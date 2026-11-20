@@ -1946,6 +1946,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fieldcraft-fcm"
+version = "0.8.1"
+dependencies = [
+ "fieldcraft-fem",
+ "fieldcraft-mesh",
+ "fieldcraft-parallel",
+ "fieldcraft-solver",
+ "libm",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "fieldcraft-fem"
 version = "0.8.1"
 dependencies = [

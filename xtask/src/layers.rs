@@ -51,6 +51,7 @@ pub const TABLE: &[(&str, Class)] = &[
     ("solver", Class::Layer(2)),
     ("explicit", Class::Layer(2)),
     ("lbm", Class::Layer(2)),
+    ("fcm", Class::Layer(2)),
     // L3: coupling between solvers (`fsi`, later).
     // L4 and up: the document, files, commands, UI.
     ("doc", Class::Layer(4)),
@@ -71,6 +72,9 @@ pub const TABLE: &[(&str, Class)] = &[
 
 /// Explicit orderings *within* a layer (earlier may be used by later).
 pub const INTRA_LAYER_ORDER: &[&[&str]] = &[
+    // The finite cell solver assembles into the implicit solver's sparse matrices and factors
+    // with its Cholesky.
+    &["solver", "fcm"],
     // The window draws through the GPU crate's pipelines.
     &["gpu", "ui-egui"],
     // The MCP server's headless screenshots draw with them too.

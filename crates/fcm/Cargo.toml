@@ -1,0 +1,18 @@
+[package]
+name = "fieldcraft-fcm"
+description = "FieldCraft's finite cell solver: linear static stress on a background grid, with no body-fitted mesh of the part"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+fieldcraft-mesh = { workspace = true }
+fieldcraft-fem = { workspace = true }
+fieldcraft-solver = { workspace = true }
+fieldcraft-parallel = { workspace = true }
+# Portable cos for the Gauss-Legendre abscissae (the same bits on every platform).
+libm = { workspace = true }
+thiserror = { workspace = true }

@@ -20,6 +20,7 @@ fieldcraft-decks = { path = "crates/decks" }
 fieldcraft-io = { path = "crates/io" }
 fieldcraft-fem = { path = "crates/fem" }
 fieldcraft-solver = { path = "crates/solver" }
+fieldcraft-fcm = { path = "crates/fcm" }
 fieldcraft-explicit = { path = "crates/explicit" }
 fieldcraft-lbm = { path = "crates/lbm" }
 fieldcraft-engine = { path = "crates/engine" }
