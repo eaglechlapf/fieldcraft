@@ -1950,6 +1950,7 @@ name = "fieldcraft-fcm"
 version = "0.8.1"
 dependencies = [
  "fieldcraft-fem",
+ "fieldcraft-geometry",
  "fieldcraft-mesh",
  "fieldcraft-parallel",
  "fieldcraft-solver",

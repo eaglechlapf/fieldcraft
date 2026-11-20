@@ -16,3 +16,7 @@ fieldcraft-parallel = { workspace = true }
 # Portable cos for the Gauss-Legendre abscissae (the same bits on every platform).
 libm = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# The real part of tests/bracket.rs: SolidCraft builds it from the oracle case's recipe.
+fieldcraft-geometry = { workspace = true, features = ["scripts"] }

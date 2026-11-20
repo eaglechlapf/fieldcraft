@@ -31,15 +31,23 @@
 //! - along a line, where it pierces a triangle, so every segment lies on one side of the surface.
 //!   The segment's ends come from the triangles in floating point; which side it is on is the
 //!   exact inside test of its midpoint;
-//! - across the lines, the integral along a line is smooth except over an edge of a triangle
-//!   (clipped to the leaf): there a face ends, turns or leaves the leaf. The second axis is
-//!   split where an edge crosses, and the third at the ends of the edges.
+//! - across the lines, the integral along a line is smooth except where a face ends or turns: at
+//!   a feature edge of the surface (the boundary of a B-rep face, or a crease inside one), at an
+//!   edge where the surface turns back along the lines, and where the surface leaves the leaf
+//!   through one of the faces the lines end on. The second axis is split where such an edge
+//!   crosses, and the third at the ends of those edges.
 //!
 //! Every interval gets the Gauss rule of the cell's degree. The lines run along the axis the
-//! leaf's triangles face most. For a part with flat faces along the axes this is exact; for
-//! other flat faces the ends of the intervals move linearly from line to line, which raises the
-//! degree of what the outer rules integrate, and the error falls with the leaf size at the
-//! rate of the Gauss rule.
+//! leaf's triangles face most. For a part with flat faces this gives the volume exactly (up to
+//! sixteen intervals an axis of a leaf; beyond that, the closest split points are merged). The
+//! edges between the facets of a smooth curved face are not split at, or the points would grow
+//! with the square of the tessellation's fineness: the integral along a line differs from that
+//! of the smooth face by at most the chordal tolerance, so what the rule misses there is of the
+//! order of the tessellation's own error, and it falls with the leaf size.
+
+use std::collections::BTreeSet;
+
+use fieldcraft_mesh::surface::BoundarySurface;
 
 use crate::inside::Solid;
 use crate::{Error, Result};
@@ -203,26 +211,34 @@ pub fn overlaps(triangle: &[[f64; 3]; 3], centre: [f64; 3], half: [f64; 3]) -> b
     true
 }
 
+/// Where an edge of a clipped triangle comes from: 0, 1 or 2 for the triangle's own edge from
+/// its first to its second corner, its second to its third, or its third to its first; from
+/// `CUT` on, the cut by a face of the box (`CUT + 2 axis`, plus one for the upper face).
+const CUT: u8 = 3;
+
 /// The part of a triangle inside the box `lo`–`hi`: a convex polygon (empty when they do not
-/// overlap). A vertex made by a cut has the cut plane's coordinate exactly.
-fn clip(triangle: &[[f64; 3]; 3], lo: [f64; 3], hi: [f64; 3]) -> Vec<[f64; 3]> {
-    let mut polygon: Vec<[f64; 3]> = triangle.to_vec();
+/// overlap), each corner with where the edge that leaves it comes from. A corner made by a cut
+/// has the cut plane's coordinate exactly.
+fn clip(triangle: &[[f64; 3]; 3], lo: [f64; 3], hi: [f64; 3]) -> Vec<([f64; 3], u8)> {
+    let mut polygon: Vec<([f64; 3], u8)> = vec![(triangle[0], 0), (triangle[1], 1), (triangle[2], 2)];
     for a in 0..3 {
-        for (bound, below) in [(lo[a], false), (hi[a], true)] {
+        for (side, (bound, below)) in [(lo[a], false), (hi[a], true)].into_iter().enumerate() {
             let keeps = |p: &[f64; 3]| if below { p[a] <= bound } else { p[a] >= bound };
             let mut kept = Vec::with_capacity(polygon.len() + 2);
-            for (i, p) in polygon.iter().enumerate() {
-                let Some(q) = polygon.get((i + 1) % polygon.len()) else { continue };
+            for (i, (p, origin)) in polygon.iter().enumerate() {
+                let Some((q, _)) = polygon.get((i + 1) % polygon.len()) else { continue };
                 let (p_in, q_in) = (keeps(p), keeps(q));
                 if p_in {
-                    kept.push(*p);
+                    kept.push((*p, *origin));
                 }
                 if p_in != q_in {
                     // The two ends lie on different sides, so their coordinates differ.
                     let s = (bound - p[a]) / (q[a] - p[a]);
                     let mut x = [p[0] + s * (q[0] - p[0]), p[1] + s * (q[1] - p[1]), p[2] + s * (q[2] - p[2])];
                     x[a] = bound;
-                    kept.push(x);
+                    // Leaving the box, the polygon goes on along the cut to where it comes back
+                    // in; coming in, along the edge it was on.
+                    kept.push((x, if p_in { CUT + 2 * a as u8 + side as u8 } else { *origin }));
                 }
             }
             polygon = kept;
@@ -275,7 +291,7 @@ pub fn sort_surface(grid: &Grid, triangles: &[[[f64; 3]; 3]]) -> Sorted {
                     if let Some(list) = sorted.touching.get_mut(cell) {
                         list.push(t as u32);
                     }
-                    let polygon = clip(triangle, lo, hi);
+                    let polygon: Vec<[f64; 3]> = clip(triangle, lo, hi).into_iter().map(|(corner, _)| corner).collect();
                     // A polygon in the plane between two cells belongs to the one the material
                     // is in: the one the normal points away from.
                     let foreign = (0..3).any(|a| {
@@ -308,20 +324,43 @@ pub struct QuadPoint {
     pub inside: bool,
 }
 
+/// The surface as the quadrature of cut cells reads it, triangle by triangle.
+#[derive(Debug, Clone, Copy)]
+pub struct Triangles<'a> {
+    /// The corners, snapped to the grid ([`Grid::snap`]).
+    pub corners: &'a [[[f64; 3]; 3]],
+    /// The outward unit normals.
+    pub normals: &'a [[f64; 3]],
+    /// The triangles across the edges from the first to the second corner, the second to the
+    /// third and the third to the first ([`BoundarySurface::neighbors`]).
+    pub across: &'a [[u32; 3]],
+    /// Which of those edges are feature edges ([`feature_flags`]).
+    pub feature: &'a [[bool; 3]],
+}
+
+/// For each triangle of a surface, which of its edges (from the first to the second corner, the
+/// second to the third, the third to the first) are feature edges: the boundary of a B-rep face,
+/// or a crease inside one.
+pub fn feature_flags(surface: &BoundarySurface) -> Vec<[bool; 3]> {
+    let features: BTreeSet<[u32; 2]> = surface.feature_edges().iter().map(|edge| edge.vertices).collect();
+    surface.triangles().iter().map(|t| [0, 1, 2].map(|k| features.contains(&[t[k].min(t[(k + 1) % 3]), t[k].max(t[(k + 1) % 3])]))).collect()
+}
+
 /// The quadrature points of the cell at `lo` with size `h`: an octree of at most `depth` levels
-/// refined where the triangles `touching` (indices into `triangles`) reach, with the Gauss
+/// refined where the triangles `touching` (indices into the surface's) reach, with the Gauss
 /// `rule` in every leaf.
 pub fn cut_quadrature(
     lo: [f64; 3],
     h: f64,
     touching: &[u32],
-    triangles: &[[[f64; 3]; 3]],
+    surface: &Triangles,
     solid: &Solid,
     rule: &[(f64, f64)],
     depth: usize,
     max_points: usize,
 ) -> Result<Vec<QuadPoint>> {
     let depth = depth.min(MAX_DEPTH);
+    let triangles = surface.corners;
     let physical = |xi: [f64; 3]| [lo[0] + 0.5 * (xi[0] + 1.0) * h, lo[1] + 0.5 * (xi[1] + 1.0) * h, lo[2] + 0.5 * (xi[2] + 1.0) * h];
     let per_leaf = rule.len() * rule.len() * rule.len();
     let mut points = Vec::new();
@@ -380,12 +419,39 @@ pub fn cut_quadrature(
         let leaf_lo = physical(corner);
         let leaf_hi = physical([corner[0] + size, corner[1] + size, corner[2] + size]);
         let tiny = MERGE * (leaf_hi[axis] - leaf_lo[axis]);
+        // The edges where the integral along a line is not smooth from line to line: a feature
+        // edge, an edge where the surface turns back along the lines (its two triangles face
+        // opposite ways along them), and the cut where the surface leaves the leaf through one
+        // of the faces the lines end on.
+        let facing = |normal: &[f64; 3]| {
+            if normal[axis] > 0.0 {
+                1
+            } else if normal[axis] < 0.0 {
+                -1
+            } else {
+                0
+            }
+        };
         let mut edges: Vec<[[f64; 2]; 2]> = Vec::new();
         for t in &cut {
-            let Some(triangle) = triangles.get(*t as usize) else { continue };
+            let index = *t as usize;
+            let Some(triangle) = triangles.get(index) else { continue };
+            let own = surface.normals.get(index).map_or(0, facing);
             let polygon = clip(triangle, leaf_lo, leaf_hi);
-            for (i, from) in polygon.iter().enumerate() {
-                if let Some(to) = polygon.get((i + 1) % polygon.len()) {
+            for (i, (from, origin)) in polygon.iter().enumerate() {
+                let Some((to, _)) = polygon.get((i + 1) % polygon.len()) else { continue };
+                let splits = match *origin as usize {
+                    edge @ 0..=2 => {
+                        surface.feature.get(index).is_some_and(|flags| flags[edge])
+                            || surface
+                                .across
+                                .get(index)
+                                .and_then(|across| surface.normals.get(across[edge] as usize))
+                                .is_none_or(|other| facing(other) != own)
+                    }
+                    cut => (cut - CUT as usize) / 2 == axis,
+                };
+                if splits {
                     edges.push([[from[b], from[c]], [to[b], to[c]]]);
                 }
             }
@@ -394,7 +460,7 @@ pub fn cut_quadrature(
         // third axis at the edges' ends, then the second where an edge crosses.
         let mut third = vec![leaf_lo[c], leaf_hi[c]];
         third.extend(edges.iter().flatten().map(|end| end[1]).filter(|at| *at > leaf_lo[c] && *at < leaf_hi[c]));
-        tidy(&mut third, tiny);
+        thin(&mut third, tiny);
         let (mut second, mut first): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
         for span_c in third.windows(2) {
             for (gc, wc) in rule {
@@ -410,7 +476,7 @@ pub fn cut_quadrature(
                         }
                     }
                 }
-                tidy(&mut second, tiny);
+                thin(&mut second, tiny);
                 for span_b in second.windows(2) {
                     for (gb, wb) in rule {
                         let at_b = 0.5 * (span_b[0] + span_b[1]) + 0.5 * (span_b[1] - span_b[0]) * gb;
@@ -472,6 +538,24 @@ fn tidy(cuts: &mut Vec<f64>, tiny: f64) {
         kept.push(upper);
     }
     *cuts = kept;
+}
+
+/// Intervals an axis of a leaf is split into across the lines, at most.
+const MOST: usize = 16;
+
+/// [`tidy`], then no more than [`MOST`] intervals: with more, split points closer than one
+/// [`MOST`]-th of the interval are one. Few split points are kept as they are, so a thin wall or
+/// a sliver is integrated exactly. Many of them are the facets of a curved face seen edge-on
+/// (a hole along the lines, tessellated in triangles that tilt either way), whose band is as
+/// narrow as the chordal tolerance; thinning them bounds the points of a leaf whatever the
+/// tessellation's fineness, and what it costs falls with the leaf size.
+fn thin(cuts: &mut Vec<f64>, tiny: f64) {
+    tidy(cuts, tiny);
+    if cuts.len() > MOST + 1
+        && let (Some(&lower), Some(&upper)) = (cuts.first(), cuts.last())
+    {
+        tidy(cuts, (upper - lower) / MOST as f64);
+    }
 }
 
 /// Lines through a triangle within this much of its edges, in barycentric coordinates, pierce

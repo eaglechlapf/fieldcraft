@@ -391,6 +391,8 @@ pub fn solve(
     }
     let (faces, body) = conditions(supports, loads, &areas, material.density)?;
     let on_surface = Surface { normals: &normals, tags: &tags, faces: &faces };
+    let feature = grid::feature_flags(surface);
+    let on_grid = grid::Triangles { corners: &triangles, normals: &normals, across: surface.neighbors(), feature: &feature };
 
     // The cells: cut where they own a piece of the surface, else by their centre.
     let solid = Solid::new(surface)?;
@@ -471,7 +473,7 @@ pub fn solve(
         let corner = grid.lo(ijk);
         let touching = sorted.touching.get(index).map(Vec::as_slice).unwrap_or_default();
         let pieces = sorted.pieces.get(index).map(Vec::as_slice).unwrap_or_default();
-        let points = grid::cut_quadrature(corner, h, touching, &triangles, &solid, &rule, options.depth, MAX_CELL_POINTS)?;
+        let points = grid::cut_quadrature(corner, h, touching, &on_grid, &solid, &rule, options.depth, MAX_CELL_POINTS)?;
         let volume = cell::integrate(p, h, &points);
         let physical = cell::stiffness(m, &volume.inside, &lame);
         let outside = cell::stiffness(m, &volume.outside, &lame);
