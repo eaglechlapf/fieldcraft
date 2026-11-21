@@ -128,7 +128,7 @@ files named on the command line go through native file pickers and open in the b
 
 ## Jobs
 
-`engine.execute` of a solve (`solve.run`, `solve.static`, `solve.nonlinear`, `solve.heat`,
+`engine.execute` of a solve (`solve.run`, `solve.static`, `solve.static.grid`, `solve.nonlinear`, `solve.heat`,
 `solve.frequency`, `solve.buckle`, `solve.explicit`, `solve.fluid`) or a mesher (`mesh.tet.generate`,
 `mesh.hex.*`, `mesh.node.relax`, `mesh.plan.apply`, `mesh.cells`) or a partition (`geometry.partition`)
 or an open (`file.open`, `file.recover`, `file.sample`, `geometry.open`, `geometry.import.mesh`)

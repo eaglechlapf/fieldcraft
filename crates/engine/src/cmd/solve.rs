@@ -165,7 +165,7 @@ pub const FLUID: CommandSpec = CommandSpec {
 pub const PROBE: CommandSpec = CommandSpec {
     id: "solve.probe",
     label: "Probe Results",
-    params: r#"{"step": "Load", "nodes": [1, 2] (or "set": "fillet", a set's nodes), "mode": 1, "frame": 0} — the stored result at nodes (with `max_von_mises`, the largest among them, for static steps): displacement, rotation, reaction, reaction moment, stress, principal stresses (the values, largest first, without their directions) and von Mises (static, with `elements` each element's results: solid, 2D and truss nodal stresses (and, in a nonlinear step, the equivalent plastic strain at the integration points of a plastic element), shell section forces (N, M, Q per length in the element's axes) and bottom, middle and top stresses, beam end forces (N, V_y, V_z, T, M_y, M_z in its axes)), the shape of mode `mode` with its rotations (frequency, from 1), or displacement and velocity in field frame `frame` (explicit, from 0; the last by default) at `nodes` (or at the nodes nearest to points: "at": [[x, y, z], ...], lowest label on a tie, each entry then giving its `xyz` and `distance`) and, with `elements` (explicit), each element's stress, von Mises stress, strain, equivalent plastic strain, damage, temperature and whether it has eroded; a coupled reference point's label gives its six displacements (translations, rotations) and reactions (forces, moments). Heat transfer steps: `frame` selects temperature and heat_flux together (from 0, the last by default); reaction is included only in the last frame, including the sole frame of a steady step. Fluid steps: {"step": "Flow", "points": [[x, y, z]], "frame": 10 (default the last)} gives velocity, pressure and (with heat) temperature in the cells at the points; {"step": "Flow", "forces": ["x_min", "F2:top", "Body1/F2:top"]} gives those walls' force histories and {"step": "Flow", "heat": ["y_min"]} the heat into them over time (power, positive into the wall); {"step": "Flow", "line": {"from": [x, y, z], "to": [x, y, z], "count": 65 (default one point per cell spacing), "field": "velocity_x|velocity_y|velocity_z|speed|pressure|temperature|fill|wall_heat_flux", "face": "x_min" (wall_heat_flux: the box wall the line lies on)}, "frame": 10} gives the field at `count` points evenly along the line (`xyz`; trilinear between the cell centres, null outside the fluid; within half a cell of a box face the nearest cell centre's value, so a temperature line run onto a held wall reads the first cell, not the wall) and its `max` and `min` with their `xyz`, located between the samples by the parabola through the extreme sample and its neighbours; `wall_heat_flux` is the heat per area into a box wall (positive into the wall): at a held temperature from the second-order one-sided difference through the wall and the two cell layers beside it, at a flux face its flux, at an adiabatic face zero; `fill` is a free surface's fill level, 1 liquid to 0 gas; {"step": "Flow", "front": {"axis": "x", "end": "max", "at": [[x, y, z], …]}} gives a free surface's liquid front: the liquid's extent along the axis at every history time (the `max` (default) or `min` face of the cells at least half full) and its `volume`, and per point in `at` the time the extent first reached the point's coordinate along the axis, coming or going (`arrivals`; between two samples by linear interpolation; null when it never did); {"step": "Flow", "depth": {"axis": "z", "at": [[x, y, z], …]}, "frame": 10} gives, per point, the liquid in the column of cells through it along the axis in that frame (the fill levels summed times the spacing: a wave gauge's depth, a collapsing column's height at its wall)"#,
+    params: r#"{"step": "Load", "nodes": [1, 2] (or "set": "fillet", a set's nodes), "mode": 1, "frame": 0} — the stored result at nodes (with `max_von_mises`, the largest among them, for static steps): displacement, rotation, reaction, reaction moment, stress, principal stresses (the values, largest first, without their directions) and von Mises (static, with `elements` each element's results: solid, 2D and truss nodal stresses (and, in a nonlinear step, the equivalent plastic strain at the integration points of a plastic element), shell section forces (N, M, Q per length in the element's axes) and bottom, middle and top stresses, beam end forces (N, V_y, V_z, T, M_y, M_z in its axes)), the shape of mode `mode` with its rotations (frequency, from 1), or displacement and velocity in field frame `frame` (explicit, from 0; the last by default) at `nodes` (or at the nodes nearest to points: "at": [[x, y, z], ...], lowest label on a tie, each entry then giving its `xyz` and `distance`) and, with `elements` (explicit), each element's stress, von Mises stress, strain, equivalent plastic strain, damage, temperature and whether it has eroded; a coupled reference point's label gives its six displacements (translations, rotations) and reactions (forces, moments). Heat transfer steps: `frame` selects temperature and heat_flux together (from 0, the last by default); reaction is included only in the last frame, including the sole frame of a steady step. Fluid steps: {"step": "Flow", "points": [[x, y, z]], "frame": 10 (default the last)} gives velocity, pressure and (with heat) temperature in the cells at the points; {"step": "Flow", "forces": ["x_min", "F2:top", "Body1/F2:top"]} gives those walls' force histories and {"step": "Flow", "heat": ["y_min"]} the heat into them over time (power, positive into the wall); {"step": "Flow", "line": {"from": [x, y, z], "to": [x, y, z], "count": 65 (default one point per cell spacing), "field": "velocity_x|velocity_y|velocity_z|speed|pressure|temperature|fill|wall_heat_flux", "face": "x_min" (wall_heat_flux: the box wall the line lies on)}, "frame": 10} gives the field at `count` points evenly along the line (`xyz`; trilinear between the cell centres, null outside the fluid; within half a cell of a box face the nearest cell centre's value, so a temperature line run onto a held wall reads the first cell, not the wall) and its `max` and `min` with their `xyz`, located between the samples by the parabola through the extreme sample and its neighbours; `wall_heat_flux` is the heat per area into a box wall (positive into the wall): at a held temperature from the second-order one-sided difference through the wall and the two cell layers beside it, at a flux face its flux, at an adiabatic face zero; `fill` is a free surface's fill level, 1 liquid to 0 gas; {"step": "Flow", "front": {"axis": "x", "end": "max", "at": [[x, y, z], …]}} gives a free surface's liquid front: the liquid's extent along the axis at every history time (the `max` (default) or `min` face of the cells at least half full) and its `volume`, and per point in `at` the time the extent first reached the point's coordinate along the axis, coming or going (`arrivals`; between two samples by linear interpolation; null when it never did); {"step": "Flow", "depth": {"axis": "z", "at": [[x, y, z], …]}, "frame": 10} gives, per point, the liquid in the column of cells through it along the axis in that frame (the fill levels summed times the spacing: a wave gauge's depth, a collapsing column's height at its wall). A step solved without a mesh (solve.static.grid) has its result at points of the body's surface, labelled above every mesh label: `nodes` takes those labels, `at` finds the nearest of them, `set` takes the points on the faces a set names, and each entry gives the point's `xyz` and `face`"#,
     form: Some(super::forms::SOLVE_PROBE),
     kind: CommandKind::Model,
     requires: &[Requirement::Result],
@@ -191,7 +191,7 @@ fn whole(v: &Value) -> Option<u64> {
 }
 
 /// An optional cap that may only lower the default.
-fn cap<T: Copy + TryInto<u64> + TryFrom<u64> + std::fmt::Display>(p: &Value, key: &str, default: T) -> Result<T> {
+pub(super) fn cap<T: Copy + TryInto<u64> + TryFrom<u64> + std::fmt::Display>(p: &Value, key: &str, default: T) -> Result<T> {
     let most: u64 = default.try_into().unwrap_or(u64::MAX);
     match p.get(key) {
         None => Ok(default),
@@ -203,7 +203,7 @@ fn cap<T: Copy + TryInto<u64> + TryFrom<u64> + std::fmt::Display>(p: &Value, key
 }
 
 /// The `threads` parameter: 1 to [`parallel::MAX_THREADS`], by default the session's.
-fn threads(s: &Session, p: &Value) -> Result<usize> {
+pub(super) fn threads(s: &Session, p: &Value) -> Result<usize> {
     match p.get("threads") {
         None => Ok(s.limits.threads.clamp(1, parallel::MAX_THREADS)),
         Some(v) => v
@@ -214,7 +214,7 @@ fn threads(s: &Session, p: &Value) -> Result<usize> {
     }
 }
 
-fn limits(p: &Value) -> Result<Limits> {
+pub(super) fn limits(p: &Value) -> Result<Limits> {
     Ok(Limits {
         max_dofs: cap(p, "max_dofs", Limits::MAX_DOFS)?,
         max_factor_entries: if p.get("max_factor_entries").is_none() {
@@ -236,7 +236,7 @@ fn extreme(values: impl Iterator<Item = (u32, f64)>, better: fn(f64, f64) -> boo
 }
 
 /// [`parallel::with_threads`], the caller's progress reporter carried onto the pool's thread.
-fn with_threads<R: Send>(threads: usize, f: impl FnOnce() -> R + Send) -> R {
+pub(super) fn with_threads<R: Send>(threads: usize, f: impl FnOnce() -> R + Send) -> R {
     let progress = fieldcraft_model::progress::current();
     parallel::with_threads(threads, move || fieldcraft_model::progress::scoped(progress, f))
 }
@@ -302,7 +302,7 @@ const CANCELLED: f64 = 1e-9; // unit-factors: relative to the terms' magnitudes
 
 /// A sum of nodal values with its round-off set to 0: a component below a billionth of the sum
 /// of the terms' magnitudes is what cancelling left (a balanced load sums to ~1e-11, not 0).
-fn settled(total: [f64; 3], terms: &[[f64; 3]]) -> [f64; 3] {
+pub(super) fn settled(total: [f64; 3], terms: &[[f64; 3]]) -> [f64; 3] {
     let mut out = total;
     for (k, c) in out.iter_mut().enumerate() {
         let scale: f64 = terms.iter().filter_map(|t| t.get(k)).map(|x| x.abs()).filter(|x| x.is_finite()).sum();
@@ -1494,8 +1494,28 @@ pub(crate) fn probe(s: &mut Session, p: &Value) -> Result<Value> {
         show_probe(&mut out, result, &display);
         return Ok(out);
     }
+    let grid = result.grid();
     let (nodes, located) = match (p.get("nodes"), p.get("at")) {
+        // A grid solve's surface points are labelled above the mesh's labels.
+        (Some(_), None) if grid.is_some() => (surface_labels(p, "nodes", result.nodes())?, None),
         (Some(_), None) => (labels(p, "nodes", MAX_PROBE)?, None),
+        // A grid solve's surface points on the faces a set names.
+        (None, None) if p.get("set").is_some() && grid.is_some() => {
+            let name = opt::<String>(p, "set")?.unwrap_or_default();
+            let set = s.model.set(&name).ok_or_else(|| EngineError::Params(format!("no set `{}`", name.chars().take(100).collect::<String>())))?;
+            let body = grid.map_or("", |g| g.body.as_str());
+            let named = |face: &str| fieldcraft_model::GeometryRef::face(body, face).is_ok_and(|tag| set.geometry.iter().any(|r| r.selects(&tag)));
+            let found = grid.map(|g| g.points_on(named)).unwrap_or_default();
+            if found.is_empty() {
+                return Err(EngineError::Params(format!(
+                    "set `{name}` names no face of body `{body}`, on whose surface step `{step}` has its result"
+                )));
+            }
+            if found.len() > MAX_PROBE {
+                return Err(EngineError::Params(format!("set `{name}` has {} surface points; a probe takes at most {MAX_PROBE}", found.len())));
+            }
+            (found, None)
+        }
         (None, None) if p.get("set").is_some() => {
             let name = opt::<String>(p, "set")?.unwrap_or_default();
             let set = s.model.resolve_set(&name)?;
@@ -1506,7 +1526,10 @@ pub(crate) fn probe(s: &mut Session, p: &Value) -> Result<Value> {
         }
         (None, Some(_)) => {
             let at = points(p, "at", MAX_PROBE)?;
-            let found = nearest_nodes(&s.model, result.nodes(), &at)?;
+            let found = match grid {
+                Some(g) => g.nearest(&at)?,
+                None => nearest_nodes(&s.model, result.nodes(), &at)?,
+            };
             (found.iter().map(|(l, _, _)| *l).collect(), Some(found))
         }
         (None, None) if matches!(result.as_ref(), StepResult::Explicit(_)) || p.get("elements").is_some() => (Vec::new(), None),
@@ -1519,6 +1542,22 @@ pub(crate) fn probe(s: &mut Session, p: &Value) -> Result<Value> {
         }
         StepResult::Implicit(r) => probe_implicit(&s.model, r, &step, &nodes, p)?,
         StepResult::Fluid(r) => probe_fluid(&s.model, r, p)?,
+        StepResult::Grid(g) => {
+            if p.get("elements").is_some() {
+                result.on_mesh("a probe of elements")?;
+            }
+            let mut out = probe_implicit(&s.model, &g.result, &step, &nodes, p)?;
+            // Where each surface point is, and on which face.
+            let faces = g.faces_of(&nodes);
+            for entry in out.get_mut("nodes").and_then(Value::as_array_mut).into_iter().flatten() {
+                let label = entry.get("node").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok());
+                if let (Some(label), Some(obj)) = (label, entry.as_object_mut()) {
+                    obj.insert("xyz".into(), json!(g.display.node_position(label).map(|p| [p.x, p.y, p.z])));
+                    obj.insert("face".into(), json!(faces.get(&label)));
+                }
+            }
+            out
+        }
     };
     // The largest von Mises stress among the probed nodes (static results).
     let peak = out.get("nodes").and_then(Value::as_array).and_then(|entries| {
@@ -1597,6 +1636,21 @@ fn show_probe(out: &mut Value, r: &StepResult, display: &fieldcraft_model::Displ
     if let Some(o) = out.as_object_mut() {
         o.insert("units".into(), Value::Object(units));
     }
+}
+
+/// A required list of a grid result's surface point labels (`nodes`, those the result has), at
+/// most [`MAX_PROBE`] long.
+fn surface_labels(p: &Value, key: &str, nodes: &[u32]) -> Result<Vec<u32>> {
+    let raw = p
+        .get(key)
+        .and_then(Value::as_array)
+        .filter(|a| a.len() <= MAX_PROBE)
+        .ok_or_else(|| super::wrong(p, key, ProblemKind::NotAList { max: MAX_PROBE, what: "labels" }))?;
+    let (first, last) = (nodes.first().copied().unwrap_or(0), nodes.last().copied().unwrap_or(0));
+    raw.iter()
+        .map(|v| v.as_u64().and_then(|n| u32::try_from(n).ok()).filter(|n| nodes.binary_search(n).is_ok()))
+        .collect::<Option<Vec<u32>>>()
+        .ok_or_else(|| EngineError::invalid(key, format!("must be labels of the result's surface points, {first} to {last}")))
 }
 
 /// The node with a result nearest to each point (lowest label on a tie), where it is and how far.

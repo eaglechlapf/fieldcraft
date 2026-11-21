@@ -399,6 +399,15 @@ pub fn number_in(v: f64, scale: f64) -> String {
     number(clean(v, scale))
 }
 
+/// What a probed point is called: a mesh node by its label; a grid solve's result is at points
+/// of the body's surface, numbered apart from the mesh's nodes.
+pub fn probe_title(node: u32) -> String {
+    match fieldcraft_engine::results::grid_vertex(node) {
+        Some(point) => format!("Surface point {point}"),
+        None => format!("Node {node}"),
+    }
+}
+
 /// A count with thousands separators: `221,850,309`.
 pub fn count(n: u64) -> String {
     grouped(&n.to_string())

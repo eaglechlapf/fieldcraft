@@ -316,7 +316,7 @@ pub fn queued() -> usize {
 }
 
 /// Milliseconds in a second, for the session's length and the native clock.
-const MS_PER_SECOND: f64 = 1000.0; // unit-factors: wall-clock time of the usage counts, not a model quantity
+pub(crate) const MS_PER_SECOND: f64 = 1000.0; // unit-factors: wall-clock time of the usage counts, not a model quantity
 
 /// A clock in milliseconds for command durations. The plain wasm target has none: the web page
 /// sets one ([`set_clock`]).
@@ -327,7 +327,7 @@ pub fn set_clock(clock: fn() -> f64) {
     *CLOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(clock);
 }
 
-fn now_ms() -> Option<f64> {
+pub(crate) fn now_ms() -> Option<f64> {
     if let Some(c) = *CLOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
         return Some(c());
     }

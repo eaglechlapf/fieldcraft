@@ -150,12 +150,16 @@ impl EngineError {
 
 pub type Result<T> = std::result::Result<T, EngineError>;
 
-/// The result of a solved step, from the implicit, the explicit or the lattice Boltzmann solver.
+/// The result of a solved step, from the implicit, the explicit or the lattice Boltzmann solver,
+/// or from the finite cell solver on a background grid.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StepResult {
     Implicit(fieldcraft_solver::StepResult),
     Explicit(ExplicitResult),
     Fluid(Box<fieldcraft_lbm::FluidResult>),
+    /// A static step solved without a mesh (`solve.static.grid`): the solution sampled on the
+    /// body's surface ([`results::GridResult`]).
+    Grid(Box<results::GridResult>),
 }
 
 impl StepResult {
@@ -164,6 +168,7 @@ impl StepResult {
             StepResult::Implicit(r) => r.step(),
             StepResult::Explicit(r) => &r.step,
             StepResult::Fluid(r) => &r.step,
+            StepResult::Grid(r) => r.result.step(),
         }
     }
 
@@ -174,16 +179,20 @@ impl StepResult {
             StepResult::Explicit(r) => &r.nodes,
             // A fluid result is per cell, not per node.
             StepResult::Fluid(_) => &[],
+            // The vertices of the sampled surface.
+            StepResult::Grid(r) => r.result.nodes(),
         }
     }
 
-    /// The result as a file keeps it.
-    pub fn as_stored(&self) -> fieldcraft_io::results::SolvedRef<'_> {
+    /// The result as a file keeps it; `None` for a result files do not keep (a grid solve's
+    /// samples, which belong to a tessellation and not to the model: solve again after opening).
+    pub fn as_stored(&self) -> Option<fieldcraft_io::results::SolvedRef<'_>> {
         use fieldcraft_io::results::SolvedRef;
         match self {
-            StepResult::Implicit(r) => SolvedRef::Implicit(r),
-            StepResult::Explicit(r) => SolvedRef::Explicit(r),
-            StepResult::Fluid(r) => SolvedRef::Fluid(r),
+            StepResult::Implicit(r) => Some(SolvedRef::Implicit(r)),
+            StepResult::Explicit(r) => Some(SolvedRef::Explicit(r)),
+            StepResult::Fluid(r) => Some(SolvedRef::Fluid(r)),
+            StepResult::Grid(_) => None,
         }
     }
 }
@@ -281,6 +290,9 @@ pub struct Limits {
     pub max_tets: usize,
     /// `mesh.hex.octree`'s `max_elements`.
     pub max_hex_elements: usize,
+    /// The most unknowns `solve.static.grid` solves (its `max_dofs` may only lower it): the
+    /// size of its system follows from its cell size and degree, parameters of the command.
+    pub max_grid_dofs: usize,
     /// Threads the solvers use (the `solve.*` commands' `threads`): by default
     /// `FIELDCRAFT_THREADS` or the available cores, 1 to [`fieldcraft_parallel::MAX_THREADS`].
     /// Results do not depend on it.
@@ -302,6 +314,7 @@ impl Default for Limits {
             max_steiner: cdt.max_steiner,
             max_tets: cdt.max_tets,
             max_hex_elements: cmd::octree::DEFAULT_MAX_ELEMENTS,
+            max_grid_dofs: fieldcraft_solver::Limits::MAX_DOFS,
             threads: fieldcraft_parallel::default_threads(),
             memory: machine::memory_bound(),
         }
@@ -361,6 +374,11 @@ pub struct Session {
     /// The definition each solved step was solved from ([`fieldcraft_io::results::definition_hash`]): an edit
     /// that leaves it the same keeps the step's result current. Files keep it with the result.
     result_inputs: BTreeMap<String, [u8; 32]>,
+    /// The design each grid solve's result was solved on (`solve.static.grid`), by step: such a
+    /// result reads the body's geometry, which the step's definition does not hold, so it is
+    /// current only while that design is the open one (a partition, a face merge or a defeature
+    /// makes another).
+    grid_designs: BTreeMap<String, Arc<Design>>,
     /// Counts the results stored (a solve, or a file opened): a result solved since the last save
     /// is unsaved too, since files keep results.
     results_stored: u64,
@@ -792,8 +810,17 @@ impl Session {
             Some(f) => self.result_inputs.insert(step.clone(), f),
             None => self.result_inputs.remove(&step),
         };
+        match (&result, &self.design) {
+            (StepResult::Grid(_), Some(design)) => self.grid_designs.insert(step.clone(), design.clone()),
+            _ => self.grid_designs.remove(&step),
+        };
+        // A result files keep is unsaved until the next save; one they do not keep changes
+        // nothing a save would write.
+        let kept = result.as_stored().is_some();
         self.results.insert(step.clone(), (self.revision, Arc::new(result)));
-        self.results_stored = self.results_stored.wrapping_add(1);
+        if kept {
+            self.results_stored = self.results_stored.wrapping_add(1);
+        }
         cmd::views::show_pending(self, &step);
     }
 
@@ -814,9 +841,9 @@ impl Session {
     pub(crate) fn stored_results(&self) -> Vec<(&str, fieldcraft_io::results::StoredRef<'_>)> {
         self.results
             .iter()
-            .map(|(step, (_, r))| {
+            .filter_map(|(step, (_, r))| {
                 let definition = self.result_inputs.get(step).copied().unwrap_or([0; 32]);
-                (step.as_str(), fieldcraft_io::results::StoredRef { definition, result: r.as_stored() })
+                Some((step.as_str(), fieldcraft_io::results::StoredRef { definition, result: r.as_stored()? }))
             })
             .collect()
     }
@@ -828,7 +855,9 @@ impl Session {
         let revision = self.revision;
         for (step, (solved, _)) in self.results.iter_mut().filter(|(_, (r, _))| *r != revision) {
             let read = self.result_inputs.get(step).copied();
-            if read.is_some() && read == fieldcraft_io::results::definition_hash(&self.model, step, &self.sources) {
+            // A grid solve's result also reads the geometry of the design it was solved on.
+            let same_geometry = self.grid_designs.get(step).is_none_or(|solved| self.design.as_ref().is_some_and(|open| Arc::ptr_eq(solved, open)));
+            if same_geometry && read.is_some() && read == fieldcraft_io::results::definition_hash(&self.model, step, &self.sources) {
                 *solved = revision;
             }
         }

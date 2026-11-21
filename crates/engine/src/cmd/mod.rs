@@ -50,6 +50,7 @@ mod results;
 pub(crate) mod seeds;
 pub(crate) mod sizes;
 pub(crate) mod solve;
+mod static_grid;
 pub(crate) mod stitch;
 mod symmetry;
 mod tags;
@@ -228,6 +229,7 @@ pub static ALL: &[CommandSpec] = &[
     deck::READ,
     solve::RUN,
     solve::STATIC,
+    static_grid::STATIC_GRID,
     solve::NONLINEAR,
     solve::FREQUENCY,
     solve::BUCKLE,

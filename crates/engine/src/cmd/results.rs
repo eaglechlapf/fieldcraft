@@ -627,6 +627,9 @@ fn reactions(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let frame_index: Option<usize> = opt(p, "frame")?;
     let Some((result, current)) = s.latest_result(&step) else { return Err(EngineError::Params(solved_list(s))) };
+    if let Some(g) = result.grid() {
+        return grid_reactions(s, &step, g, current, p);
+    }
     let Kind::Static(r) = result.kind() else {
         return Err(EngineError::Params(format!(
             "step `{step}` is not a static step: reactions are kept for static steps (explicit steps keep the constraint force history, solve.history)"
@@ -660,6 +663,40 @@ fn reactions(s: &mut Session, p: &Value) -> Result<Value> {
         _ => out["applied"] = json!(r.applied_total),
     }
     Ok(out)
+}
+
+/// A grid solve's reactions (`solve.static.grid`), which are kept per supported face: per set
+/// the sum over the faces it names, and the total. The solver gives each face's force and not
+/// where on the face it acts, so there are no moments.
+fn grid_reactions(s: &Session, step: &str, g: &crate::results::GridResult, current: bool, p: &Value) -> Result<Value> {
+    if p.get("frame").is_some() {
+        return Err(EngineError::invalid("frame", format!("step `{step}` is a linear static step: it has one state and no frames")));
+    }
+    let sum = |faces: &mut dyn Iterator<Item = &crate::results::FaceReaction>| {
+        let (mut force, mut count) = ([0.0; 3], 0usize);
+        for r in faces {
+            for (total, f) in force.iter_mut().zip(r.force) {
+                *total += f;
+            }
+            count += 1;
+        }
+        json!({"faces": count, "force": force, "moment": null})
+    };
+    let mut per_set = Vec::new();
+    for name in reaction_sets(s, step, p)? {
+        let set = s.model.set(&name).ok_or_else(|| EngineError::Params(format!("no set `{name}`")))?;
+        let named =
+            |face: &str| fieldcraft_model::GeometryRef::face(g.body.clone(), face).is_ok_and(|tag| set.geometry.iter().any(|r| r.selects(&tag)));
+        let mut row = sum(&mut g.reactions.iter().filter(|r| named(&r.face)));
+        row["set"] = json!(name);
+        per_set.push(row);
+    }
+    let total = sum(&mut g.reactions.iter());
+    let applied = match g.result {
+        fieldcraft_solver::StepResult::Static(ref r) => json!(r.applied_total),
+        _ => Value::Null,
+    };
+    Ok(json!({"step": step, "stale": !current, "about": [0.0, 0.0, 0.0], "sets": per_set, "total": total, "applied": applied}))
 }
 
 /// Frame `k` of a nonlinear static step.
@@ -761,7 +798,10 @@ fn export_vtu(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let r = match s.latest_result(&step) {
         Some((_, false)) => return Err(EngineError::Params(format!("the model changed since step `{step}` was solved; solve it again"))),
-        Some((r, true)) => std::sync::Arc::clone(r),
+        Some((r, true)) => {
+            r.on_mesh("results.export.vtu")?;
+            std::sync::Arc::clone(r)
+        }
         None => return Err(EngineError::Params(format!("step `{step}` has no result; solve it first"))),
     };
     let frames = |n: usize, what: &str| -> Result<Vec<State>> {
@@ -1032,7 +1072,15 @@ fn export_csv(s: &mut Session, p: &Value) -> Result<Value> {
     let (step, table) = match what.as_str() {
         "probe" => {
             let r = super::solve::probe(s, p)?;
-            let position = |label: u32| s.model.node(label).map(|n| crate::results::shown_all(crate::results::Quantity::Length, n.xyz, &display));
+            // A mesh node's position, or a grid solve's surface point's.
+            let surface = r.get("step").and_then(Value::as_str).and_then(|step| s.result(step)).and_then(|r| r.own_display());
+            let position = |label: u32| {
+                let xyz = match surface {
+                    Some(d) => d.node_position(label).map(|p| [p.x, p.y, p.z]),
+                    None => s.model.node(label).map(|n| n.xyz),
+                };
+                xyz.map(|x| crate::results::shown_all(crate::results::Quantity::Length, x, &display))
+            };
             (r.get("step").cloned().unwrap_or(Value::Null), probe_table(&r, &position, &display)?)
         }
         "reactions" => {

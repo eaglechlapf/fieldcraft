@@ -34,6 +34,8 @@ fn linearize(s: &mut Session, p: &Value) -> Result<Value> {
     fieldcraft_model::progress::check()?;
     let step = step_for(s, p, Want::Any)?;
     let result = current_result(s, &step)?;
+    // A stress classification line runs through the mesh's elements.
+    result.on_mesh("results.linearize")?;
     let Kind::Static(r) = result.kind() else {
         return Err(EngineError::invalid(
             "step",

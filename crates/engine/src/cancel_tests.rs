@@ -131,6 +131,18 @@ fn static_frequency_and_solve_all_stop_at_the_factorization() {
     cancel(&mut s, "solve.run", json!({}), None);
 }
 
+/// The grid solve stops before it starts and, once its solver runs, at the factorization or at
+/// the latest when the solver hands back: no result is kept.
+#[test]
+fn the_grid_solve_stops_and_keeps_no_result() {
+    let mut s = Session::default();
+    s.execute("file.sample", &json!({"name": "bracket-grid"})).unwrap();
+    let coarse = json!({"cell_size": 12, "degree": 2});
+    cancel(&mut s, "solve.static.grid", coarse.clone(), None);
+    cancel_when(&mut s, "solve.static.grid", coarse, Some(|now: &progress::State| now.stage.ends_with(": grid solve")));
+    assert!(s.latest_result("Load").is_none());
+}
+
 #[test]
 fn meshers_stop_and_leave_no_mesh() {
     let (_dir, mut s) = plate();

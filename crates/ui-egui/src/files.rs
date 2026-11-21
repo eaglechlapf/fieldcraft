@@ -177,7 +177,15 @@ pub fn is_long(command: &str) -> bool {
         || opens(command)
         || matches!(
             command,
-            "solve.run" | "solve.static" | "solve.nonlinear" | "solve.heat" | "solve.frequency" | "solve.buckle" | "solve.explicit" | "solve.fluid"
+            "solve.run"
+                | "solve.static"
+                | "solve.static.grid"
+                | "solve.nonlinear"
+                | "solve.heat"
+                | "solve.frequency"
+                | "solve.buckle"
+                | "solve.explicit"
+                | "solve.fluid"
         )
 }
 
@@ -208,6 +216,7 @@ pub const BACKGROUND: &[&str] = &[
     "mesh.cells",
     "geometry.partition",
     "results.path",
+    "solve.static.grid",
 ];
 
 /// Most entries the recent-files list keeps, and the longest path it keeps.
@@ -1181,6 +1190,19 @@ impl ModelApp {
         }
         if o.command == "file.sample" && !self.session.model.steps().is_empty() {
             done.push_str(" — Solve shows its results");
+        }
+        // A grid solve run from its form says what it found, with the whole summary in the panel,
+        // as a solve run in the window does; run again, it takes what this one took.
+        if o.command == "solve.static.grid" {
+            let label = crate::command_label(o.command);
+            done = format!("{label}: {} (details in the panel)", crate::reply::summary_in(o.command, &o.reply, Some(self.session.units())));
+            let taken: serde_json::Map<String, Value> = ["step", "body", "cell_size", "degree", "check_convergence", "tolerance", "sample_size"]
+                .into_iter()
+                .filter_map(|key| o.reply.get(key).filter(|v| !v.is_null()).map(|v| (key.to_string(), v.clone())))
+                .collect();
+            let params = self.session.params_with_units(o.command, &Value::Object(taken));
+            crate::context::opened(self, crate::context::Opened::Reply);
+            self.reply = Some(crate::reply::Reply { command: o.command.into(), label: label.into(), params, value: o.reply.clone() });
         }
         if warnings.is_empty() {
             self.set_status(done, false);
@@ -2855,6 +2877,43 @@ pub(crate) mod tests {
             assert!(app.session.model == direct.model, "{command}: redo");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Grid Static from its form: the solve runs off the window thread, its summary shows in the
+    /// panel, and the results plot is drawn on the body's surface, where a click's node probes.
+    #[test]
+    fn the_grid_solve_runs_from_its_form_and_shows_on_the_surface() {
+        let mut app = ModelApp::new(Session::default());
+        // No design: the entry says what it needs.
+        assert!(app.unavailable("solve.static.grid").is_some_and(|u| u.to_string().contains("an open design")));
+        app.run("file.sample", json!({"name": "bracket-grid"})).unwrap();
+        assert!(app.unavailable("solve.static.grid").is_none() && app.unavailable("solve.run").is_some());
+        app.open_form("solve.static.grid", json!({"cell_size": 12, "degree": 2}));
+        app.submit_dialog();
+        assert_eq!(app.busy(), Some(crate::command_label("solve.static.grid")), "it runs off the window thread");
+        app.wait_loaded();
+        assert!(app.dialog.is_none() && app.status.as_ref().is_some_and(|s| !s.error && s.text.contains("unknowns")), "{:?}", app.status);
+        let reply = app.reply.clone().unwrap();
+        assert_eq!((reply.command.as_str(), reply.value["body"].as_str()), ("solve.static.grid", Some("Bracket")));
+        assert_eq!(reply.params["degree"], 2, "Run again takes what the solve took: {}", reply.params);
+        // The plot: von Mises contours on the sampled surface, not on the (empty) mesh.
+        let plot = app.plot().unwrap();
+        assert!(!plot.display.tris.is_empty() && app.display().tris.is_empty());
+        assert!(plot.contour.as_ref().is_some_and(|c| c.field == fieldcraft_engine::results::Field::VonMises && c.max.1 > c.min.1));
+        let (scene_tris, plot_tris) = (app.scene().1.tris.len(), plot.display.tris.len());
+        assert!(scene_tris >= plot_tris, "{scene_tris} drawn of {plot_tris}");
+        // A probed surface point is named apart from the mesh's nodes.
+        let node = plot.display.nodes.first().map(|n| n.label).unwrap();
+        app.probe_node(node).unwrap();
+        let probe = app.probe.clone().unwrap();
+        assert_eq!(probe.lines.first().map(String::as_str), Some("Surface point 1"));
+        assert!(probe.lines.iter().any(|l| l.starts_with("Mises")), "{:?}", probe.lines);
+        // A failure stays in the form, and the result shown stays.
+        app.open_form("solve.static.grid", json!({"cell_size": 12, "degree": 2, "body": "Nope"}));
+        app.submit_dialog();
+        app.wait_loaded();
+        assert!(app.dialog.as_ref().is_some_and(|d| d.error.as_deref().is_some_and(|e| e.contains("no body `Nope`"))), "{:?}", app.status);
+        assert!(app.plot().is_some());
     }
 
     /// The control channel's `ui.start` never opens a picker: it opens the form.

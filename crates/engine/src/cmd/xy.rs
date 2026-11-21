@@ -425,6 +425,7 @@ fn natural(step: &str, r: &StepResult) -> Result<Axis> {
 fn xy(s: &mut Session, p: &Value) -> Result<Value> {
     let step = step_for(s, p, Want::Any)?;
     let (r, current) = s.latest_result(&step).ok_or_else(|| EngineError::Params(format!("step `{step}` has no result")))?;
+    r.on_mesh("results.xy")?;
     let x_travel = p.get("x").filter(|x| x.is_object());
     let axis = match x_travel {
         Some(_) => None,

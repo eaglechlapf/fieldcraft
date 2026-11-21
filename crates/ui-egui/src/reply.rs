@@ -26,7 +26,7 @@ pub struct Reply {
 }
 
 /// The solvers whose reply is a step's summary ([`solve_summary`]).
-const SOLVES: [&str; 6] = ["solve.static", "solve.nonlinear", "solve.heat", "solve.frequency", "solve.buckle", "solve.explicit"];
+const SOLVES: [&str; 7] = ["solve.static", "solve.static.grid", "solve.nonlinear", "solve.heat", "solve.frequency", "solve.buckle", "solve.explicit"];
 
 /// Replies that only read the model, refreshed when it changes; any other reply closes then.
 pub const LIVE: [&str; 3] = ["model.check", "model.activity", "geometry.defeature.propose"];
@@ -908,6 +908,13 @@ fn solve_line(v: &Value, units: Option<&DisplaySystem>) -> String {
     if let Some(n) = v["dofs"].as_u64() {
         parts.push(format!("{} DOFs", count(n)));
     }
+    // A grid solve: its unknowns, and how long it took.
+    if let Some(n) = v["unknowns"].as_u64() {
+        parts.push(format!("{} unknowns", count(n)));
+    }
+    if let Some(s) = v["seconds"].as_f64() {
+        parts.push(format!("{} s", number(s)));
+    }
     parts.join(", ")
 }
 
@@ -919,6 +926,8 @@ enum Row {
     Vector(Quantity),
     Count,
     Text,
+    /// Wall-clock seconds: the time a solve took, not a time of the model.
+    Seconds,
 }
 
 /// A solve's summary: the step's peaks and totals with their units first, round-off as 0, rows
@@ -927,8 +936,9 @@ enum Row {
 fn solve_summary(ui: &mut egui::Ui, t: &Tokens, v: &Value, units: Option<&DisplaySystem>) {
     let Some(m) = v.as_object() else { return value(ui, t, egui::Id::unique("fc_reply_solve"), v, 0) };
     let steady = m.get("frames").and_then(Value::as_u64).is_some_and(|n| n <= 1);
-    let rows: [(&str, &str, Row); 18] = [
+    let rows: [(&str, &str, Row); 27] = [
         ("step", "Step", Row::Text),
+        ("body", "Body", Row::Text),
         ("max_displacement", "Max |U|", Row::Peak(Quantity::Length)),
         ("max_von_mises", "Max Mises", Row::Peak(Quantity::Pressure)),
         ("max_temperature", "Max T", Row::Peak(Quantity::Temperature)),
@@ -946,6 +956,15 @@ fn solve_summary(ui: &mut egui::Ui, t: &Tokens, v: &Value, units: Option<&Displa
         ("dofs", "Degrees of freedom", Row::Count),
         ("elements", "Elements", Row::Count),
         ("frames", "Frames", Row::Count),
+        // A grid solve (solve.static.grid): its grid and how well the grid holds the part.
+        ("cell_size", "Cell size", Row::Number(Quantity::Length)),
+        ("degree", "Degree", Row::Count),
+        ("unknowns", "Unknowns", Row::Count),
+        ("cells", "Cells with material", Row::Count),
+        ("volume", "Volume in the cells", Row::Number(Quantity::Volume)),
+        ("surface_volume", "Volume of the body", Row::Number(Quantity::Volume)),
+        ("strain_energy", "Strain energy", Row::Number(Quantity::Energy)),
+        ("seconds", "Run time", Row::Seconds),
     ];
     let mut shown: Vec<&str> = Vec::new();
     {
@@ -958,8 +977,10 @@ fn solve_summary(ui: &mut egui::Ui, t: &Tokens, v: &Value, units: Option<&Displa
             }
             let text = match row {
                 Row::Number(q) => x.as_f64().map(|f| with_unit(number(f), unit(*q, units).as_deref())),
+                // A mesh solve's peak is at a node; a grid solve's at a point of a face, which
+                // have rows of their own below.
                 Row::Peak(q) => x["value"].as_f64().map(|f| {
-                    let at = x["node"].as_u64().map_or_else(String::new, |n| format!(" at node {n}"));
+                    let at = x["node"].as_u64().filter(|_| x.get("at").is_none()).map_or_else(String::new, |n| format!(" at node {n}"));
                     format!("{}{at}", with_unit(number(f), unit(*q, units).as_deref()))
                 }),
                 Row::Vector(q) => {
@@ -967,9 +988,18 @@ fn solve_summary(ui: &mut egui::Ui, t: &Tokens, v: &Value, units: Option<&Displa
                 }
                 Row::Count => x.as_u64().map(count),
                 Row::Text => inline(x),
+                Row::Seconds => x.as_f64().map(|f| format!("{} s", number(f))),
             };
             if let Some(text) = text {
                 kit::row(ui, label, |ui| kit::text(ui, &text, kit::Text::Cell));
+            }
+            if let (Row::Peak(_), Some(p)) = (row, x.get("at").and_then(|p| serde_json::from_value::<Vec<f64>>(p.clone()).ok())) {
+                let at = with_unit(components(&p, 0.0), unit(Quantity::Length, units).as_deref());
+                kit::value_row(ui, "at", &at);
+                // A persistent face name can be long: its row wraps.
+                if let Some(face) = x["face"].as_str() {
+                    kit::value_row(ui, "on face", face);
+                }
             }
         }
     }
@@ -991,6 +1021,34 @@ fn solve_summary(ui: &mut egui::Ui, t: &Tokens, v: &Value, units: Option<&Displa
                 .collect();
             text_table(ui, "fc_reply_solve_modes", &["Mode", if buckling { "Load factor" } else { "Frequency [Hz]" }], &rows);
             more(ui, t, modes.len());
+        });
+    }
+    // A grid solve's convergence check: how far the solution is from the one a degree lower.
+    if let Some(c) = m.get("convergence").filter(|c| c.is_object()) {
+        shown.push("convergence");
+        let lower = c["against_degree"].as_u64().map_or_else(String::new, |d| format!(" from degree {d}"));
+        let percent = |x: &Value| x.as_f64().map(|f| format!("{} %{lower}", number(100.0 * f)));
+        for (key, label) in [("peak_von_mises", "Peak Mises change"), ("von_mises", "Local Mises change"), ("strain_energy", "Energy change")] {
+            if let Some(text) = percent(&c[key]) {
+                kit::row(ui, label, |ui| kit::text(ui, &text, kit::Text::Cell));
+            }
+        }
+    }
+    // A grid solve's supports: the force each supported face carries.
+    if let Some(reactions) = m.get("reactions").and_then(Value::as_array).filter(|a| !a.is_empty()) {
+        shown.push("reactions");
+        kit::section_count(ui, "fc_reply_solve_reactions", "Reactions", true, Some(reactions.len()), |ui| {
+            let rows: Vec<Vec<String>> = reactions
+                .iter()
+                .take(MAX_ROWS)
+                .map(|x| {
+                    let force = serde_json::from_value::<Vec<f64>>(x["force"].clone()).ok();
+                    vec![x["face"].as_str().unwrap_or_default().to_string(), force.map_or("—".into(), |f| components(&f, 0.0))]
+                })
+                .collect();
+            let force = with_unit("Force".into(), unit(Quantity::Force, units).map(|u| format!("[{u}]")).as_deref());
+            text_table(ui, "fc_reply_solve_reactions", &["Face", &force], &rows);
+            more(ui, t, reactions.len());
         });
     }
     if let Some(w) = m.get("warnings").and_then(Value::as_array) {

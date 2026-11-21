@@ -124,7 +124,13 @@ fn extreme_lines(plot: &Plot) -> Option<[(String, u32); 2]> {
     let l = plot.contour.as_ref()?;
     let unit = l.field.unit(&plot.result, &plot.units);
     let scale = l.max.1.abs().max(l.min.1.abs());
-    let at = |node: u32| match plot.extreme_position(node).filter(|_| plot.is_fluid()) {
+    // A cell of a fluid step and a surface point of a grid solve are named by where they are: the
+    // point of the body, not where a magnified deformation draws it.
+    let place = |node: u32| match plot.result.own_display() {
+        Some(surface) => surface.node_position(node),
+        None => plot.extreme_position(node).filter(|_| plot.is_fluid()),
+    };
+    let at = |node: u32| match place(node) {
         Some(p) => {
             let at = fieldcraft_engine::results::shown_all(Quantity::Length, [p.x, p.y, p.z], &plot.units);
             format!("at {}", with_unit(components(&at, 0.0), unit_of(Quantity::Length, &plot.units).as_deref()))
@@ -727,7 +733,7 @@ fn probed(app: &ModelApp, plot: &Plot, ui: &mut egui::Ui) -> Option<Value> {
         kit::status_line(ui, "Click the model to probe a node", kit::StatusTone::Dim);
         return None;
     };
-    kit::text(ui, &format!("Node {}", p.node), kit::Text::Heading("fc_results_probe"));
+    kit::text(ui, &crate::results::probe_title(p.node), kit::Text::Heading("fc_results_probe"));
     for (what, value) in &p.rows {
         kit::row(ui, what, |ui| kit::copy_cell(ui, value, &format!("{what}: {value}"), false, "Copy the value"));
     }
@@ -1238,10 +1244,19 @@ fn reactions_table(ui: &mut egui::Ui, r: &Value, plot: &Plot) {
         .into_iter()
         .flatten()
         .map(|s| {
-            let nodes = s["nodes"].as_u64().unwrap_or(0);
-            (format!("{} ({} nodes)", s["set"].as_str().unwrap_or("?"), count(nodes)), vector(&s["force"]), vector(&s["moment"]))
+            // A mesh solve sums over a set's nodes; a grid solve over the faces it names.
+            let over = match s["faces"].as_u64() {
+                Some(1) => "1 face".to_string(),
+                Some(faces) => format!("{} faces", count(faces)),
+                None => format!("{} nodes", count(s["nodes"].as_u64().unwrap_or(0))),
+            };
+            (format!("{} ({over})", s["set"].as_str().unwrap_or("?")), vector(&s["force"]), vector(&s["moment"]))
         })
-        .chain(std::iter::once(("All nodes".to_string(), vector(&r["total"]["force"]), vector(&r["total"]["moment"]))))
+        .chain(std::iter::once((
+            if r["total"]["faces"].is_u64() { "All supported faces" } else { "All nodes" }.to_string(),
+            vector(&r["total"]["force"]),
+            vector(&r["total"]["moment"]),
+        )))
         .collect();
     let applied = vector(&r["applied"]);
     let largest = |vs: &mut dyn Iterator<Item = [f64; 3]>| vs.flatten().map(f64::abs).filter(|x| x.is_finite()).fold(0.0, f64::max);

@@ -1914,6 +1914,7 @@ version = "0.8.1"
 dependencies = [
  "fieldcraft-decks",
  "fieldcraft-explicit",
+ "fieldcraft-fcm",
  "fieldcraft-fem",
  "fieldcraft-geometry",
  "fieldcraft-io",

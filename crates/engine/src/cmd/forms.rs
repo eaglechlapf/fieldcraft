@@ -2700,6 +2700,7 @@ pub const SAMPLE: &[Field] = &[choice(
         ("cooling-enclosure", "Sealed enclosure cooling"),
         ("cooling-aio", "AIO cooler radiator"),
         ("heated-bracket", "Heated bracket"),
+        ("bracket-grid", "Bracket without a mesh"),
         ("bracket-hex", "Hex-meshed bracket"),
         ("crank-arm", "Bicycle crank arm"),
         ("crank-mirror", "Mirrored crank arm"),
@@ -2772,6 +2773,27 @@ const MAX_FACTOR: Field = int("max_factor_entries", "Max factor entries", 1, sup
 const THREADS: Field = int("threads", "Threads", 1, 256).help("Threads to use; the session's setting when empty.").hint("the session's");
 
 pub const SOLVE_STATIC: &[Field] = &[STEP, MAX_DOFS, MAX_FACTOR, THREADS];
+pub const SOLVE_STATIC_GRID: &[Field] = &[
+    STEP,
+    reference("body", "Body", C::Body).help("The body of the design to solve, on its own; the only one when empty.").hint("the only one"),
+    positive("cell_size", "Cell size", D::Length)
+        .help("The size of the grid's cubic cells, the same everywhere. For a stress peak at a hole or a fillet within about 1 %: two cells per radius of the smallest stressed feature at degree 4, or four at degree 3. Displacements and reactions need far less.")
+        .hint("1/20 of the diagonal"),
+    int("degree", "Degree", 1, super::static_grid::MAX_DEGREE)
+        .help("The polynomial degree of the shape functions on every cell. With one cell per radius of a hole or fillet the stress peak is good to about 10 % at degree 3, 6.5 % at degree 4 and 3 % at degree 5.")
+        .def("3"),
+    flag("check_convergence", "Check convergence")
+        .help("Also solves one degree lower on the same grid and reports how much the peak von Mises stress and the strain energy changed: an indicator of convergence, not a bound of the error."),
+    positive("tolerance", "Chordal tolerance", D::Length)
+        .help("Largest distance between the triangulated surface, which is all the solver knows of the body, and the true curved surface.")
+        .hint("1e-3 of the diagonal"),
+    positive("sample_size", "Result sampling", D::Length)
+        .help("The results are read at points of the body's surface no farther apart than this, for the contours.")
+        .hint("cell size / degree"),
+    MAX_DOFS,
+    MAX_FACTOR,
+    THREADS,
+];
 pub const SOLVE_NONLINEAR: &[Field] = &[
     STEP,
     MAX_DOFS,
@@ -3181,6 +3203,7 @@ mod tests {
                     max_steiner: 10,
                     max_tets: 100,
                     max_hex_elements: 100,
+                    max_grid_dofs: 100,
                     max_import_nodes: 10,
                     max_import_elements: 100,
                     max_import_members: 100,
@@ -3243,6 +3266,7 @@ mod tests {
                     max_steiner: 10,
                     max_tets: 100,
                     max_hex_elements: 100,
+                    max_grid_dofs: 100,
                     max_import_nodes: 10,
                     max_import_elements: 100,
                     max_import_members: 100,

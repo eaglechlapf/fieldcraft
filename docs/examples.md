@@ -105,6 +105,23 @@ and a point moves α ΔT times its distance from the hole's axis. The upright's 
 mm along x (within 2 %); the foot's end, 16 mm from the clamped bore, which cannot grow, moves
 0.0228 mm against 0.024 mm (within 6 %).
 
+## Bracket without a mesh (`bracket-grid`)
+
+The filleted bracket in steel with no mesh at all: the foot's underside clamped, 2 kN in +x on
+the end of the upright. **Solve** needs a mesh and stays grey; **Solve ▸ Grid Static**
+(`solve.static.grid`) solves the step on a background grid in a few seconds
+([Grid Static](grid-static.md)). Meshed (Mesh ▸ Tet Mesh), **Static** solves the same step, so the
+two solvers can be compared on one model.
+
+**Look at:** the von Mises contours on the surface, and the summary in the panel: unknowns,
+cells, the reaction of the clamped face, the volume the cells integrated.
+
+**Check:** the peak von Mises stress on the fillet face
+(`solve.probe {"step": "Load", "set": "fillet"}`) against the 213 MPa of the oracle case
+`tests/oracle/filleted-bracket-fillet-stress`: within 3 % with 4 mm cells of degree 3 (grids of
+this fineness are up to 7 % off, see [Grid Static](grid-static.md)); the clamped face carries the
+whole 2 kN.
+
 ## Hex-meshed bracket (`bracket-hex`)
 
 ![Von Mises stress on the all-hex bracket, O-grids round both holes, peaking at the upright's hole](media/examples/bracket-hex.png)

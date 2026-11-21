@@ -5,6 +5,7 @@
 # User guide
 
 - [Examples](examples.md)
+- [Grid Static: a static solve without a mesh](grid-static.md)
 - [AI agents (MCP)](mcp.md)
 - [Units](units.md)
 - [Read an Abaqus input deck](abaqus-import.md)

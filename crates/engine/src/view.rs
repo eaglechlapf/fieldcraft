@@ -546,6 +546,8 @@ fn picture(s: &Session, p: &Palette, section: Option<Section>, toward: Vec3) -> 
         }
         return Picture { scene, drawn: base, bounds, shown, glyphs, colors, datums: Aabb3::EMPTY, bodies };
     }
+    // A grid solve's result is drawn on the surface it was sampled on, not on the model's mesh.
+    let base = result.own_display().unwrap_or(&base);
     let pick = view.pick();
     let nodes = result.nodes();
     let u = displacements(result, pick).unwrap_or(&[]);

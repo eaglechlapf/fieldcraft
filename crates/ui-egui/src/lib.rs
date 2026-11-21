@@ -1156,7 +1156,8 @@ impl ModelApp {
     fn read_probe(&mut self, reply: &Value, node: u32, step: String, pick: fieldcraft_engine::results::Pick) -> Probe {
         let plot = self.plot();
         let rows = probe_rows(reply, plot.as_deref(), self.session.units(), node, pick.mode);
-        let lines: Vec<String> = std::iter::once(format!("Node {node}")).chain(rows.iter().map(|(what, value)| format!("{what} {value}"))).collect();
+        let lines: Vec<String> =
+            std::iter::once(results::probe_title(node)).chain(rows.iter().map(|(what, value)| format!("{what} {value}"))).collect();
         Probe { node, step, mode: pick.mode, frame: pick.frame, rows, lines }
     }
 
@@ -1313,13 +1314,16 @@ impl ModelApp {
         if self.plot.0 != key {
             self.display();
             let still = key.as_ref().map(|k| PlotKey { frame: None, ..k.clone() });
+            // A grid solve's result is drawn on the surface it was sampled on, not on the model's mesh.
+            let shown = results::shown(&self.session).map(|(_, result, _)| result.clone());
+            let base = shown.as_deref().and_then(|r| r.own_display()).unwrap_or(&self.display.1);
             if self.prepared.0 != still {
                 let pick = key.as_ref().map(|k| k.pick).unwrap_or_default();
                 let bodies: Vec<&str> = self.pick.names.iter().map(|n| n.name.as_str()).collect();
-                self.prepared = (still, results::prepare(&self.session, &self.display.1, pick, &bodies).unwrap_or_default());
+                self.prepared = (still, results::prepare(&self.session, base, pick, &bodies).unwrap_or_default());
             }
             let frame = key.as_ref().and_then(|k| k.frame);
-            let p = key.as_ref().and_then(|_| results::plot(&self.session, &self.display.1, frame, &self.prepared.1));
+            let p = key.as_ref().and_then(|_| results::plot(&self.session, base, frame, &self.prepared.1));
             self.plot = (key, p.map(Arc::new));
         }
         self.plot.1.clone()

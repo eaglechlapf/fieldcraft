@@ -17,6 +17,7 @@ fieldcraft-io = { workspace = true }
 fieldcraft-decks = { workspace = true }
 fieldcraft-solver = { workspace = true }
 fieldcraft-explicit = { workspace = true }
+fieldcraft-fcm = { workspace = true }
 fieldcraft-fem = { workspace = true }
 fieldcraft-lbm = { workspace = true }
 fieldcraft-parallel = { workspace = true }

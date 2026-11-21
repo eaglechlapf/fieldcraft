@@ -17,7 +17,15 @@ use crate::{EngineError, Result, Session, crash};
 pub(crate) fn is_solve(id: &str) -> bool {
     matches!(
         id,
-        "solve.run" | "solve.static" | "solve.nonlinear" | "solve.heat" | "solve.frequency" | "solve.buckle" | "solve.explicit" | "solve.fluid"
+        "solve.run"
+            | "solve.static"
+            | "solve.static.grid"
+            | "solve.nonlinear"
+            | "solve.heat"
+            | "solve.frequency"
+            | "solve.buckle"
+            | "solve.explicit"
+            | "solve.fluid"
     )
 }
 

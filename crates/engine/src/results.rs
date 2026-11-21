@@ -37,13 +37,145 @@ pub enum Kind<'a> {
 
 impl StepResult {
     pub fn kind(&self) -> Kind<'_> {
+        fn implicit(r: &fieldcraft_solver::StepResult) -> Kind<'_> {
+            match r {
+                fieldcraft_solver::StepResult::Static(r) => Kind::Static(r),
+                fieldcraft_solver::StepResult::Frequency(r) => Kind::Frequency(r),
+                fieldcraft_solver::StepResult::Heat(r) => Kind::Heat(r),
+            }
+        }
         match self {
-            StepResult::Implicit(fieldcraft_solver::StepResult::Static(r)) => Kind::Static(r),
-            StepResult::Implicit(fieldcraft_solver::StepResult::Frequency(r)) => Kind::Frequency(r),
-            StepResult::Implicit(fieldcraft_solver::StepResult::Heat(r)) => Kind::Heat(r),
+            StepResult::Implicit(r) => implicit(r),
             StepResult::Explicit(r) => Kind::Explicit(r),
             StepResult::Fluid(r) => Kind::Fluid(r),
+            // A static result like any other to the display: its nodes are the surface's vertices.
+            StepResult::Grid(r) => implicit(&r.result),
         }
+    }
+
+    /// The result of a grid solve (`solve.static.grid`), which is kept on the body's surface and
+    /// not on the model's mesh.
+    pub fn grid(&self) -> Option<&GridResult> {
+        match self {
+            StepResult::Grid(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    /// What the result is drawn on when that is not the model's mesh: a grid solve's sampled
+    /// surface.
+    pub fn own_display(&self) -> Option<&fieldcraft_render::DisplayMesh> {
+        self.grid().map(|g| &g.display)
+    }
+
+    /// Refuse a result that is not on the model's mesh, for `what` (a command that reads values
+    /// at the mesh's nodes and elements).
+    pub fn on_mesh(&self, what: &str) -> Result<()> {
+        match self.grid() {
+            Some(g) => Err(EngineError::Params(format!(
+                "step `{}` was solved on the grid (solve.static.grid): its result is kept on the surface of body `{}`, and {what} reads results on a mesh (solve.static)",
+                self.step(),
+                g.body
+            ))),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The first label of a grid result's surface vertices and triangles: above every label a mesh
+/// can have ([`fieldcraft_model::MAX_LABEL`]), so a value kept on the surface is never taken for
+/// a mesh node's.
+pub const GRID_LABELS: u32 = fieldcraft_model::MAX_LABEL + 1;
+
+/// The number (from 1) of the surface vertex a grid result's node label stands for; `None` for a
+/// mesh label.
+pub fn grid_vertex(label: u32) -> Option<u32> {
+    label.checked_sub(GRID_LABELS).map(|k| k + 1)
+}
+
+/// The reaction of one supported face of a grid solve.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FaceReaction {
+    /// The face's persistent name.
+    pub face: String,
+    /// The force the support exerts on the part (SI).
+    pub force: [f64; 3],
+}
+
+/// A static step solved on a background grid for one body (`solve.static.grid`,
+/// [`fieldcraft_fcm`]): the solver's displacement and stress, sampled at the vertices of the
+/// body's triangulated surface.
+///
+/// The samples are a [`fieldcraft_solver::StaticResult`] whose "nodes" are the surface's
+/// vertices, labelled from [`GRID_LABELS`], so the results display (contours, the deformed
+/// shape, the legend, probes) reads them as it reads a mesh solve's, drawn on [`Self::display`]
+/// in place of the model's mesh. Nothing that needs elements (exports, paths, linearization,
+/// reaction sums over sets) applies ([`StepResult::on_mesh`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GridResult {
+    /// The body solved.
+    pub body: String,
+    /// The sampled values; always a static result.
+    pub result: fieldcraft_solver::StepResult,
+    /// The sampled surface as drawn (metres): its triangles with their vertices' labels, the
+    /// vertices as nodes, and the edges between the body's faces as feature lines.
+    pub display: fieldcraft_render::DisplayMesh,
+    /// The body's face (its name) each triangle of [`Self::display`] lies on.
+    pub tri_face: Vec<u32>,
+    /// The names of the body's faces, by the index [`Self::tri_face`] holds.
+    pub faces: Vec<String>,
+    /// The reaction of every supported face.
+    pub reactions: Vec<FaceReaction>,
+}
+
+impl GridResult {
+    /// The sampled vertex nearest to each point (the lowest label on a tie), where it is and how
+    /// far.
+    pub fn nearest(&self, at: &[[f64; 3]]) -> Result<Vec<(u32, [f64; 3], f64)>> {
+        at.iter()
+            .map(|p| {
+                let p = fieldcraft_render::Vec3::from(*p);
+                self.display
+                    .nodes
+                    .iter()
+                    .map(|n| (n.label, [n.p.x, n.p.y, n.p.z], n.p.dist(p)))
+                    .min_by(|a, b| a.2.total_cmp(&b.2))
+                    .ok_or_else(|| EngineError::Params("the result has no surface points to probe".into()))
+            })
+            .collect()
+    }
+
+    /// The sampled vertices on the faces `on` picks by name (those of the faces' triangles, so
+    /// the faces' edges too), in label order.
+    pub fn points_on(&self, on: impl Fn(&str) -> bool) -> Vec<u32> {
+        let picked: Vec<bool> = self.faces.iter().map(|f| on(f)).collect();
+        let on_face = |face: &u32| picked.get(*face as usize).copied().unwrap_or(false);
+        let mut out: Vec<u32> = self.display.tris.iter().zip(&self.tri_face).filter(|(_, face)| on_face(face)).flat_map(|(t, _)| t.nodes).collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// The name of the face a sampled vertex lies on (the face of the first triangle that has
+    /// it; a vertex on an edge belongs to several).
+    pub fn face_of(&self, label: u32) -> Option<&str> {
+        self.faces_of(&[label]).remove(&label)
+    }
+
+    /// [`Self::face_of`] for several vertices, in one pass over the triangles.
+    pub fn faces_of(&self, labels: &[u32]) -> std::collections::BTreeMap<u32, &str> {
+        let wanted: std::collections::BTreeSet<u32> = labels.iter().copied().collect();
+        let mut out = std::collections::BTreeMap::new();
+        for (t, face) in self.display.tris.iter().zip(&self.tri_face) {
+            let Some(name) = self.faces.get(*face as usize) else { continue };
+            for label in t.nodes.iter().filter(|n| wanted.contains(n)) {
+                out.entry(*label).or_insert(name.as_str());
+            }
+            if out.len() == wanted.len() {
+                break;
+            }
+        }
+        out
     }
 }
 

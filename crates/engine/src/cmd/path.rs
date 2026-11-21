@@ -118,6 +118,8 @@ fn path(s: &mut Session, p: &Value) -> Result<Value> {
     fieldcraft_model::progress::check()?;
     let step = step_for(s, p, Want::Any)?;
     let result = current_result(s, &step)?;
+    // A path runs through the mesh's elements.
+    result.on_mesh("results.path")?;
     let field_id = p.get("field").filter(|v| !v.is_null()).ok_or_else(|| EngineError::param("field", crate::schema::ProblemKind::Required))?;
     let field = field_id.as_str().and_then(Field::parse).ok_or_else(|| EngineError::invalid("field", "use a supported nodal contour field id"))?;
     let pick = pick(&result, field, p)?;

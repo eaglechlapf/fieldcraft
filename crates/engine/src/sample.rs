@@ -11,7 +11,8 @@
 //! explicit dynamic step.
 //!
 //! The examples gallery (docs/examples.md), each ready to solve with `solve.run`:
-//! [`ibeam`], [`drop_test`], [`rubber_seal`], [`flow_past`], [`heated_bracket`], [`bracket_hex`] and [`crank_arm`]. Their
+//! [`ibeam`], [`drop_test`], [`rubber_seal`], [`flow_past`], [`heated_bracket`], [`bracket_hex`] and [`crank_arm`];
+//! [`bracket_grid`] has no mesh and is ready for `solve.static.grid`. Their
 //! geometry is a SolidCraft script run when the sample opens ([`Sample::design`]): a corpus
 //! recipe (`tests/corpus`) or [`UPRIGHT_BRACKET`].
 
@@ -135,6 +136,14 @@ pub const SAMPLES: &[Sample] = &[
         design: Some(FILLETED_BRACKET),
         prepare: None,
         script: |_| heated_bracket(),
+    },
+    Sample {
+        name: "bracket-grid",
+        label: "Bracket Without a Mesh",
+        about: "The filleted steel bracket clamped under its foot with 2 kN on its top, and no mesh: ready for Solve › Grid Static (the fillet's von Mises stress is 213 MPa)",
+        design: Some(FILLETED_BRACKET),
+        prepare: None,
+        script: |_| bracket_grid(),
     },
     Sample {
         name: "bracket-hex",
@@ -550,6 +559,32 @@ pub fn heated_bracket() -> Value {
         {"command": "model.boundary_condition.create", "params": {"name": "Heater", "type": "temperature", "target": {"set": "hot"}, "value": HEATER}},
         {"command": "model.load.create", "params": {"name": "Air", "type": "convection", "set": "skin", "film": "10 W/(m^2 K)", "sink": AMBIENT}},
         {"command": "model.step.create", "params": {"name": "Heat", "procedure": {"type": "coupled_temperature_displacement"}, "boundary_conditions": ["Clamp", "Heater"], "loads": ["Air"]}},
+    ])
+}
+
+/// The push on the top of [`bracket_grid`]'s bracket.
+pub const BRACKET_PUSH: Typed = Typed::new(2.0, "kN");
+
+/// [`FILLETED_BRACKET`] in steel with no mesh, set up as the oracle's fillet stress case
+/// (`tests/oracle/filleted-bracket-fillet-stress`, whose mesh-independent peak von Mises stress
+/// on the fillet is 213 MPa): the foot's underside (`F2:side:l1`, set `foot`) clamped,
+/// [`BRACKET_PUSH`] in +x on the upright's end (`F2:side:l5`, set `top`), the fillet face as set
+/// `fillet`. Step `Load` (linear static), which `solve.static.grid` solves as it is; meshed
+/// (`mesh.tet.generate`), `solve.static` solves the same step.
+pub fn bracket_grid() -> Value {
+    let face = |f: &str| json!([{"body": "Bracket", "face": f}]);
+    let push = sample_value(Quantity::Force, BRACKET_PUSH);
+    json!([
+        {"command": "model.units", "params": {"system": "mm-t-s-N-MPa"}},
+        {"command": "model.set.create", "params": {"name": "bracket", "geometry": [{"body": "Bracket"}]}},
+        {"command": "model.material.create", "params": {"name": "Steel", "elastic": {"type": "isotropic", "young": STEEL_YOUNG, "poisson": 0.3}, "density": STEEL_DENSITY}},
+        {"command": "model.section.create", "params": {"name": "Bracket", "set": "bracket", "material": "Steel", "kind": {"type": "solid"}}},
+        {"command": "model.set.create", "params": {"name": "foot", "geometry": face("F2:side:l1")}},
+        {"command": "model.set.create", "params": {"name": "top", "geometry": face("F2:side:l5")}},
+        {"command": "model.set.create", "params": {"name": "fillet", "geometry": face("F3:blend(F2:side:l3|F2:side:l4)")}},
+        {"command": "model.boundary_condition.create", "params": {"name": "Clamp", "type": "fixed", "target": {"set": "foot"}}},
+        {"command": "model.load.create", "params": {"name": "Push", "type": "force", "target": {"set": "top"}, "vector": [push, 0, 0]}},
+        {"command": "model.step.create", "params": {"name": "Load", "procedure": {"type": "static"}, "boundary_conditions": ["Clamp"], "loads": ["Push"]}},
     ])
 }
 
@@ -1159,6 +1194,43 @@ mod tests {
         let reaction = s.execute("results.reactions", &json!({"step": "Load", "sets": ["top"]})).unwrap();
         assert!((reaction["sets"][0]["force"][1].as_f64().unwrap() - 1000.0).abs() < 1e-6, "{reaction}");
         assert!(r["max_von_mises"]["value"].as_f64().unwrap() > 200.0, "{r}");
+    }
+
+    /// The bracket without a mesh opens with nothing to mesh-solve and everything the grid
+    /// solver needs. Solved coarsely there (12 mm cells of degree 2), the foot carries the push
+    /// and the cells integrate the bracket's volume.
+    #[test]
+    fn the_bracket_without_a_mesh_solves_on_the_grid() {
+        let mut s = Session::default();
+        s.execute("file.sample", &json!({"name": "bracket-grid"})).unwrap();
+        assert!(s.model.elements().is_empty() && !s.is_dirty());
+        assert!(s.execute("solve.run", &json!({})).unwrap_err().to_string().contains("Needs a mesh"));
+        let r = s.execute("solve.static.grid", &json!({"cell_size": 12, "degree": 2})).unwrap();
+        let push = sample_value(Quantity::Force, BRACKET_PUSH);
+        assert!((r["reaction_total"][0].as_f64().unwrap() + push).abs() < 1e-6 * push, "{r}");
+        assert_eq!(r["applied_total"], json!([push, 0.0, 0.0]), "{r}");
+        assert_eq!(r["reactions"][0]["face"], "F2:side:l1", "{r}");
+        // The corpus recipe's volume (tests/corpus/filleted-bracket), within the tessellation's.
+        assert!((r["volume"].as_f64().unwrap() - 32144.778925).abs() < 2e-3 * 32144.778925, "{r}");
+        assert!(r["max_von_mises"]["value"].as_f64().unwrap() > 50.0 && r["max_displacement"]["value"].as_f64().unwrap() > 0.0, "{r}");
+        assert_eq!(s.results_view.as_ref().map(|v| v.step.as_str()), Some("Load"));
+    }
+
+    /// The oracle's reference for this bracket (`tests/oracle/filleted-bracket-fillet-stress`):
+    /// a peak von Mises stress of 213 MPa on the fillet face, the mesh-independent value of a
+    /// study of quadratic tetrahedral meshes. 4 mm cells of degree 3 (the command's defaults give
+    /// 4.4 mm) are within 3 % of it.
+    #[test]
+    #[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
+    fn the_bracket_on_the_grid_has_the_fillet_stress_of_the_oracle() {
+        let mut s = Session::default();
+        s.execute("file.sample", &json!({"name": "bracket-grid"})).unwrap();
+        let r = s.execute("solve.static.grid", &json!({"cell_size": 4, "degree": 3})).unwrap();
+        let fillet = s.execute("solve.probe", &json!({"step": "Load", "set": "fillet"})).unwrap();
+        let peak = fillet["max_von_mises"]["value"].as_f64().unwrap();
+        assert!((peak - 213.0).abs() < 0.03 * 213.0, "fillet peak {peak} MPa; {r}");
+        let push = sample_value(Quantity::Force, BRACKET_PUSH);
+        assert!((r["reaction_total"][0].as_f64().unwrap() + push).abs() < 1e-6 * push, "{r}");
     }
 
     /// The crank opens as one conforming structured hex20 mesh: the half meshed in blocks
