@@ -6,7 +6,8 @@ polynomial shape functions of a chosen degree, and the equations are integrated 
 only (the finite cell method, `crates/fcm`). Short edges, sliver faces and small fillets, which
 can stop a mesher, are only places where a cell is cut. Where the surface is curved tightly the
 cells are divided into smaller ones, so a fillet or a hole is resolved without fine cells
-everywhere.
+everywhere. Material on the two sides of a gap that is narrower than a cell (the open corner of
+a sheet metal part, a slit, the fins of a heat sink) is kept apart, as it is in the part.
 
 The model is the one a mesh solve reads: a material and a solid section on the body, boundary
 conditions and loads on sets of its faces, a static step. So the same model can be solved both
@@ -80,6 +81,7 @@ mesh; each solve replaces the step's result.
 | `cell_size` | 1/20 of the bounding-box diagonal | The size of the grid's cubic cells (a length). |
 | `degree` | 3 | The polynomial degree of the shape functions, 1 to 8. |
 | `refine` | 1 | Levels of local refinement, 0 to 6: a cell across which the surface is curved more tightly than it resolves is divided into eight, this many times at most. `levels` in the reply counts the cells of each level. |
+| `gaps` | `"open"` | `"open"`: material on the two sides of a gap narrower than a cell has unknowns of its own on each side, and the cells where such a gap ends are divided (four times at most). `"joined"`: the part is solved as if such gaps were welded shut wherever a cell reaches across them. See [Narrow gaps](#narrow-gaps-sheet-metal-corners-slits-fins). |
 | `check_convergence` | false | Also solve one degree lower on the same grid and report the change (`convergence`); needs degree 2 or more. |
 | `tolerance` | 1/250 of the smallest cell, at most 1e-3 of the diagonal | The chordal tolerance of the surface's triangulation, which is all the solver knows of the geometry. The smallest cell is `cell_size` halved `refine` times. |
 | `sample_size` | `cell_size` / `degree` | The results are read at points of the surface no farther apart than this; where cells are divided, as much closer as the cells are smaller. |
@@ -115,6 +117,11 @@ divided cell is of `cell_size`). The results display reads them like a mesh solv
   `set` of faces);
 - `results.reactions` sums the reactions over each set of supported faces. The solver gives a
   force per face and not where it acts, so there are no moments.
+
+The reply's `gap_cells` counts the cells that hold material in separate pieces, each with
+unknowns of its own there (`gap_unknowns` more than the grid alone has); neither is there when
+no cell holds a gap. `levels` counts the cells of every level, those divided where gaps end
+included.
 
 Not available yet: the stress inside the part (slices, paths, stress linearization), VTU export,
 XY plots. A grid result is not written to the model file: solve again after opening it.
@@ -189,7 +196,10 @@ with the default triangulation:
 | 12 mm | 2 | 3 mm | 4 | 222 009 | 18.2 s | 212.4 MPa | −0.3 % |
 | 16 mm | 2 | 4 mm | 4 | 124 824 | 10.6 s | 217.2 MPa | +2.0 % |
 
-(Times on a 24-core desktop.) Read with the guidance above, for a fillet of 6 mm:
+(Times on a 24-core desktop. The table was measured again with the narrow gaps open, the
+default: every peak is the same to the digit shown, and a few rows have up to one per cent more
+unknowns, where a cell holds the two sides of a hole.) Read with the guidance above, for a
+fillet of 6 mm:
 
 - with cells of 2.2 mm or less at the fillet at degree 3 (four grids), the peak lies between
   −0.7 % and +0.2 % of the reference; with cells of 3 mm at degree 4 (two grids), −1.1 % and
@@ -225,3 +235,96 @@ Where the answer can be poor:
   holds;
 - `volume` against `surface_volume` shows how well the cut cells were integrated; they agree to
   the tessellation's accuracy.
+
+## Narrow gaps: sheet metal corners, slits, fins
+
+A cell carries one polynomial, and a polynomial cannot tell the two sides of a narrow gap apart.
+Where one cell holds the two flanges at the open corner of a sheet metal part, the two jaws of a
+slit clamp or two fins of a heat sink, it would join them: the part would be solved as if the
+gap were welded shut, with no warning, and far too stiff. So the solver sorts the material of
+every cut cell into the pieces that are not connected inside the cell and gives each piece
+shape functions of its own there; two cells share the functions of the face between them only
+where material goes on through it (`crates/fcm/src/islands.rs`: the overlapping elements of
+Hansbo & Hansbo, 2004). Nothing is to be set or drawn for it: it follows the body's surface,
+and a part without such gaps is solved exactly as before, to the last bit.
+
+Where a gap ends, its two sides are one piece of material again, and the cell at the root
+joins them over its own length. The cells whose shape functions do that are divided, level by
+level (four at most, and no more cells than the part had), until they are no more than two and
+a half widths of the gap across. Nothing else is divided for it. When cells are left that join
+the sides of a gap over more than five of its widths, the reply warns.
+
+**In theory** (`crates/fcm/tests/gap.rs`): a fork whose prongs are 10 mm thick and 1 mm apart,
+on cells of 17 mm, pulled by one prong. The pulled prong must carry the stress of the load and
+the other nothing.
+
+| | Stress in the pulled prong | In the other prong |
+|---|---|---|
+| Gaps joined | 89.2 % of the load, along its whole length | 10.8 % |
+| Gaps open, from two cells off the root on | 100.000 % | 0.000 % |
+| Gaps open, 10 mm from the root | 97.0 % | 4.7 % |
+| The same with the cells divided twice where the gap ends | 100.3 % | 0.3 % |
+
+**On a real part** (`crates/fcm/tests/tray.rs`): a tray of 2 mm steel, 400 × 300 mm with four
+walls 50 mm high bent up from its floor (inside bend radius 2 mm), holes in the floor and the
+walls, and four open corners, where the ends of two walls are 2 mm apart. The form as it opens
+gives cells of 25 mm, a dozen sheet thicknesses. The reference is FieldCraft's own mesh solve of
+the same model on quadratic tetrahedra of 4 mm (920 000 unknowns; 44 s to mesh and 26 s to
+solve, and only with `max_factor_entries` raised to 1.5 billion: with the default the mesh
+solve is refused).
+
+| | Bolted at four holes, 1 kPa on the floor: sag at the passage | Hung by one wall, 100 N on the opposite wall: sag at the passage |
+|---|---|---|
+| Mesh solve (reference) | 0.1532 mm | 2.175 mm |
+| Grid, gaps joined | 0.1508 mm (−1.6 %), 6 s | 0.027 mm (−98.8 %), 6 s |
+| Grid, gaps open, no cells divided where they end (the solver's option, not the form's) | 0.1518 mm (−0.9 %) | 1.054 mm (−52 %) |
+| **Grid as the form opens** (gaps open) | **0.1520 mm (−0.8 %), 9 s** | **1.915 mm (−12 %), 9 s** |
+| The same on cells of 12.5 mm | | 2.044 mm (−6 %), about 20 s |
+
+Bolted, the corners carry little, and joined or open the floor sags the same to a per cent.
+Hung by one wall, everything goes through the bend along that wall and the side walls end free
+at its corners: joined to it they carry the load as ribs, and the tray sags an eightieth of
+what it does.
+
+**Thin sheet is the solver's hard case.** What is left of the error in the hung tray is the
+bend along the clamped wall, 2 mm of sheet bent to an inside radius of 2 mm, on cells of
+12.5 mm that hold all of it: the cells resolve neither the bend nor the reliefs at its ends,
+where the stress concentrates. Finer cells lower it slowly (−6 % on cells of 12.5 mm divided
+once, with 400 000 unknowns), because the cells are cubes and are divided along all three axes
+where a bend needs it across the bend only, and because every cell carries the full degree
+through the thickness, where a plate needs two. So for sheet metal: read the deflection of a
+part whose load goes through a bend as up to a tenth too small on the default grid, and check
+with **Check convergence** or a smaller cell size. Cells that follow the sheet (divided across
+a bend only, a lower degree through the thickness) are the next step for it.
+
+The gaps stay as wide as they are: the solve is linear, and two sides that would close and
+touch under load pass through each other. `"gaps": "joined"` (the form's **Narrow gaps**) solves
+the part as if every gap narrower than a cell were welded shut, which is what a corner seam
+that is welded after bending wants.
+
+## Assemblies: what comes next
+
+The grid solves one body. What it needs for several is what the gaps already use: every piece
+of material has unknowns of its own in the cells it shares with another, and pieces are joined
+only where something joins them. Two bodies are two pieces by definition, so in one grid over
+an assembly no cell joins them by accident, however close they are; what joins them is a
+*connection*, and connections can be found from the geometry instead of being drawn by hand:
+
+1. **Faces that touch.** Two faces of two bodies that lie on each other are found as the meshed
+   solve finds contact pairs (`interaction.contact.find`), and are *bonded* unless told
+   otherwise. On the grid a bond is cheap: the two bodies' pieces in the cells along the common
+   face share their unknowns there (exact for one material; with two, the cell integrates each
+   body with its own constants), or are tied in the weak form over the pieces of the common
+   face (Nitsche's method, as the supports are), which also carries *sliding* (the normal
+   component alone) and later contact.
+2. **Holes in line.** Coaxial holes through bodies that touch are bolt candidates
+   (`interaction.bolt` of the roadmap's M7): a beam with the bolt's section, its head and nut
+   bearing on the annuli around the holes.
+3. **Edges that end on a face.** A plate standing on another is a weld seam candidate
+   (`interaction.weld`).
+
+Each found connection is listed with its kind, its two faces and its area, drawn in the
+viewport, and can be switched (bonded, sliding, free) before the solve: the engineer reviews a
+list instead of building one. In this order: several bodies with their own materials and every
+touching face bonded; the list and its switches; bolts and seams; sliding; contact, which needs
+the nonlinear step.

@@ -2785,6 +2785,9 @@ pub const SOLVE_STATIC_GRID: &[Field] = &[
     int("refine", "Refinement levels", 0, super::static_grid::MAX_REFINE)
         .help("Divides the cells across which the surface is curved more tightly than they resolve (a fillet or hole with fewer than two cells to its radius at degree 4, four at degree 3) into eight, this many times at most. A coarse grid then resolves a small feature without fine cells everywhere. 0 keeps the grid the same everywhere.")
         .def("1"),
+    choice("gaps", "Narrow gaps", &[("open", "Open"), ("joined", "Joined")])
+        .help("Open: material on the two sides of a gap narrower than a cell (the open corner of a sheet metal part, a slit, the fins of a heat sink) is kept apart, as it is in the part, and the cells where such a gap ends are divided. Joined: the part is solved as if such gaps were welded shut.")
+        .def("\"open\""),
     flag("check_convergence", "Check convergence")
         .help("Also solves one degree lower on the same grid and reports how much the peak von Mises stress and the strain energy changed: an indicator of convergence, not a bound of the error."),
     positive("tolerance", "Chordal tolerance", D::Length)
