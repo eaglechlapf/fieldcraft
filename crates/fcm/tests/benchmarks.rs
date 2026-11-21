@@ -17,6 +17,10 @@
 //!   bore as Poisson's ratio approaches one half, against Lamé's closed form. At ν = 0.4999 and
 //!   degrees 4 and 5 the default fictitious stiffness leaves the system singular to working
 //!   precision, and the solver raises it a hundred times.
+//!
+//! Kirsch's plate and LE1 are also solved with local refinement (`Options::refine`): a coarse
+//! grid whose cells are divided at the hole, or towards the end of the ellipse where it is
+//! curved most.
 
 mod common;
 
@@ -47,8 +51,10 @@ fn attempt(
     let started = Instant::now();
     match solve(surface, material, supports, loads, options, &Limits::default()) {
         Ok(solution) => {
+            // With refinement, the cells of each level.
+            let levels = if options.refine > 0 { format!(", cells by level {:?}", &solution.stats.levels[..=options.refine]) } else { String::new() };
             let run = format!(
-                "{case}: cell {}, degree {}: {} unknowns, {:.1} s",
+                "{case}: cell {}, degree {}{levels}: {} unknowns, {:.1} s",
                 options.cell_size,
                 options.degree,
                 solution.stats.unknowns,
@@ -79,11 +85,12 @@ fn turn(i: usize, segments: usize) -> (f64, f64) {
     }
 }
 
-/// A quarter of a square plate of half width `half` with a hole of radius 1, pulled along x.
-fn kirsch(case: &str, half: f64, thin: bool, basis: Basis, cases: &[(f64, usize)]) {
+/// A quarter of a square plate of half width `half` with a hole of radius 1, pulled along x, for
+/// each cell size, degree and number of levels of refinement.
+fn kirsch(case: &str, half: f64, thin: bool, basis: Basis, cases: &[(f64, usize, usize)]) {
     const SEGMENTS: usize = 128;
     let material = Material { young: 1000.0, poisson: 0.3, density: 0.0 };
-    for &(cell, degree) in cases {
+    for &(cell, degree, refine) in cases {
         // Plane strain, one cell thick with both faces on grid planes; or a thin plate with a free
         // face (plane stress), cut by every cell.
         let (thickness, at) = if thin { (0.05, 0.0) } else { (cell, 0.5 * cell) };
@@ -106,7 +113,7 @@ fn kirsch(case: &str, half: f64, thin: bool, basis: Basis, cases: &[(f64, usize)
         let supports = if thin { &supports[..3] } else { &supports[..] };
         let loads = [Load::Traction { face: OUTER_A, traction: [1.0, 0.0, 0.0] }];
         // One cell thick, its two faces on grid planes; the grid is off the part in x and y.
-        let options = Options { degree, basis, offset: [0.37, 0.21, if thin { 0.43 } else { 0.0 }], ..Options::new(cell) };
+        let options = Options { degree, basis, refine, offset: [0.37, 0.21, if thin { 0.43 } else { 0.0 }], ..Options::new(cell) };
         if let Some((solution, run)) = attempt(case, &surface, &material, supports, &loads, &options) {
             let top = solution.stress([0.0, 1.0, at]).unwrap()[0];
             let side = solution.stress([1.0, 0.0, at]).unwrap()[1];
@@ -118,10 +125,25 @@ fn kirsch(case: &str, half: f64, thin: bool, basis: Basis, cases: &[(f64, usize)
 #[test]
 #[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
 fn kirsch_plate_with_a_hole() {
-    kirsch("kirsch", 30.0, false, Basis::Tensor, &[(2.0, 3), (2.0, 4), (1.0, 2), (1.0, 3), (0.5, 2), (1.0, 4)]);
+    kirsch("kirsch", 30.0, false, Basis::Tensor, &[(2.0, 3, 0), (2.0, 4, 0), (1.0, 2, 0), (1.0, 3, 0), (0.5, 2, 0), (1.0, 4, 0)]);
     // Cells as large as the hole's radius resolve it from degree 5 on, which fits the limits of
     // the system in the trunk space.
-    kirsch("kirsch, trunk space", 30.0, false, Basis::Trunk, &[(1.0, 5), (1.0, 6), (1.0, 7)]);
+    kirsch("kirsch, trunk space", 30.0, false, Basis::Trunk, &[(1.0, 5, 0), (1.0, 6, 0), (1.0, 7, 0)]);
+}
+
+/// The same plate with local refinement (`Options::refine`): cells as large as the hole's
+/// radius, and twice and four times as large, divided at the hole only. The uniform grid of
+/// this plate cannot have two cells a radius at degree 4 (the system would not fit); divided
+/// at the hole, cells of the radius reach Kirsch's values with a few thousand unknowns more
+/// than they have alone.
+#[test]
+#[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
+fn kirsch_plate_with_a_hole_refined() {
+    let cases = [(1.0, 3, 0), (1.0, 3, 1), (1.0, 3, 2), (1.0, 4, 0), (1.0, 4, 1), (1.0, 4, 2), (2.0, 3, 3), (2.0, 4, 2), (4.0, 4, 3)];
+    kirsch("kirsch, refined", 30.0, false, Basis::Tensor, &cases);
+    kirsch("kirsch, refined, trunk space", 30.0, false, Basis::Trunk, &[(1.0, 5, 0), (1.0, 5, 2), (2.0, 6, 2)]);
+    // A thin plate with a free face: every cell is cut, and the divided ones are too.
+    kirsch("kirsch, half width 8, thin, refined", 8.0, true, Basis::Tensor, &[(1.0, 3, 0), (1.0, 3, 2), (1.0, 4, 0), (1.0, 4, 1), (0.5, 4, 0)]);
 }
 
 /// The same hole in a plate small enough for cells of half its radius at degree 4. The plate is
@@ -130,8 +152,8 @@ fn kirsch_plate_with_a_hole() {
 #[test]
 #[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
 fn kirsch_hole_in_a_small_plate_settles() {
-    kirsch("kirsch, half width 8", 8.0, false, Basis::Tensor, &[(1.0, 3), (1.0, 4), (1.0, 5), (0.5, 3), (0.5, 4), (0.25, 3)]);
-    kirsch("kirsch, half width 8, thin", 8.0, true, Basis::Tensor, &[(1.0, 3), (1.0, 4), (1.0, 5), (0.5, 3), (0.5, 4)]);
+    kirsch("kirsch, half width 8", 8.0, false, Basis::Tensor, &[(1.0, 3, 0), (1.0, 4, 0), (1.0, 5, 0), (0.5, 3, 0), (0.5, 4, 0), (0.25, 3, 0)]);
+    kirsch("kirsch, half width 8, thin", 8.0, true, Basis::Tensor, &[(1.0, 3, 0), (1.0, 4, 0), (1.0, 5, 0), (0.5, 3, 0), (0.5, 4, 0)]);
 }
 
 #[test]
@@ -154,6 +176,14 @@ fn nafems_le1_elliptic_membrane() {
     for (cell, degree) in [(0.5, 3), (0.5, 4), (0.5, 5), (0.25, 3), (0.25, 4), (0.25, 5)] {
         let options = Options { degree, offset: OFF_GRID, ..Options::new(cell) };
         if let Some((solution, run)) = attempt("le1", &surface, &material, &supports, &loads, &options) {
+            println!("{run}; σ_yy at D {} MPa", percent(solution.stress([2.0, 0.0, 0.0]).unwrap()[1], 92.7));
+        }
+    }
+    // With local refinement: the inner ellipse has the radius of curvature 0.5 at D, as large
+    // as a cell, and 4 at its other end, so the cells are divided towards D.
+    for (cell, degree, refine) in [(0.5, 3, 1), (0.5, 3, 2), (0.5, 4, 1), (0.5, 4, 2), (0.25, 3, 1), (0.25, 4, 1), (1.0, 3, 2), (1.0, 4, 2)] {
+        let options = Options { degree, refine, offset: OFF_GRID, ..Options::new(cell) };
+        if let Some((solution, run)) = attempt("le1, refined", &surface, &material, &supports, &loads, &options) {
             println!("{run}; σ_yy at D {} MPa", percent(solution.stress([2.0, 0.0, 0.0]).unwrap()[1], 92.7));
         }
     }

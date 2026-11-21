@@ -9,6 +9,14 @@
 //!
 //! The numbers here are in the consistent set millimetre, newton, megapascal, the units of the
 //! design and of the oracle's recipe.
+//!
+//! What the peak of one solution is worth shows over several positions of the grid
+//! (`the_fillet_stress_over_grid_positions`, degree 3): on 8 mm cells it lies anywhere from 184
+//! to 242 MPa, on 4 mm cells from 203 to 218. With local refinement (`Options::refine`) the
+//! 8 mm cells are divided at the fillet and the holes: once, they are 4 mm there and the peak
+//! lies from 201 to 220 MPa with two thirds of the unknowns of the 4 mm grid; twice, from 212
+//! to 221. The bracket is small against its fillet and holes, so more than half of its cells
+//! are divided and the saving is modest.
 
 use std::time::Instant;
 
@@ -56,16 +64,21 @@ fn the_fillet_stress_of_a_real_bracket() {
         assert!(!on_fillet.is_empty());
         let supports = [Support { face: foot, fixed: [true; 3], value: [0.0; 3] }];
         let loads = [Load::Force { face: top, force: [FORCE, 0.0, 0.0] }];
-        let cases: &[(f64, usize)] =
-            if tolerance == 0.05 { &[(8.0, 2), (8.0, 3), (4.0, 2), (4.0, 3), (8.0, 4)] } else { &[(8.0, 3), (4.0, 3), (8.0, 4)] };
-        for &(cell, degree) in cases {
+        // Cell size, degree and levels of local refinement (`Options::refine`): 8 mm cells
+        // divided at the R6 fillet and the holes against 4 mm cells everywhere.
+        let cases: &[(f64, usize, usize)] = if tolerance == 0.05 {
+            &[(8.0, 2, 0), (8.0, 3, 0), (4.0, 2, 0), (4.0, 3, 0), (8.0, 4, 0), (8.0, 3, 1), (8.0, 3, 2), (8.0, 4, 1)]
+        } else {
+            &[(8.0, 3, 0), (4.0, 3, 0), (8.0, 4, 0), (8.0, 3, 1), (8.0, 3, 2)]
+        };
+        for &(cell, degree, refine) in cases {
             let started = Instant::now();
             // The grid starts off the part's corner, so no face of the bracket lies on a grid plane.
-            let options = Options { degree, offset: [0.37, 0.21, 0.43], ..Options::new(cell) };
+            let options = Options { degree, refine, offset: [0.37, 0.21, 0.43], ..Options::new(cell) };
             let solution = match solve(&surface, &STEEL, &supports, &loads, &options, &Limits::default()) {
                 Ok(solution) => solution,
                 Err(e) => {
-                    println!("cell {cell} mm, degree {degree}: {e}");
+                    println!("cell {cell} mm, degree {degree}, {refine} levels: {e}");
                     continue;
                 }
             };
@@ -79,8 +92,9 @@ fn the_fillet_stress_of_a_real_bracket() {
             }
             let reaction = solution.reactions.iter().find(|r| r.face == foot).unwrap().force;
             let stats = &solution.stats;
+            let levels = if refine > 0 { format!(", {refine} levels (cells by level {:?})", &stats.levels[..=refine]) } else { String::new() };
             println!(
-                "cell {cell} mm, degree {degree}: {} inside and {} cut cells, {} unknowns, {} points, {seconds:.1} s; volume error {:.1e}, smallest fraction {:.1e}; fillet peak {peak:.1} MPa ({:+.1} % of {REFERENCE}) at [{:.1}, {:.1}, {:.1}]; reaction {:.3} {:.3} {:.3} N; strain energy {:.4} N mm",
+                "cell {cell} mm, degree {degree}{levels}: {} inside and {} cut cells, {} unknowns, {} points, {seconds:.1} s; volume error {:.1e}, smallest fraction {:.1e}; fillet peak {peak:.1} MPa ({:+.1} % of {REFERENCE}) at [{:.1}, {:.1}, {:.1}]; reaction {:.3} {:.3} {:.3} N; strain energy {:.4} N mm",
                 stats.inside_cells,
                 stats.cut_cells,
                 stats.unknowns,
@@ -102,4 +116,56 @@ fn the_fillet_stress_of_a_real_bracket() {
             assert!((stats.volume - stats.surface_volume).abs() < 1e-3 * stats.surface_volume, "the quadrature gives the part's volume");
         }
     }
+}
+
+/// Where the grid sits, on the bracket: the fillet peak over six positions of the grid, for
+/// 4 mm cells everywhere and for 8 mm cells divided at the fillet and the holes
+/// (`Options::refine`). One position tells little: the peak of a fillet of 6 mm on cells of 4 mm
+/// moves by several per cent with the grid, as the stress at a hole does (`tests/hole.rs`).
+#[test]
+#[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
+fn the_fillet_stress_over_grid_positions() {
+    let (surface, [foot, top, fillet]) = bracket(0.05);
+    let mut on_fillet: Vec<[f64; 3]> = Vec::new();
+    for (triangle, tag) in surface.triangles().iter().zip(surface.tri_face()) {
+        if *tag == fillet {
+            let corners = triangle.map(|v| surface.points()[v as usize]);
+            on_fillet.extend(corners);
+            on_fillet.push([0, 1, 2].map(|i| (corners[0][i] + corners[1][i] + corners[2][i]) / 3.0));
+        }
+    }
+    let supports = [Support { face: foot, fixed: [true; 3], value: [0.0; 3] }];
+    let loads = [Load::Force { face: top, force: [FORCE, 0.0, 0.0] }];
+    let mut spreads = Vec::new();
+    for (cell, degree, refine) in [(8.0, 3, 0), (4.0, 3, 0), (8.0, 3, 1), (8.0, 3, 2), (8.0, 4, 0), (8.0, 4, 1)] {
+        let (mut lowest, mut highest) = (f64::INFINITY, 0.0f64);
+        let (mut fewest, mut most, mut seconds) = (usize::MAX, 0usize, 0.0f64);
+        let (mut least, mut largest) = (f64::INFINITY, 0.0f64);
+        for offset in [[0.37, 0.21, 0.43], [0.0, 0.0, 0.0], [0.11, 0.63, 0.87], [0.71, 0.05, 0.29], [0.5, 0.5, 0.5], [0.93, 0.41, 0.17]] {
+            let options = Options { degree, refine, offset, ..Options::new(cell) };
+            let started = Instant::now();
+            let solution = solve(&surface, &STEEL, &supports, &loads, &options, &Limits::default()).unwrap();
+            seconds += started.elapsed().as_secs_f64() / 6.0;
+            let peak = on_fillet.iter().map(|x| solution.von_mises(*x).unwrap()).fold(0.0, f64::max);
+            (lowest, highest) = (lowest.min(peak), highest.max(peak));
+            (fewest, most) = (fewest.min(solution.stats.unknowns), most.max(solution.stats.unknowns));
+            (least, largest) = (least.min(solution.strain_energy), largest.max(solution.strain_energy));
+            let reaction = solution.reactions.iter().find(|r| r.face == foot).unwrap().force;
+            assert!((reaction[0] + FORCE).abs() < 1e-6 * FORCE, "the foot carries the load: {reaction:?}");
+            let stats = &solution.stats;
+            assert!((stats.volume - stats.surface_volume).abs() < 1e-3 * stats.surface_volume, "the quadrature gives the part's volume");
+        }
+        let spread = (highest - lowest) / (highest + lowest);
+        println!(
+            "cell {cell} mm, degree {degree}, {refine} levels: fillet peak from {lowest:.1} to {highest:.1} MPa over six grid positions (± {:.1} %, {:+.1} % to {:+.1} % of {REFERENCE}); strain energy {least:.3} to {largest:.3} N mm; {fewest} to {most} unknowns, {seconds:.1} s a solve",
+            100.0 * spread,
+            100.0 * (lowest - REFERENCE) / REFERENCE,
+            100.0 * (highest - REFERENCE) / REFERENCE
+        );
+        spreads.push(spread);
+    }
+    // Divided at the fillet, the 8 mm cells are far closer than they are alone, and as close as
+    // the 4 mm cells within a per cent of the peak.
+    assert!(spreads[2] < 0.5 * spreads[0] && spreads[2] < spreads[1] + 0.01, "{spreads:?}");
+    assert!(spreads[3] < 0.03 && spreads[5] < 0.03, "{spreads:?}");
 }
