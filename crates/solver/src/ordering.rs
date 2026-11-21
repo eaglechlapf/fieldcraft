@@ -20,6 +20,10 @@
 //! 1976), which cuts such a wall across its surface. [`fill_reducing_order`] computes both and
 //! keeps the one whose Cholesky factor has fewer entries; the symbolic count costs O(|L|) time
 //! and O(n + |A|) memory, small next to the numeric factorization.
+//!
+//! Both take their separators from the nodes. Where an element has many nodes that all couple
+//! (a cell of high polynomial degree), [`element_dissection`] takes them from the elements
+//! instead: the nodes two groups of elements share.
 
 /// Parts this small are ordered as they come.
 const LEAF: usize = 16;
@@ -253,6 +257,180 @@ pub fn graph_dissection(adjacency: &[Vec<usize>]) -> Vec<usize> {
     order
 }
 
+/// Nested dissection by elements: the elements are split in two across an axis, and the nodes
+/// that elements of both halves share are the separator, ordered after the two halves;
+/// `elements[e]` are the nodes of element e and `centres[e]` its centre. Returns the nodes in
+/// the order of elimination; a node of no element comes last.
+///
+/// A separator taken from the nodes ([`nested_dissection`]) cuts through elements, and holds
+/// the nodes of every element it cuts that lie on one side: about half of each. Where an
+/// element has many nodes that all couple (the modes of a cell of high degree), the nodes two
+/// groups of elements share are far fewer: the ones on the faces between them. This is the
+/// dissection George's analysis is for (blocks of elements divided along lines of nodes, 1973),
+/// and how the multifrontal solvers of hp finite elements order their unknowns, from the
+/// elements upward (M. Paszyński, D. Pardo, C. Torres-Verdín, L. Demkowicz, V. Calo, *A
+/// parallel direct solver for the self-adaptive hp Finite Element Method*, J. Parallel Distrib.
+/// Comput. 70(3):270–281, 2010).
+///
+/// The cut is the one that shares the fewest nodes among all that leave each half at least a
+/// third of the elements, the balance of the separator theorem (R. J. Lipton, R. E. Tarjan, *A
+/// separator theorem for planar graphs*, SIAM J. Appl. Math. 36(2):177–189, 1979; for nested
+/// dissection, R. J. Lipton, D. J. Rose, R. E. Tarjan, *Generalized nested dissection*, SIAM J.
+/// Numer. Anal. 16(2):346–358, 1979): the elements are sorted by their centres along each axis
+/// in turn (ties by index) and moved to the first half one by one, counting the nodes shared
+/// as they go. Of equal cuts the more even one is taken, then the one across the longer axis.
+pub fn element_dissection(nodes: usize, elements: &[&[usize]], centres: &[[f64; 3]]) -> Vec<usize> {
+    let nodes_of = |e: usize| elements.get(e).copied().unwrap_or_default();
+    let mut order = Vec::with_capacity(nodes);
+    let mut placed = vec![false; nodes];
+    // Per node, for the split at hand: its elements in the part, and those in the first half.
+    let (mut total, mut before) = (vec![0u32; nodes], vec![0u32; nodes]);
+    enum Task {
+        Split(Vec<usize>),
+        Emit(Vec<usize>),
+    }
+    let mut stack = vec![Task::Split((0..elements.len()).collect())];
+    let mut touched: Vec<usize> = Vec::new();
+    while let Some(task) = stack.pop() {
+        let part = match task {
+            Task::Emit(separator) => {
+                order.extend(separator);
+                continue;
+            }
+            Task::Split(part) => part,
+        };
+        if part.len() <= 1 {
+            for &e in &part {
+                for &v in nodes_of(e) {
+                    if let Some(done) = placed.get_mut(v)
+                        && !*done
+                    {
+                        *done = true;
+                        order.push(v);
+                    }
+                }
+            }
+            continue;
+        }
+        // The nodes of the part that are not in a separator above it, each with its elements
+        // here, and the box of the elements' centres.
+        let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        touched.clear();
+        for &e in &part {
+            let c = centres.get(e).copied().unwrap_or_default();
+            for k in 0..3 {
+                lo[k] = lo[k].min(c[k]);
+                hi[k] = hi[k].max(c[k]);
+            }
+            for &v in nodes_of(e) {
+                if placed.get(v) == Some(&false)
+                    && let Some(count) = total.get_mut(v)
+                {
+                    if *count == 0 {
+                        touched.push(v);
+                    }
+                    *count += 1;
+                }
+            }
+        }
+        // The first half may hold this many elements.
+        let len = part.len();
+        let third = len.div_ceil(3);
+        let (least, most) = (third.clamp(1, len - 1), (len - third).clamp(1, len - 1));
+        // The best cut so far: the nodes shared, how uneven it is, the axis' extent, the
+        // elements along that axis and how many of them are the first half.
+        let mut best: Option<(usize, usize, f64, Vec<usize>, usize)> = None;
+        for axis in 0..3 {
+            let extent = hi[axis] - lo[axis];
+            if !(extent > 0.0) && best.is_some() {
+                continue;
+            }
+            let key = |e: usize| centres.get(e).map_or(0.0, |c| c[axis]);
+            let mut sorted = part.clone();
+            sorted.sort_by(|&a, &b| key(a).total_cmp(&key(b)).then(a.cmp(&b)));
+            for &v in &touched {
+                if let Some(count) = before.get_mut(v) {
+                    *count = 0;
+                }
+            }
+            let mut shared = 0usize;
+            let mut found: Option<(usize, usize, usize)> = None;
+            for (i, &e) in sorted.iter().enumerate() {
+                for &v in nodes_of(e) {
+                    if placed.get(v) != Some(&false) {
+                        continue;
+                    }
+                    // A node of one element here is never shared.
+                    let (Some(all), Some(count)) = (total.get(v).copied().filter(|all| *all > 1), before.get_mut(v)) else { continue };
+                    *count += 1;
+                    if *count == 1 {
+                        shared += 1;
+                    }
+                    if *count == all {
+                        shared -= 1;
+                    }
+                }
+                let first = i + 1;
+                let cut = (shared, (2 * first).abs_diff(len));
+                if (least..=most).contains(&first) && found.is_none_or(|(fewest, uneven, _)| cut < (fewest, uneven)) {
+                    found = Some((cut.0, cut.1, first));
+                }
+            }
+            let Some((shared, uneven, first)) = found else { continue };
+            let better = best.as_ref().is_none_or(|(fewest, lopsided, longest, _, _)| {
+                (shared, uneven) < (*fewest, *lopsided) || ((shared, uneven) == (*fewest, *lopsided) && extent > *longest)
+            });
+            if better {
+                best = Some((shared, uneven, extent, sorted, first));
+            }
+        }
+        let reset = |counts: &mut [u32], touched: &[usize]| {
+            for &v in touched {
+                if let Some(count) = counts.get_mut(v) {
+                    *count = 0;
+                }
+            }
+        };
+        let Some((_, _, _, mut first_half, at)) = best else {
+            // No cut (there is one for two elements or more): the part's nodes as they come.
+            reset(&mut total, &touched);
+            for &v in &touched {
+                if let Some(done) = placed.get_mut(v) {
+                    *done = true;
+                    order.push(v);
+                }
+            }
+            continue;
+        };
+        let second_half = first_half.split_off(at);
+        reset(&mut before, &touched);
+        for &e in &first_half {
+            for &v in nodes_of(e) {
+                if placed.get(v) == Some(&false)
+                    && let Some(count) = before.get_mut(v)
+                {
+                    *count += 1;
+                }
+            }
+        }
+        // The nodes with elements in both halves, in their own order.
+        let mut separator: Vec<usize> =
+            touched.iter().copied().filter(|v| before.get(*v).is_some_and(|count| *count > 0 && Some(count) != total.get(*v))).collect();
+        separator.sort_unstable();
+        reset(&mut total, &touched);
+        for &v in &separator {
+            if let Some(done) = placed.get_mut(v) {
+                *done = true;
+            }
+        }
+        stack.push(Task::Emit(separator));
+        stack.push(Task::Split(second_half));
+        stack.push(Task::Split(first_half));
+    }
+    order.extend((0..nodes).filter(|v| placed.get(*v) == Some(&false)));
+    order
+}
+
 /// The entries of the Cholesky factor of the node graph `adjacency` eliminated in `order` (one
 /// per node pair): the fill an ordering gives. `order` must be a permutation of the nodes.
 pub fn fill(adjacency: &[Vec<usize>], order: &[usize]) -> usize {
@@ -392,6 +570,77 @@ mod tests {
         let planes = fill(&adj, &nested_dissection(&xyz, &adj));
         let chosen = fill(&adj, &fill_reducing_order(&xyz, &adj));
         assert!(chosen <= planes, "chosen {chosen} planes {planes}");
+    }
+
+    /// A grid of `dims` cells of degree `q`: every cell has the (q + 1)³ nodes of a lattice of q
+    /// steps along each of its edges, shared with its neighbours. Returns the nodes' positions,
+    /// the cells' nodes and their centres.
+    fn cells(dims: [usize; 3], q: usize) -> (Vec<[f64; 3]>, Vec<Vec<usize>>, Vec<[f64; 3]>) {
+        let n = [q * dims[0] + 1, q * dims[1] + 1, q * dims[2] + 1];
+        let id = |i: usize, j: usize, k: usize| i + n[0] * (j + n[1] * k);
+        let mut xyz = vec![[0.0; 3]; n[0] * n[1] * n[2]];
+        for k in 0..n[2] {
+            for j in 0..n[1] {
+                for i in 0..n[0] {
+                    xyz[id(i, j, k)] = [i as f64 / q as f64, j as f64 / q as f64, k as f64 / q as f64];
+                }
+            }
+        }
+        let (mut elements, mut centres) = (Vec::new(), Vec::new());
+        for k in 0..dims[2] {
+            for j in 0..dims[1] {
+                for i in 0..dims[0] {
+                    let mut nodes = Vec::new();
+                    for c in 0..=q {
+                        for b in 0..=q {
+                            for a in 0..=q {
+                                nodes.push(id(q * i + a, q * j + b, q * k + c));
+                            }
+                        }
+                    }
+                    elements.push(nodes);
+                    centres.push([i as f64 + 0.5, j as f64 + 0.5, k as f64 + 0.5]);
+                }
+            }
+        }
+        (xyz, elements, centres)
+    }
+
+    /// Elements are divided along the nodes they share: of two cells the face between them comes
+    /// last, and a plate of cells of degree 3 fills its factor far less than when the
+    /// separators are taken from the nodes, which cut through the cells.
+    #[test]
+    fn elements_are_dissected_along_the_nodes_they_share() {
+        let (xyz, elements, centres) = cells([2, 1, 1], 2);
+        let lists: Vec<&[usize]> = elements.iter().map(Vec::as_slice).collect();
+        let order = element_dissection(xyz.len(), &lists, &centres);
+        assert!(is_permutation(&order, xyz.len()));
+        let last = &order[order.len() - 9..];
+        assert!(last.iter().all(|v| xyz[*v][0] == 1.0), "the face between the two cells: {last:?}");
+
+        for (dims, q) in [([12, 12, 1], 3), ([24, 6, 1], 2), ([6, 6, 6], 2)] {
+            let (xyz, elements, centres) = cells(dims, q);
+            let lists: Vec<&[usize]> = elements.iter().map(Vec::as_slice).collect();
+            let order = element_dissection(xyz.len(), &lists, &centres);
+            assert!(is_permutation(&order, xyz.len()));
+            assert_eq!(order, element_dissection(xyz.len(), &lists, &centres), "deterministic");
+            let adjacency = crate::sparse::NodeGraph::new(xyz.len(), lists.iter()).adjacency;
+            let (by_elements, by_nodes) = (fill(&adjacency, &order), fill(&adjacency, &fill_reducing_order(&xyz, &adjacency)));
+            println!("{dims:?} cells of degree {q}: {by_elements} entries by elements, {by_nodes} by nodes");
+            assert!(by_elements < by_nodes, "{dims:?}: {by_elements} against {by_nodes}");
+        }
+    }
+
+    /// Nodes of no element come last, an element may name a node there is not or have no centre,
+    /// and nothing at all is ordered as nothing.
+    #[test]
+    fn element_dissection_of_hostile_lists() {
+        assert!(element_dissection(0, &[], &[]).is_empty());
+        assert_eq!(element_dissection(3, &[], &[]), vec![0, 1, 2]);
+        let elements: [&[usize]; 4] = [&[0, 1, 99], &[1, 2], &[], &[2, 2, 0]];
+        let order = element_dissection(5, &elements, &[[0.0; 3], [f64::NAN; 3]]);
+        assert!(is_permutation(&order, 5), "{order:?}");
+        assert_eq!(&order[3..], &[3, 4]);
     }
 
     /// Factor entries and factor time (s) of a diagonally dominant 3-unknowns-per-node matrix on
