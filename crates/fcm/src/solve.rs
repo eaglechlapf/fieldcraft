@@ -1689,8 +1689,8 @@ fn solve_at(
         }
     }
 
-    // The solution.
-    stiffness.mirror_lower();
+    // The solution. The factorization reads the matrix's lower triangle, and nothing reads the
+    // matrix after it.
     let factor = Factor::new(&UpperColumns::from_symmetric(&stiffness), limits.max_factor_entries).map_err(|e| factor_error(e, options.refine))?;
     stats.factor_entries = factor.entries();
     let mut u = load;

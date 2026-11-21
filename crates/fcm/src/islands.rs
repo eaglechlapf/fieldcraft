@@ -54,6 +54,8 @@ const OFF_FACE: f64 = 1e-6; // unit-factors: relative to the cell size
 const BESIDE: f64 = 1e-5;
 /// Corners of a cell's pieces in a face that are tried for material beside them, at most.
 const MOST_BESIDE: usize = 8;
+/// Leaves whose gaps' sides one task finds ([`sides`]).
+const LEAVES: usize = 16;
 /// Points kept of each group's material for [`integrate`]'s third step.
 const MOST_SAMPLES: usize = 16;
 
@@ -617,15 +619,19 @@ pub(crate) fn sides<'a>(tree: &Tree, links: &[[u32; 4]], held: &(dyn Fn(usize) -
         joined.insert([link[2], link[3], link[0], link[1]]);
     }
     let islands_of = |side: &Held| side.of_piece.iter().copied().max().map_or(1, |most| most + 1);
-    let mut found = Vec::new();
-    let mut between = |islands: [u32; 4], apart: f64| {
-        if apart.is_finite() && apart > 0.0 {
-            found.push(Sides { islands, width: apart });
-        }
-    };
-    for node in tree.leaves() {
-        let Some(cell) = tree.nodes.get(node as usize).filter(|cell| cell.material()) else { continue };
-        let Some(own) = held(node as usize) else { continue };
+    // Leaf by leaf, a few to a task: the widths are distances between all the pieces of two
+    // islands, and the sides come out in the leaves' order whichever thread finds them.
+    let leaves = tree.leaves();
+    let of_leaf = |index: usize| -> Vec<Sides> {
+        let mut found = Vec::new();
+        let mut between = |islands: [u32; 4], apart: f64| {
+            if apart.is_finite() && apart > 0.0 {
+                found.push(Sides { islands, width: apart });
+            }
+        };
+        let Some(&node) = leaves.get(index) else { return found };
+        let Some(cell) = tree.nodes.get(node as usize).filter(|cell| cell.material()) else { return found };
+        let Some(own) = held(node as usize) else { return found };
         // Two islands of one cell.
         let islands = islands_of(&own);
         for first in 0..islands {
@@ -659,8 +665,9 @@ pub(crate) fn sides<'a>(tree: &Tree, links: &[[u32; 4]], held: &(dyn Fn(usize) -
                 }
             }
         }
-    }
-    found
+        found
+    };
+    fieldcraft_parallel::map_grained(leaves.len(), LEAVES, of_leaf).into_iter().flatten().collect()
 }
 
 #[cfg(test)]
