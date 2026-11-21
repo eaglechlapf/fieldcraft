@@ -10,7 +10,7 @@
 /// the two largest eigenvalues, so even a 1 % gap is resolved long before this.
 const MAX_ITERATIONS: usize = 1000;
 /// The iteration stops when the Rayleigh quotient changes by less than this fraction.
-const CONVERGED: f64 = 1e-9;
+const CONVERGED: f64 = 1e-9; // unit-factors: a relative change of the eigenvalue
 
 /// Factor the symmetric positive definite `a` (n × n) in place: its lower triangle becomes L
 /// with A = L Lᵀ (the upper triangle is left as it was). False when a pivot is not positive.
