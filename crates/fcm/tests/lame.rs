@@ -24,6 +24,10 @@ const LENGTH: f64 = 0.05;
 const PRESSURE: f64 = 100e6;
 
 fn tube(options: &Options) -> Solution {
+    tube_within(options, &Limits::default()).unwrap()
+}
+
+fn tube_within(options: &Options, limits: &Limits) -> Result<Solution, fieldcraft_fcm::Error> {
     let supports = [
         Support { face: AT_X0, fixed: [true, false, false], value: [0.0; 3] },
         Support { face: AT_Y0, fixed: [false, true, false], value: [0.0; 3] },
@@ -31,7 +35,7 @@ fn tube(options: &Options) -> Solution {
         Support { face: AT_Z1, fixed: [false, false, true], value: [0.0; 3] },
     ];
     let loads = [Load::Pressure { face: INNER, pressure: PRESSURE }];
-    solve(&quarter_tube(INNER_RADIUS, OUTER_RADIUS, LENGTH, 32), &STEEL, &supports, &loads, options, &Limits::default()).unwrap()
+    solve(&quarter_tube(INNER_RADIUS, OUTER_RADIUS, LENGTH, 32), &STEEL, &supports, &loads, options, limits)
 }
 
 /// The largest errors of the radial displacement (relative to its value at the bore) and of the
@@ -214,4 +218,100 @@ fn refinement_against_uniform_grids() {
     // Refinement is no worse than the grid it starts from.
     assert!(errors[1].1 < errors[0].1 && errors[2].1 < errors[0].1, "degree 3: {errors:?}");
     assert!(errors[6].1 < errors[5].1 && errors[7].1 < errors[5].1, "degree 4: {errors:?}");
+}
+
+/// Refinement that follows the solution ([`Options::adapt`]): with no cell divided for the
+/// bore's curvature, each round divides the cells the last solution is least resolved in, and
+/// the errors against Lamé's solution fall round by round, as does what a round still changes.
+#[test]
+fn rounds_that_follow_the_solution_lower_the_error() {
+    let grid = |adapt: usize| Options { degree: 2, depth: 1, adapt, ..Options::new(0.1) };
+    let mut errors = Vec::new();
+    let mut settled = Vec::new();
+    for adapt in 0..=3 {
+        let solution = tube(&grid(adapt));
+        let stats = &solution.stats;
+        println!(
+            "{adapt} rounds asked: {} done, the last changed the strain energy by {:.2e}, cells by level {:?}",
+            stats.rounds,
+            stats.settled,
+            &stats.levels[..=adapt]
+        );
+        assert_eq!(stats.rounds, adapt);
+        assert!(adapt == 0 || stats.levels[adapt] > 0, "{:?}", stats.levels);
+        errors.push(report(&format!("degree 2, {adapt} rounds, {} unknowns", stats.unknowns), &solution));
+        settled.push(stats.settled);
+        // The cuts still carry the pressure on the bore.
+        let force = PRESSURE * INNER_RADIUS * LENGTH;
+        for (face, axis) in [(AT_X0, 0), (AT_Y0, 1)] {
+            let reaction = solution.reactions.iter().find(|r| r.face == face).unwrap().force[axis];
+            assert!((reaction + force).abs() < 2e-3 * force, "face {face}: {reaction} against {force}");
+        }
+    }
+    // Displacement and stress errors of 2.4 % and 15 % on the grid's own cells, 0.24 % and 7.6 %
+    // after two rounds, 0.06 % and 1.9 % after three; no round makes them worse.
+    for (before, after) in errors.iter().zip(errors.iter().skip(1)) {
+        assert!(after.0 < before.0 && after.1 < before.1, "{errors:?}");
+    }
+    assert!(errors[2].0 < 0.2 * errors[0].0 && errors[3].1 < 0.2 * errors[0].1, "{errors:?}");
+    // What a round changes is small against the solution, and none without a round.
+    assert!(settled[0] == 0.0 && settled[1..].iter().all(|change| change.abs() < 1e-2 && *change != 0.0), "{settled:?}");
+}
+
+/// The rounds end once one has moved the solution by no more than [`Options::settle`], in the
+/// energy norm, and a round whose system would be too large is left out: the result is then
+/// the solution of the rounds before it, bit for bit.
+#[test]
+fn the_rounds_end_once_the_solution_has_settled() {
+    let grid = |adapt: usize, settle: f64| Options { degree: 2, depth: 1, adapt, settle, ..Options::new(0.1) };
+    let same = |a: &Solution, b: &Solution| {
+        a.strain_energy.to_bits() == b.strain_energy.to_bits() && a.stats.unknowns == b.stats.unknowns && a.stats.levels == b.stats.levels
+    };
+    // What each of three rounds moves the solution by.
+    let all: Vec<Solution> = (0..=3).map(|adapt| tube(&grid(adapt, 0.0))).collect();
+    let moved: Vec<f64> = all.iter().map(|solution| solution.stats.settled.abs().sqrt()).collect();
+    println!("the rounds move the solution by {:?} in the energy norm", &moved[1..]);
+    assert!(moved[0] == 0.0 && moved[1..].iter().all(|m| *m > 0.0 && *m < 0.1), "{moved:?}");
+    // Asked to settle within what a round moved it by, the rounds end with that round.
+    for last in 1..=3 {
+        let Some(ends) = (1..=3).find(|round| moved[*round] <= moved[last]) else { continue };
+        let solution = tube(&grid(3, moved[last]));
+        assert_eq!(solution.stats.rounds, ends, "settle within {}: {moved:?}", moved[last]);
+        assert!(same(&solution, &all[ends]) && !solution.stats.left_out);
+    }
+    // Within 5 %, this tube is settled after two rounds (they move it by 5.5 %, 4.3 % and 3.4 %,
+    // which are changes of the strain energy of 0.3 % and less); within nothing, never.
+    assert_eq!(tube(&grid(3, Options::SETTLED)).stats.rounds, 2);
+    assert_eq!(tube(&grid(3, 0.5 * moved[1..].iter().copied().fold(f64::INFINITY, f64::min))).stats.rounds, 3);
+    // A round that does not fit is left out.
+    let fits_two = Limits { max_dofs: all[2].stats.unknowns, ..Limits::default() };
+    let capped = tube_within(&grid(3, 0.0), &fits_two).unwrap();
+    assert!(capped.stats.left_out && capped.stats.rounds == 2 && same(&capped, &all[2]), "{:?}", capped.stats);
+    let fits_none = Limits { max_dofs: all[0].stats.unknowns, ..Limits::default() };
+    let capped = tube_within(&grid(3, 0.0), &fits_none).unwrap();
+    assert!(capped.stats.left_out && capped.stats.rounds == 0 && same(&capped, &all[0]), "{:?}", capped.stats);
+    // Not a change to end at.
+    for settle in [-0.1, f64::NAN, f64::INFINITY] {
+        assert!(matches!(tube_within(&grid(1, settle), &Limits::default()), Err(fieldcraft_fcm::Error::Invalid(_))), "{settle}");
+    }
+}
+
+/// The same bits on one thread and on several, with rounds that follow the solution.
+#[test]
+fn the_rounds_do_not_depend_on_the_threads() {
+    let run = |threads: usize| {
+        fieldcraft_parallel::with_threads(threads, || {
+            let solution = tube(&Options { degree: 2, depth: 1, adapt: 2, offset: [0.37, 0.21, 0.43], ..Options::new(0.1) });
+            let mut bits = vec![solution.strain_energy.to_bits(), solution.stats.unknowns as u64, solution.stats.settled.to_bits()];
+            bits.extend(solution.stats.levels.iter().map(|cells| *cells as u64));
+            for x in [[0.1, 0.0, 0.025], [0.0, 0.2, 0.05], [0.11, 0.1, 0.02]] {
+                bits.extend(solution.displacement(x).unwrap().map(f64::to_bits));
+                bits.extend(solution.stress(x).unwrap().map(f64::to_bits));
+            }
+            bits
+        })
+    };
+    let one = run(1);
+    assert_eq!(one, run(2));
+    assert_eq!(one, run(7));
 }

@@ -2,7 +2,7 @@
 //! loads to the displacement and stress anywhere in the part.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use fieldcraft_fem::{DofLayout, DofSet};
 use fieldcraft_mesh::surface::BoundarySurface;
@@ -43,7 +43,7 @@ const GRAIN: usize = 4096;
 /// along a line, a sphere on a plate) has no width to stop at, and a part of many slits has
 /// many roots: the ends of gaps are then resolved as far as this pays for, and
 /// [`Stats::holding`] says what is left.
-const GAP_CELLS: usize = 512;
+const GAP_CELLS: usize = 2048;
 /// A point this close to a grid plane, as a fraction of the cell size, may be evaluated in the
 /// cell on either side.
 const NEAR: f64 = 1e-6; // unit-factors: relative to the cell size
@@ -224,13 +224,57 @@ pub struct Options {
     /// ([`crate::islands`]) that are less than a quarter of the cell apart ([`Options::GAP`]),
     /// up to this many levels: the stretch along which the sides are joined shrinks to a few
     /// widths of the gap, and nothing else is divided for it. The cells this may add are bounded
-    /// (as many again as hold material, 512 at least), and when the system is too large with
+    /// (as many again as hold material, 2048 at least), and when the system is too large with
     /// them the step is solved with a level less, down to none; [`Stats::holding`] counts the
     /// cells that are left holding the sides of a gap together.
     pub gaps: usize,
+    /// Rounds of refinement that follow the solution, 0 for none.
+    ///
+    /// [`Options::refine`] divides cells where the surface is curved, whether or not anything
+    /// happens there: every bend of a sheet metal part and every hole, when one bend carries
+    /// the load. A round of this divides the cells the *solution* is least resolved in, and
+    /// solves again. How well a cell resolves the solution is read from the solution itself:
+    /// the strain energy of the part of it that only the functions of the highest degree carry
+    /// in that cell (the hierarchic indicator of the p-version: B. Szabó, I. Babuška, *Finite
+    /// Element Analysis*, Wiley 1991; a field the lower degrees represent has none). The cells
+    /// that carry [`Options::SHARE`] of the sum, largest first, are divided (W. Dörfler, *A
+    /// convergent adaptive algorithm for Poisson's equation*, SIAM J. Numer. Anal.
+    /// 33(3):1106–1124, 1996), each round at most one level deeper than the last, so a stress
+    /// that is singular (a sharp re-entrant edge, the end of a support) takes a round's share
+    /// and no more. A round whose system would be too large is left out, and the solution
+    /// before it is the result ([`Stats::left_out`]). [`Stats::rounds`] counts the rounds, and
+    /// [`Stats::settled`] is how much the last one still changed the strain energy.
+    ///
+    /// The indicator ranks the cells of one solution; it is not a measure of the error. Summed
+    /// over the part it is no fraction of the strain energy: in a cell that holds a thin slab
+    /// of material the functions of the highest degree and the lower ones carry large parts
+    /// that cancel. And it follows the energy, not a stress peak: at a hole of the radius of a
+    /// cell in a plate under tension (`tests/hole.rs`) two rounds leave the stress at the hole
+    /// within ± 7 % over six positions of the grid where two levels of [`Options::refine`]
+    /// leave it within ± 0.7 % in the same time. The two work together: `refine` for what the
+    /// surface shows, the rounds for what only the solution does.
+    pub adapt: usize,
+    /// The rounds of [`Options::adapt`] end once one has moved the solution by no more than
+    /// this, in the energy norm and relative to the solution: √|ΔU / U| with the strain
+    /// energies of the two solutions ([`Solution::change_from`]). 0 runs every round asked for.
+    pub settle: f64,
 }
 
 impl Options {
+    /// The share of the indicator's sum whose cells a round of [`Options::adapt`] divides. Any
+    /// share below one converges (Dörfler); a small one divides few cells a round and needs
+    /// many rounds, each a whole solve, and a large one divides cells that did not need it.
+    /// Measured on the sheet metal tray of `tests/tray.rs`, hung by one wall (the sag against
+    /// 2.175 mm, from the grid's own cells): two rounds at 0.5 leave it about 14 % low, at 0.8
+    /// 12 %, at 0.9 6 % with 163 000 unknowns in 14 s, at 0.95 5 % with a quarter more
+    /// unknowns.
+    pub const SHARE: f64 = 0.9;
+    /// The distance between two rounds' solutions below which a caller may take the result as
+    /// settled ([`Options::settle`]): 5 % in the energy norm, the permissible error of the
+    /// examples of O. C. Zienkiewicz, J. Z. Zhu, *A simple error estimator and adaptive
+    /// procedure for practical engineering analysis*, Int. J. Numer. Meth. Engng
+    /// 24(2):337–357, 1987. In strain energy that is a change of 0.25 %.
+    pub const SETTLED: f64 = 0.05;
     /// A cell that holds the root of a gap is divided while it is more than this many widths
     /// of the gap across ([`Options::gaps`]).
     pub const GAP: f64 = 2.5;
@@ -272,6 +316,8 @@ impl Options {
             refine: 0,
             separate: true,
             gaps: 0,
+            adapt: 0,
+            settle: 0.0,
         }
     }
 
@@ -286,8 +332,11 @@ impl Options {
     }
 
     fn check(&self) -> Result<()> {
-        if self.refine > MAX_REFINE || self.gaps > MAX_REFINE {
-            return Err(Error::Invalid(format!("{} levels of refinement are above {MAX_REFINE}", self.refine.max(self.gaps))));
+        if self.refine > MAX_REFINE || self.gaps > MAX_REFINE || self.adapt > MAX_REFINE {
+            return Err(Error::Invalid(format!("{} levels of refinement are above {MAX_REFINE}", self.refine.max(self.gaps).max(self.adapt))));
+        }
+        if !(self.settle >= 0.0 && self.settle.is_finite()) {
+            return Err(Error::Invalid(format!("the change that ends the rounds of refinement, {}, is not a number from 0 on", self.settle)));
         }
         if !(1..=MAX_DEGREE).contains(&self.degree) {
             return Err(Error::Invalid(format!("degree {} is not in 1..={MAX_DEGREE}", self.degree)));
@@ -322,6 +371,8 @@ pub struct Stats {
     pub unknowns: usize,
     /// Quadrature points of the cut cells.
     pub quadrature_points: usize,
+    /// Entries of the stiffness, as the factorization counts them.
+    pub stiffness_entries: usize,
     /// Entries of the Cholesky factor.
     pub factor_entries: usize,
     /// The volume of the part as the quadrature sees it.
@@ -352,6 +403,14 @@ pub struct Stats {
     /// Whether the pieces were joined after all: told apart, the system was singular (a piece
     /// that nothing holds), and the step was solved as with [`Options::separate`] off.
     pub joined: bool,
+    /// The rounds of refinement that followed the solution ([`Options::adapt`]).
+    pub rounds: usize,
+    /// The change of the strain energy in the last of those rounds, (U − U_before) / U: how
+    /// far the solution still moved. 0 without a round.
+    pub settled: f64,
+    /// Whether a round of [`Options::adapt`] was left out: with its cells the system would have
+    /// been too large, or could not be solved.
+    pub left_out: bool,
 }
 
 /// How far two solutions of the same step are apart ([`Solution::change_from`]): an indicator
@@ -392,6 +451,9 @@ pub struct Solution {
     /// Three displacement coefficients per mode.
     u: Vec<f64>,
     pub stats: Stats,
+    /// For each element, the strain energy of what only the functions of the highest degree
+    /// carry in its cell ([`Options::adapt`]).
+    surplus: Vec<f64>,
     /// The strain energy of the part, ½ ∫ σ : ε dV.
     pub strain_energy: f64,
     /// The reaction of every supported face, by face tag.
@@ -399,6 +461,33 @@ pub struct Solution {
 }
 
 impl Solution {
+    /// The cells to divide next ([`Options::adapt`]): the leaves whose elements carry the share
+    /// `share` of the indicator's sum, largest first, each by its level and its place, with
+    /// the cells above it (a cell is divided only when the cells above it are).
+    fn least_resolved(&self, share: f64) -> BTreeSet<(u8, [u32; 3])> {
+        let mut order: Vec<usize> = (0..self.surplus.len()).collect();
+        // Largest first, the lower element first among equals.
+        order.sort_by(|a, b| self.surplus[*b].total_cmp(&self.surplus[*a]).then(a.cmp(b)));
+        let total: f64 = self.surplus.iter().filter(|s| s.is_finite()).sum();
+        let mut marked = BTreeSet::new();
+        let mut sum = 0.0;
+        for element in order {
+            let Some(surplus) = self.surplus.get(element).copied().filter(|s| s.is_finite() && *s > 0.0) else { continue };
+            if !(sum < share * total) {
+                break;
+            }
+            sum += surplus;
+            let Some(cell) = self.space.elements.get(element).and_then(|node| self.tree.nodes.get(*node as usize)) else { continue };
+            if usize::from(cell.level) >= MAX_REFINE {
+                continue;
+            }
+            for up in 0..=cell.level {
+                marked.insert((cell.level - up, cell.ijk.map(|i| i >> up)));
+            }
+        }
+        marked
+    }
+
     /// The leaf under `node` that holds the point at `t` cells of the grid from its origin and
     /// holds material: its element, the point's natural coordinates in it and its size. A point
     /// within [`NEAR`] of the plane between two children may be in either.
@@ -848,11 +937,82 @@ pub fn solve(
     options: &Options,
     limits: &Limits,
 ) -> Result<Solution> {
-    solve_marked(surface, material, supports, loads, options, limits, None)
+    let mut next = Round::default();
+    let (mut solution, used) = solve_marked(surface, material, supports, loads, options, limits, None, &next)?;
+    // The rounds that follow the solution ([`Options::adapt`]): each divides the cells the last
+    // solution is least resolved in and solves again, as the first solve was solved in the end
+    // (with the levels where gaps end that fitted, with the pieces joined if they had to be).
+    for round in 0..options.adapt.min(MAX_REFINE) {
+        let before = next.asked.len();
+        next.asked.extend(solution.least_resolved(Options::SHARE));
+        if next.asked.len() == before {
+            break;
+        }
+        next.before = Some((solution.stats.stiffness_entries, solution.stats.factor_entries));
+        match solve_raising(surface, material, supports, loads, &used, limits, None, &next) {
+            Ok(mut finer) => {
+                finer.stats.rounds = round + 1;
+                finer.stats.joined = solution.stats.joined;
+                finer.stats.settled =
+                    if finer.strain_energy != 0.0 { (finer.strain_energy - solution.strain_energy) / finer.strain_energy } else { 0.0 };
+                let settled = finer.stats.settled.abs().sqrt() <= options.settle;
+                solution = finer;
+                if settled {
+                    break;
+                }
+            }
+            // Too large with this round's cells, or not to be solved with them: the solution
+            // before it stands.
+            Err(Error::Limit(_) | Error::Singular(_)) => {
+                solution.stats.left_out = true;
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(solution)
 }
 
-/// [`solve`], dividing the cells `marker` names (up to [`Options::refine`] levels) when there is
-/// one.
+/// What a solve of [`solve`] takes from the solves before it ([`Options::adapt`]).
+#[derive(Default)]
+struct Round {
+    /// The cells to divide besides those the surface's curvature names, by level and place.
+    asked: BTreeSet<(u8, [u32; 3])>,
+    /// The entries of the stiffness and of its factor in the solve before, when there was one.
+    before: Option<(usize, usize)>,
+}
+
+/// One solve of [`solve`] with exactly these options: dividing the cells `marker` names (up to
+/// [`Options::refine`] levels) when there is one, and the cells `round` asks for besides. The fictitious stiffness is as small as the factorization allows
+/// ([`Options::fictitious`]): the fraction asked for, then a hundred times more at a time up to
+/// the one that keeps the margin for this material.
+#[allow(clippy::too_many_arguments)]
+fn solve_raising(
+    surface: &BoundarySurface,
+    material: &Material,
+    supports: &[Support],
+    loads: &[Load],
+    options: &Options,
+    limits: &Limits,
+    marker: Option<Marker>,
+    round: &Round,
+) -> Result<Solution> {
+    let lame = material.lame()?;
+    options.check()?;
+    let most = margin_fraction(&lame).min(1.0);
+    let mut fictitious = options.fictitious;
+    // Each step multiplies the fraction, so the loop ends.
+    loop {
+        match solve_at(surface, material, supports, loads, options, limits, fictitious, marker, round) {
+            Err(Error::Singular(_)) if fictitious < most => fictitious = (fictitious * FICTITIOUS_STEP).min(most),
+            result => return result,
+        }
+    }
+}
+
+/// The first solve of [`solve`], with what it falls back on when the step cannot be solved as
+/// asked, and the options it was solved with in the end.
+#[allow(clippy::too_many_arguments)]
 fn solve_marked(
     surface: &BoundarySurface,
     material: &Material,
@@ -861,22 +1021,9 @@ fn solve_marked(
     options: &Options,
     limits: &Limits,
     marker: Option<Marker>,
-) -> Result<Solution> {
-    let lame = material.lame()?;
-    options.check()?;
-    // The fictitious stiffness is as small as the factorization allows ([`Options::fictitious`]):
-    // the fraction asked for, then a hundred times more at a time up to the one that keeps the
-    // margin for this material. Each step multiplies the fraction, so the loop ends.
-    let most = margin_fraction(&lame).min(1.0);
-    let attempt = |options: &Options| {
-        let mut fictitious = options.fictitious;
-        loop {
-            match solve_at(surface, material, supports, loads, options, limits, fictitious, marker) {
-                Err(Error::Singular(_)) if fictitious < most => fictitious = (fictitious * FICTITIOUS_STEP).min(most),
-                result => return result,
-            }
-        }
-    };
+    round: &Round,
+) -> Result<(Solution, Options)> {
+    let attempt = |options: &Options| solve_raising(surface, material, supports, loads, options, limits, marker, round);
     // The cells divided where gaps end may make the system too large ([`Options::gaps`]): then
     // with a level less of them, down to none.
     let mut fewer = *options;
@@ -889,15 +1036,18 @@ fn solve_marked(
     match first {
         // Told apart, a piece of material may be held by nothing ([`Options::separate`]): the
         // step with the pieces joined, when that one can be solved.
-        Err(Error::Singular(message)) if options.separate => match attempt(&Options { separate: false, ..*options }) {
-            Ok(mut solution) => {
-                solution.stats.joined = true;
-                Ok(solution)
+        Err(Error::Singular(message)) if options.separate => {
+            let joined = Options { separate: false, ..*options };
+            match attempt(&joined) {
+                Ok(mut solution) => {
+                    solution.stats.joined = true;
+                    Ok((solution, joined))
+                }
+                Err(Error::Singular(_)) => Err(Error::Singular(message)),
+                Err(other) => Err(other),
             }
-            Err(Error::Singular(_)) => Err(Error::Singular(message)),
-            Err(other) => Err(other),
-        },
-        result => result,
+        }
+        result => result.map(|solution| (solution, fewer)),
     }
 }
 
@@ -907,8 +1057,10 @@ const FICTITIOUS_STEP: f64 = 100.0;
 
 /// Divide the cells of `tree` that are too coarse, level by level up to `levels`
 /// ([`Options::refine`]): the cut cells across which the surface turns by more than `turn` and
-/// the cells around them, or the cells `marker` names. `touching` and `pieces` hold the surface
-/// in every cell of the tree ([`grid::Sorted`]) and get those of the new cells.
+/// the cells around them, or the cells `marker` names; and, to any level, the cells `asked` for
+/// by level and place ([`Options::adapt`]), without the cells around them. `touching` and
+/// `pieces` hold the surface in every cell of the tree ([`grid::Sorted`]) and get those of the
+/// new cells.
 #[allow(clippy::too_many_arguments)]
 fn divide_cells(
     grid: &Grid,
@@ -920,12 +1072,14 @@ fn divide_cells(
     levels: usize,
     turn: f64,
     marker: Option<Marker>,
+    asked: &BTreeSet<(u8, [u32; 3])>,
 ) -> Result<()> {
     let curvature = if marker.is_none() { grid::curvatures(surface) } else { Vec::new() };
     let base = tree.nodes.len();
     // The cells of the level being looked at: the ones the level before made.
     let mut first = 0;
-    for level in 0..levels.min(MAX_REFINE) {
+    let deepest_asked = asked.iter().map(|(level, _)| usize::from(*level) + 1).max().unwrap_or(0);
+    for level in 0..levels.max(deepest_asked).min(MAX_REFINE) {
         let end = tree.nodes.len();
         let size = grid.step(level);
         let leaf = |node: usize| tree.nodes.get(node).filter(|cell| cell.is_leaf() && cell.material());
@@ -936,7 +1090,8 @@ fn divide_cells(
                     Some(marker) => marker(level, grid.fine_lo(level, cell.position()), size),
                     None => {
                         let curved = |piece: &Piece| curvature.get(piece.triangle as usize).copied().unwrap_or(0.0);
-                        cell.kind == Kind::Cut
+                        level < levels
+                            && cell.kind == Kind::Cut
                             && size * pieces.get(node).map_or(0.0, |owned| owned.iter().map(curved).fold(0.0, f64::max)) > turn * (1.0 + AT_LIMIT)
                     }
                 }
@@ -946,8 +1101,11 @@ fn divide_cells(
         let divided: Vec<usize> = (first..end)
             .filter(|&node| {
                 let Some(cell) = leaf(node) else { return false };
-                if is_marked(node) || marker.is_some() {
-                    return is_marked(node);
+                if is_marked(node) || asked.contains(&(cell.level, cell.ijk)) {
+                    return true;
+                }
+                if marker.is_some() {
+                    return false;
                 }
                 // The cells across the faces of a marked one are divided with it.
                 let at = cell.ijk.map(i64::from);
@@ -1046,7 +1204,9 @@ fn solve_at(
     limits: &Limits,
     fictitious: f64,
     marker: Option<Marker>,
+    round: &Round,
 ) -> Result<Solution> {
+    let asked = &round.asked;
     let lame = material.lame()?;
     options.check()?;
     let p = options.degree;
@@ -1070,8 +1230,10 @@ fn solve_at(
     }
     let grid = Grid::over(lo, hi, options.cell_size, options.offset, MAX_CELLS)?;
     let mut triangles = Vec::with_capacity(surface.triangles().len());
-    // The finest cells there can be: divided for the surface's curvature, then where gaps end.
-    let finest = (options.refine + if options.separate { options.gaps } else { 0 }).min(MAX_REFINE);
+    // The finest cells there can be: divided for the surface's curvature or because a round
+    // asked for it, then where gaps end.
+    let deepest_asked = asked.iter().map(|(level, _)| usize::from(*level) + 1).max().unwrap_or(0);
+    let finest = (options.refine.max(deepest_asked) + if options.separate { options.gaps } else { 0 }).min(MAX_REFINE);
     for t in surface.triangles() {
         // On the planes of the finest cells there may be: a face of the part that lies on one
         // lies on it exactly.
@@ -1123,8 +1285,8 @@ fn solve_at(
     }
     drop(sorted);
     drop(kinds);
-    if options.refine > 0 {
-        divide_cells(&grid, &mut tree, &on_grid, &solid, &mut touching, &mut pieces, options.refine, options.turn(), marker)?;
+    if options.refine > 0 || !asked.is_empty() {
+        divide_cells(&grid, &mut tree, &on_grid, &solid, &mut touching, &mut pieces, options.refine, options.turn(), marker, asked)?;
     }
 
     // The cut cells: their quadrature, and the separate pieces of material each holds. Where
@@ -1139,7 +1301,11 @@ fn solve_at(
     // where that is more.
     let allowed = tree.nodes.iter().filter(|cell| cell.is_leaf() && cell.material()).count().max(GAP_CELLS);
     let (mut added, mut holding) = (0usize, 0usize);
-    for round in 0..=options.gaps.min(MAX_REFINE) {
+    // A round divides the cells that hold a gap's sides together, the largest first, so cells
+    // that are already small beside larger ones take a round more for every level between
+    // them: as many rounds as the levels asked for and the levels there are.
+    let rounds = if options.gaps == 0 { 0 } else { (options.gaps + tree.deepest()).min(2 * MAX_REFINE) };
+    for round in 0..=rounds {
         cuts.resize(tree.nodes.len(), None);
         let todo: Vec<usize> = (0..tree.nodes.len())
             .filter(|node| {
@@ -1196,7 +1362,7 @@ fn solve_at(
         // the ends of gaps may cost, the cells that are left hold their gaps' sides together:
         // the ones that do so over more than twice the widths asked for are counted.
         let more = 7 * divided.len();
-        if round == options.gaps.min(MAX_REFINE) || added + more > allowed || tree.nodes.len() + 8 * divided.len() > 2 * MAX_CELLS {
+        if round == rounds || added + more > allowed || tree.nodes.len() + 8 * divided.len() > 2 * MAX_CELLS {
             holding = crate::space::holding(&tree, &islands_of, &links, &sides, 2.0 * Options::GAP, &|level| grid.step(level)).len();
             break;
         }
@@ -1254,13 +1420,27 @@ fn solve_at(
     if layout.dofs() != unknowns {
         return Err(Error::Internal("the layout does not hold three unknowns per mode".into()));
     }
-    let mut stiffness = {
+    let (mut stiffness, stiffness_entries) = {
         let graph = NodeGraph::new(space.count, (0..elements).map(|element| space.functions(element)));
         let entries = graph.entries(&layout);
         if entries > MAX_MATRIX_ENTRIES {
             return Err(too_large(entries));
         }
-        graph.zero_matrix(&layout)
+        // A round of [`Options::adapt`] is refused here, before its cells are integrated, when
+        // its factor cannot fit: the larger system of the same part is taken to have no fewer
+        // entries of the factor for each of the stiffness than the solve before it had (the
+        // fill of a nested dissection grows with the system).
+        if let Some((stiffness, factor)) = round.before.filter(|(stiffness, _)| *stiffness > 0 && entries >= *stiffness) {
+            let least = entries as f64 * factor as f64 / stiffness as f64;
+            if least > limits.max_factor_entries as f64 {
+                return Err(Error::Limit(format!(
+                    "the factorization would need {least:.0} entries or more; the limit is {} ({})",
+                    limits.max_factor_entries,
+                    smaller(options.refine)
+                )));
+            }
+        }
+        (graph.zero_matrix(&layout), entries)
     };
     let mut load = vec![0.0; unknowns];
 
@@ -1374,6 +1554,7 @@ fn solve_at(
         cut_cells: 0,
         unknowns,
         quadrature_points: 0,
+        stiffness_entries,
         factor_entries: 0,
         volume: 0.0,
         surface_volume: surface.volume(),
@@ -1385,6 +1566,9 @@ fn solve_at(
         separated: 3 * separated,
         holding,
         joined: false,
+        rounds: 0,
+        settled: 0.0,
+        left_out: false,
     };
     let mut nitsche = vec![0.0; elements];
     let mut fractions = vec![1.0; elements];
@@ -1458,11 +1642,14 @@ fn solve_at(
     // The strain energy of the part: ½ uᵀ K u element by element, in the modes of its cell, with
     // the stiffness of the part alone.
     let mut strain_energy = 0.0;
+    // The modes of the highest degree along an axis.
+    let top: Vec<bool> = shapes.modes.iter().map(|mode| mode.iter().any(|index| usize::from(*index) == p)).collect();
+    let mut surplus = Vec::with_capacity(elements);
     for block in fieldcraft_parallel::blocks(elements, block_size) {
         let first = block.start;
         let energies = fieldcraft_parallel::map(block.len(), |i| {
             let element = first + i;
-            let Ok((node, cell, whole)) = cell_of(element) else { return 0.0 };
+            let Ok((node, cell, whole)) = cell_of(element) else { return (0.0, 0.0) };
             let local = space.local(element, &u);
             let own;
             let k = match cut_of(node).and_then(|leaf| leaf.inside.get(space.island(element))) {
@@ -1476,10 +1663,19 @@ fn solve_at(
             for (row, x) in k.chunks_exact(n).zip(&local) {
                 energy += x * row.iter().zip(&local).map(|(a, b)| a * b).sum::<f64>();
             }
-            0.5 * energy
+            // And of what the functions of the highest degree alone carry ([`Options::adapt`]).
+            let highest = |unknown: usize| top.get(unknown / 3).copied().unwrap_or(false);
+            let mut surplus = 0.0;
+            for (r, (row, x)) in k.chunks_exact(n).zip(&local).enumerate() {
+                if highest(r) {
+                    surplus += x * row.iter().zip(&local).enumerate().filter(|(c, _)| highest(*c)).map(|(_, (a, b))| a * b).sum::<f64>();
+                }
+            }
+            (0.5 * energy, 0.5 * surplus)
         });
-        for energy in energies {
+        for (energy, most) in energies {
             strain_energy += energy;
+            surplus.push(most);
         }
     }
 
@@ -1523,7 +1719,7 @@ fn solve_at(
     // The positions of the modes were for the ordering only.
     space.xyz = Vec::new();
     let near = if separated > 0 { (0..elements).map(|element| space.around(element, NEAR_LINKS).unwrap_or_default()).collect() } else { Vec::new() };
-    Ok(Solution { grid, shapes, lame, tree, space, split, near, fractions, material, u, stats, strain_energy, reactions })
+    Ok(Solution { grid, shapes, lame, tree, space, split, near, fractions, material, u, stats, surplus, strain_energy, reactions })
 }
 
 #[cfg(test)]
@@ -1586,7 +1782,7 @@ mod tests {
             Support { face: 4, fixed: [false, false, true], value: [0.0; 3] },
         ];
         let loads = [Load::Traction { face: 1, traction: [STRESS, 0.0, 0.0] }];
-        let solution = solve_marked(&block(SIZE), &STEEL, &supports, &loads, options, &Limits::default(), Some(marker)).unwrap();
+        let solution = solve_marked(&block(SIZE), &STEEL, &supports, &loads, options, &Limits::default(), Some(marker), &Round::default()).unwrap().0;
         let elongation = STRESS * SIZE[0] / STEEL.young;
         let (mut displacement, mut stress) = (0.0f64, 0.0f64);
         for fx in [0.0, 0.07, 0.31, 0.5, 0.88, 1.0] {
@@ -1681,7 +1877,8 @@ mod tests {
         let (size, gravity) = ([0.5, 0.25, 1.0], 9.81);
         let supports = [Support { face: 5, fixed: [true; 3], value: [0.0; 3] }];
         let loads = [Load::Gravity { acceleration: [0.0, 0.0, -gravity] }];
-        let solution = solve_marked(&block(size), &material, &supports, &loads, options, &Limits::default(), Some(marker)).unwrap();
+        let solution =
+            solve_marked(&block(size), &material, &supports, &loads, options, &Limits::default(), Some(marker), &Round::default()).unwrap().0;
         let weight = material.density * gravity;
         let scale = weight * size[2] * size[2] / (2.0 * material.young);
         let (mut displacement, mut stress) = (0.0f64, 0.0f64);

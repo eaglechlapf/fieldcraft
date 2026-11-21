@@ -26,6 +26,13 @@
 //!    nodes*, Comput. Mech. 55(3):499–517, 2015). Every cell that is not divided is integrated
 //!    like a cell of the grid, in its own shape functions; the functions of the cells above it
 //!    are combinations of those.
+//!    The cells the solution is least resolved in can be divided as well, in rounds of solving
+//!    and dividing ([`Options::adapt`], off by default): the indicator is the strain energy of
+//!    what the functions of the highest degree alone carry in a cell (B. Szabó, I. Babuška,
+//!    *Finite Element Analysis*, Wiley 1991), the cells that carry a fixed share of its sum are
+//!    divided (W. Dörfler, *A convergent adaptive algorithm for Poisson's equation*, SIAM J.
+//!    Numer. Anal. 33(3):1106–1124, 1996), and the rounds end when one no longer moves the
+//!    solution ([`Options::settle`]).
 //! 3. **Basis** ([`legendre`]): the tensor product of integrated Legendre polynomials of degree
 //!    p on every cell, or its trunk space ([`Options::basis`]). Modes on a shared vertex, edge
 //!    or face of the grid are one unknown.

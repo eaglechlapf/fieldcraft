@@ -20,6 +20,13 @@
 //! say how far the grid is from it, and the hung tray is a hard case for both (a plate of 2 mm
 //! bent over 300 mm, with stress concentrated where the bend meets the corner reliefs).
 //!
+//! What is left of the error once the corners are open is the bend along the fixed wall, which
+//! cells of 12.5 mm do not resolve. A section through it alone (the wall, the bend and a strip
+//! of the floor, 10 mm wide; measured once and not kept as a test) converges to a deflection
+//! that cells of 25 mm miss by 8 %, cells divided to 6 mm at the bend by 2 % and to 3 mm by
+//! 0.7 %. Dividing the cells of every bend and hole that far is more than the solver holds;
+//! dividing the ones the solution is least resolved in ([`Options::adapt`]) is not.
+//!
 //! The numbers are in the consistent set millimetre, newton, megapascal.
 
 use std::collections::BTreeMap;
@@ -138,8 +145,10 @@ fn sag(tray: &Tray, hung: bool, options: &Options) -> (f64, String) {
     assert!(volume_error < 1e-4, "volume error {volume_error}");
     let total = solution.reactions.iter().fold([0.0; 3], |sum, r| [sum[0] + r.force[0], sum[1] + r.force[1], sum[2] + r.force[2]]);
     let account = format!(
-        "{} unknowns, cells by level {:?}, {} cells of several pieces ({} unknowns more), reaction {:.3?} N, {:.1} s",
+        "{} unknowns, {} rounds (the last changed the strain energy by {:.2} %), cells by level {:?}, {} cells of several pieces ({} unknowns more), reaction {:.3?} N, {:.1} s",
         stats.unknowns,
+        stats.rounds,
+        100.0 * stats.settled,
         stats.levels,
         stats.split_cells,
         stats.separated,
@@ -170,10 +179,25 @@ fn a_sheet_metal_tray_with_open_corners() {
     println!("hung, cells divided where the gaps end: {divided:.4} mm of {HUNG} ({account})");
     assert!((divided / HUNG - 1.0).abs() < 0.15, "{divided}");
 
+    // And with the cells divided where the solution is least resolved, which is the bend along
+    // the wall that holds the tray: two rounds, neither of which settles it within 5 %.
+    let rounds = Options { adapt: 2, settle: Options::SETTLED, ..grid(true, 4) };
+    let (adapted, account) = sag(&tray, true, &rounds);
+    println!("hung, two rounds that follow the solution: {adapted:.4} mm of {HUNG} ({account})");
+    assert!((adapted / HUNG - 1.0).abs() < 0.05, "{adapted}");
+    // From the grid's own cells, with none divided for the curvature of a bend or a hole, the
+    // same two rounds do better than one level at every bend and hole, with fewer unknowns.
+    let (followed, account) = sag(&tray, true, &Options { refine: 0, ..rounds });
+    println!("hung, two rounds from the grid's own cells: {followed:.4} mm of {HUNG} ({account})");
+    assert!((followed / HUNG - 1.0).abs() < 0.08 && (followed / HUNG - 1.0).abs() < (divided / HUNG - 1.0).abs(), "{followed}");
+
     // Bolted. The corners carry little.
     for (separate, gaps, tolerance) in [(false, 0, 0.02), (true, 4, 0.012)] {
         let (bolted, account) = sag(&tray, false, &grid(separate, gaps));
         println!("bolted, separate {separate}, {gaps} levels where gaps end: {bolted:.5} mm of {BOLTED} ({account})");
         assert!((bolted / BOLTED - 1.0).abs() < tolerance, "{bolted}");
     }
+    let (bolted, account) = sag(&tray, false, &rounds);
+    println!("bolted, two rounds that follow the solution: {bolted:.5} mm of {BOLTED} ({account})");
+    assert!((bolted / BOLTED - 1.0).abs() < 0.005, "{bolted}");
 }
