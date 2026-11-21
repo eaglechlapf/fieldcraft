@@ -161,7 +161,7 @@ impl Tree {
 
     /// The deepest cell of a level up to `level` that covers the place of cell `at` of `level`;
     /// `None` where no cell of the grid holds material.
-    fn covering(&self, level: usize, at: [i64; 3]) -> Option<usize> {
+    pub fn covering(&self, level: usize, at: [i64; 3]) -> Option<usize> {
         let mut base = [0usize; 3];
         for axis in 0..3 {
             if at[axis] < 0 {

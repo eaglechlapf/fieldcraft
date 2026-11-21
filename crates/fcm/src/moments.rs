@@ -152,6 +152,13 @@ impl Moments {
         }
     }
 
+    /// Add the points of `other`.
+    pub fn absorb(&mut self, other: &Moments) {
+        for (m, more) in self.m.iter_mut().zip(&other.m) {
+            *m += more;
+        }
+    }
+
     /// The sum of the weights.
     pub fn total(&self) -> f64 {
         self.m.first().copied().unwrap_or(0.0)

@@ -1,6 +1,7 @@
 //! The linear static step on the grid: from a face-tagged surface, a material, supports and
 //! loads to the displacement and stress anywhere in the part.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use fieldcraft_fem::{DofLayout, DofSet};
@@ -14,6 +15,7 @@ use crate::cell::{self, Face, Lame, Shapes, Surface};
 use crate::gauss::gauss_legendre;
 use crate::grid::{self, Grid, MAX_DEPTH, MAX_REFINE, Piece, QuadPoint, Triangles, cross, dot, sub};
 use crate::inside::Solid;
+use crate::islands::{self, CutLeaf, Held};
 use crate::legendre::MAX_DEGREE;
 use crate::moments::{Moments, Scratch};
 use crate::refine::{Node, Tree};
@@ -36,6 +38,12 @@ const BLOCK_BYTES: usize = 1 << 30;
 const MOST_BLOCK: usize = 256;
 /// Cells classified per parallel task.
 const GRAIN: usize = 4096;
+/// Cells that dividing the ends of gaps may always add ([`Options::gaps`]); beyond these, as
+/// many as the cells that hold material. A gap that closes to nothing (two faces that touch
+/// along a line, a sphere on a plate) has no width to stop at, and a part of many slits has
+/// many roots: the ends of gaps are then resolved as far as this pays for, and
+/// [`Stats::holding`] says what is left.
+const GAP_CELLS: usize = 512;
 /// A point this close to a grid plane, as a fraction of the cell size, may be evaluated in the
 /// cell on either side.
 const NEAR: f64 = 1e-6; // unit-factors: relative to the cell size
@@ -191,9 +199,41 @@ pub struct Options {
     /// in the same measurement the full depth under every divided cell changes the stress at
     /// the hole by 0.04 % at most, with up to seven times the quadrature points.
     pub refine: usize,
+    /// Whether material that one cell holds in separate pieces has unknowns of its own in each
+    /// piece ([`crate::islands`]): the two flanges of a sheet metal corner, the two jaws of a
+    /// slit clamp, the two sides of any gap narrower than a cell. Off, a cell is one polynomial
+    /// whatever it holds, and such a gap is solved as if it were welded shut wherever a cell
+    /// reaches across it: on the fork of `tests/gap.rs` the prong that is not pulled takes a
+    /// tenth of the load, and the tray of `tests/tray.rs`, hung by one wall, carries its load
+    /// through its four open corners and deflects an eightieth of what it does.
+    ///
+    /// This costs nothing where no cell holds separate pieces of material, and changes nothing
+    /// there: not the unknowns, not their numbering, not a bit of the result. A cell that cuts
+    /// through a hole can hold the material on its two sides as two pieces; that is told apart
+    /// too, which adds a few unknowns and moves the stress at the hole in its last digits. A
+    /// piece of material that is connected to nothing else leaves the system singular; the step
+    /// is then solved with the pieces joined, and [`Stats::joined`] says so.
+    pub separate: bool,
+    /// The levels of refinement at the root of a gap, 0..=[`MAX_REFINE`]; 0 for none.
+    ///
+    /// Where a gap ends inside a cell (a slit, the relief at a sheet metal corner), the cell
+    /// holds one piece of material and its polynomial joins the two sides of the gap for as far
+    /// as the cell reaches along it: nothing tells them apart there ([`Options::separate`]
+    /// does where a cell holds the two sides and not the root). So a cell that holds one piece
+    /// of material is divided when one of its eight parts would hold separate pieces
+    /// ([`crate::islands`]) that are less than a quarter of the cell apart ([`Options::GAP`]),
+    /// up to this many levels: the stretch along which the sides are joined shrinks to a few
+    /// widths of the gap, and nothing else is divided for it. The cells this may add are bounded
+    /// (as many again as hold material, 512 at least), and when the system is too large with
+    /// them the step is solved with a level less, down to none; [`Stats::holding`] counts the
+    /// cells that are left holding the sides of a gap together.
+    pub gaps: usize,
 }
 
 impl Options {
+    /// A cell that holds the root of a gap is divided while it is more than this many widths
+    /// of the gap across ([`Options::gaps`]).
+    pub const GAP: f64 = 2.5;
     pub const DEGREE: usize = 3;
     /// The turning of the surface across one cell, in radians, that a cell of degree 4 or more
     /// resolves: half a radian, two cells to the radius. This is a measurement, not a choice:
@@ -230,6 +270,8 @@ impl Options {
             offset: [0.0; 3],
             basis: Basis::Tensor,
             refine: 0,
+            separate: true,
+            gaps: 0,
         }
     }
 
@@ -244,8 +286,8 @@ impl Options {
     }
 
     fn check(&self) -> Result<()> {
-        if self.refine > MAX_REFINE {
-            return Err(Error::Invalid(format!("{} levels of refinement are above {MAX_REFINE}", self.refine)));
+        if self.refine > MAX_REFINE || self.gaps > MAX_REFINE {
+            return Err(Error::Invalid(format!("{} levels of refinement are above {MAX_REFINE}", self.refine.max(self.gaps))));
         }
         if !(1..=MAX_DEGREE).contains(&self.degree) {
             return Err(Error::Invalid(format!("degree {} is not in 1..={MAX_DEGREE}", self.degree)));
@@ -298,6 +340,18 @@ pub struct Stats {
     /// ([`Options::refine`]): `levels[0]` are cells of the grid, `levels[1]` cells of half
     /// their size, and so on. Their sum is `inside_cells + cut_cells`.
     pub levels: [usize; MAX_REFINE + 1],
+    /// The cells that hold material in separate pieces, each of which has unknowns of its own
+    /// there ([`Options::separate`]): the two sides of a gap narrower than the cell.
+    pub split_cells: usize,
+    /// The unknowns that telling such pieces apart added.
+    pub separated: usize,
+    /// The cells that still hold the two sides of a gap together where it ends, over more than
+    /// twice [`Options::GAP`] widths of the gap: [`Options::gaps`] had no level left for them,
+    /// or the cells it may add were used up.
+    pub holding: usize,
+    /// Whether the pieces were joined after all: told apart, the system was singular (a piece
+    /// that nothing holds), and the step was solved as with [`Options::separate`] off.
+    pub joined: bool,
 }
 
 /// How far two solutions of the same step are apart ([`Solution::change_from`]): an indicator
@@ -323,6 +377,13 @@ pub struct Solution {
     lame: Lame,
     tree: Tree,
     space: Space,
+    /// The cells that hold several islands, by node: the pieces of surface each owns and the
+    /// island of each piece ([`islands::island_at`]).
+    split: BTreeMap<u32, (Vec<Piece>, Vec<u16>)>,
+    /// Where functions were told apart ([`Options::separate`]): for each element, itself and
+    /// the elements a few links of material from it, in increasing order ([`Space::around`]).
+    /// Empty where none were.
+    near: Vec<Vec<u32>>,
     /// The fraction of each element's cell that holds material.
     fractions: Vec<f64>,
     /// Where the material of each element's cell is, in the cell's natural coordinates: its
@@ -341,15 +402,20 @@ impl Solution {
     /// The leaf under `node` that holds the point at `t` cells of the grid from its origin and
     /// holds material: its element, the point's natural coordinates in it and its size. A point
     /// within [`NEAR`] of the plane between two children may be in either.
-    fn descend(&self, node: usize, t: [f64; 3]) -> Option<(usize, [f64; 3], f64)> {
+    fn descend(&self, node: usize, t: [f64; 3], island: bool) -> Option<(usize, [f64; 3], f64)> {
         let cell = self.tree.nodes.get(node)?;
         let level = usize::from(cell.level);
         // In cells of this level from the cell's lowest corner.
         let steps = (1u64 << level.min(MAX_REFINE)) as f64;
         let within = [0, 1, 2].map(|a| t[a] * steps - cell.ijk[a] as f64);
         if cell.is_leaf() {
-            let element = self.space.element_of.get(node).copied().filter(|element| *element != NONE && cell.material())?;
-            return Some((element as usize, within.map(|s| 2.0 * s - 1.0), self.grid.step(level)));
+            let first = self.space.element_of.get(node).copied().filter(|element| *element != NONE && cell.material())? as usize;
+            // In a cell of several islands, the one the point is in, when that is asked for:
+            // the first otherwise.
+            let island = u32::try_from(node).ok().filter(|_| island).and_then(|node| self.split.get(&node)).map_or(0, |(pieces, of_piece)| {
+                islands::island_at(pieces, of_piece, [0, 1, 2].map(|a| self.grid.origin[a] + t[a] * self.grid.spacing))
+            });
+            return Some((first + island, within.map(|s| 2.0 * s - 1.0), self.grid.step(level)));
         }
         let mut halves = [[None; 2]; 3];
         for a in 0..3 {
@@ -361,7 +427,7 @@ impl Solution {
         for k in halves[2].into_iter().flatten() {
             for j in halves[1].into_iter().flatten() {
                 for i in halves[0].into_iter().flatten() {
-                    if let Some(found) = self.descend(cell.children as usize + i + 2 * j + 4 * k, t) {
+                    if let Some(found) = self.descend(cell.children as usize + i + 2 * j + 4 * k, t, island) {
                         return Some(found);
                     }
                 }
@@ -372,6 +438,12 @@ impl Solution {
 
     /// The element that holds `x`, its natural coordinates there and the size of its cell.
     fn locate(&self, x: [f64; 3]) -> Option<(usize, [f64; 3], f64)> {
+        self.locate_in(x, true)
+    }
+
+    /// [`Solution::locate`]; with `island` off, the first element of the cell that holds `x`,
+    /// whichever of the cell's islands the point is in: enough for what the cell alone says.
+    fn locate_in(&self, x: [f64; 3], island: bool) -> Option<(usize, [f64; 3], f64)> {
         let mut t = [0.0; 3];
         let mut candidates = [[None; 2]; 3];
         for a in 0..3 {
@@ -398,7 +470,7 @@ impl Solution {
                     if root == NONE {
                         continue;
                     }
-                    if let Some(found) = self.descend(root as usize, t) {
+                    if let Some(found) = self.descend(root as usize, t, island) {
                         return Some(found);
                     }
                 }
@@ -453,9 +525,9 @@ impl Solution {
             return readers;
         };
         let t = [0, 1, 2].map(|a| (x[a] - self.grid.origin[a]) / self.grid.spacing);
-        let reader = |node: usize| -> Option<Reader> {
+        let reader = |node: usize, island: usize| -> Option<Reader> {
             let other = self.tree.nodes.get(node)?;
-            let element = self.space.element_of.get(node).copied().filter(|element| *element != NONE)? as usize;
+            let element = self.space.element(node, island)?;
             let fraction = self.fractions.get(element).copied().filter(|fraction| *fraction > 0.0)?;
             let (middle, half) = self.material.get(element).copied()?;
             let steps = (1u64 << other.level) as f64;
@@ -465,14 +537,27 @@ impl Solution {
             let growth: f64 = (0..3).map(|a| chebyshev(self.shapes.p, ((xi[a] - middle[a]).abs() / half[a]).max(1.0))).product();
             Some(Reader { estimate: growth / fraction.sqrt(), element, xi, size: self.grid.step(usize::from(other.level)) })
         };
-        readers.extend(reader(node));
+        readers.extend(reader(node, self.space.island(element)));
+        // Where pieces of material were told apart, only the elements this one's material goes
+        // on into, across a few faces at most, know its stress: the other side of a gap does not.
+        let joined = self.near.get(element);
         let (level, at) = (usize::from(cell.level), cell.ijk.map(i64::from));
         for around in 0..27i64 {
             let beside = [at[0] + around % 3 - 1, at[1] + (around / 3) % 3 - 1, at[2] + around / 9 - 1];
-            if let Some(found) = self.tree.leaf_near(level, beside, t).and_then(reader)
-                && readers.iter().all(|reader| reader.element != found.element)
-            {
-                readers.push(found);
+            let Some(found) = self.tree.leaf_near(level, beside, t) else { continue };
+            // One island where nothing was told apart; `Space::element` ends the others.
+            for island in 0..usize::from(u16::MAX) {
+                let Some(other) = self.space.element(found, island) else { break };
+                let told_apart = joined.is_some_and(|joined| u32::try_from(other).is_ok_and(|other| joined.binary_search(&other).is_err()));
+                if !told_apart
+                    && let Some(found) = reader(found, island)
+                    && readers.iter().all(|reader| reader.element != found.element)
+                {
+                    readers.push(found);
+                }
+                if joined.is_none() {
+                    break;
+                }
             }
         }
         readers
@@ -490,7 +575,7 @@ impl Solution {
     /// not divided). The solution is one polynomial over that length, so its stress is read
     /// well at points this far apart over the degree.
     pub fn cell_size(&self, x: [f64; 3]) -> Option<f64> {
-        self.locate(x).map(|(_, _, size)| size)
+        self.locate_in(x, false).map(|(_, _, size)| size)
     }
 
     /// The displacement at a point of the part; `None` outside the cells that hold material
@@ -543,17 +628,24 @@ impl Solution {
     /// (`tests/benchmarks.rs`) the stresses at the two ends of the hole, which lie in slivers
     /// on the planes of symmetry, move from within 0.6 % of the exact values to within 1.7 %.
     pub fn stress(&self, x: [f64; 3]) -> Option<[f64; 6]> {
-        let (_, g) = self.field(x)?;
+        self.at(x).map(|(_, stress)| stress)
+    }
+
+    /// The displacement and the stress at a point of the part ([`Solution::displacement`],
+    /// [`Solution::stress`]), read together: half the work of asking for each.
+    pub fn at(&self, x: [f64; 3]) -> Option<([f64; 3], [f64; 6])> {
+        let (u, g) = self.field(x)?;
         let (lambda, mu) = (self.lame.lambda, self.lame.mu);
         let dilatation = lambda * (g[0][0] + g[1][1] + g[2][2]);
-        Some([
+        let stress = [
             dilatation + 2.0 * mu * g[0][0],
             dilatation + 2.0 * mu * g[1][1],
             dilatation + 2.0 * mu * g[2][2],
             mu * (g[0][1] + g[1][0]),
             mu * (g[0][2] + g[2][0]),
             mu * (g[1][2] + g[2][1]),
-        ])
+        ];
+        Some((u, stress))
     }
 
     /// The von Mises stress at a point of the part.
@@ -670,6 +762,11 @@ fn conditions(supports: &[Support], loads: &[Load], areas: &BTreeMap<u32, f64>, 
     Ok((faces, body))
 }
 
+/// Faces between an element and one that reads its stress with it ([`Solution::stress`]): the
+/// cells around a cell, which share a face, an edge or a vertex with it, are three faces away
+/// at most.
+const NEAR_LINKS: usize = 3;
+
 /// A cell's polynomial as an estimate of the gradient at a point ([`Solution::stress`]).
 struct Reader {
     /// How large its error is estimated to be, against a cell wholly inside the part at a
@@ -719,11 +816,8 @@ struct Integrated {
     cut: Option<Cut>,
 }
 
-/// What the quadrature of a cut cell leaves behind.
+/// What an element of a cut cell leaves behind.
 struct Cut {
-    /// The moments of the part in the cell: its stiffness alone, with no fictitious stiffness
-    /// and no support terms, is computed from them again for the strain energy.
-    inside: Moments,
     nitsche: f64,
     volume: f64,
     points: usize,
@@ -774,12 +868,36 @@ fn solve_marked(
     // the fraction asked for, then a hundred times more at a time up to the one that keeps the
     // margin for this material. Each step multiplies the fraction, so the loop ends.
     let most = margin_fraction(&lame).min(1.0);
-    let mut fictitious = options.fictitious;
-    loop {
-        match solve_at(surface, material, supports, loads, options, limits, fictitious, marker) {
-            Err(Error::Singular(_)) if fictitious < most => fictitious = (fictitious * FICTITIOUS_STEP).min(most),
-            result => return result,
+    let attempt = |options: &Options| {
+        let mut fictitious = options.fictitious;
+        loop {
+            match solve_at(surface, material, supports, loads, options, limits, fictitious, marker) {
+                Err(Error::Singular(_)) if fictitious < most => fictitious = (fictitious * FICTITIOUS_STEP).min(most),
+                result => return result,
+            }
         }
+    };
+    // The cells divided where gaps end may make the system too large ([`Options::gaps`]): then
+    // with a level less of them, down to none.
+    let mut fewer = *options;
+    let first = loop {
+        match attempt(&fewer) {
+            Err(Error::Limit(_)) if fewer.separate && fewer.gaps > 0 => fewer.gaps -= 1,
+            result => break result,
+        }
+    };
+    match first {
+        // Told apart, a piece of material may be held by nothing ([`Options::separate`]): the
+        // step with the pieces joined, when that one can be solved.
+        Err(Error::Singular(message)) if options.separate => match attempt(&Options { separate: false, ..*options }) {
+            Ok(mut solution) => {
+                solution.stats.joined = true;
+                Ok(solution)
+            }
+            Err(Error::Singular(_)) => Err(Error::Singular(message)),
+            Err(other) => Err(other),
+        },
+        result => result,
     }
 }
 
@@ -850,54 +968,69 @@ fn divide_cells(
                 "refinement would make more than {MAX_CELLS} cells (use fewer levels of refinement or a larger cell size)"
             )));
         }
-        let finer = grid.step(level + 1);
-        let children = fieldcraft_parallel::map(divided.len(), |i| -> Result<Vec<(Kind, Vec<u32>, Vec<Piece>)>> {
-            let broken = || Error::Internal("a cell to divide is missing".into());
-            let node = *divided.get(i).ok_or_else(broken)?;
-            let cell = tree.nodes.get(node).ok_or_else(broken)?;
-            let reach = touching.get(node).ok_or_else(broken)?;
-            let at = cell.position();
-            (0..8usize)
-                .map(|child| {
-                    let at = [2 * at[0] + (child & 1), 2 * at[1] + ((child >> 1) & 1), 2 * at[2] + ((child >> 2) & 1)];
-                    let (lo, hi) = (grid.fine_lo(level + 1, at), grid.fine_hi(level + 1, at));
-                    let (reach, owned) = grid::sort_into_box(surface.corners, reach, lo, hi, finer);
-                    // A cell that owns a piece is cut; a part of a cell wholly inside is inside;
-                    // any other lies on one side of the surface, which its centre decides.
-                    let kind = if !owned.is_empty() {
-                        Kind::Cut
-                    } else if cell.kind == Kind::Inside || solid.contains([0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1]), 0.5 * (lo[2] + hi[2])])? {
-                        Kind::Inside
-                    } else {
-                        Kind::Outside
-                    };
-                    Ok((kind, reach, owned))
-                })
-                .collect()
-        });
-        for (node, children) in divided.into_iter().zip(children) {
-            let children = children?;
-            let mut kinds = [Kind::Outside; 8];
-            for (kind, child) in kinds.iter_mut().zip(&children) {
-                *kind = child.0;
-            }
-            if children.len() != kinds.len() {
-                return Err(Error::Internal("a divided cell has not eight children".into()));
-            }
-            tree.divide(node, kinds)?;
-            for (_, reach, owned) in children {
-                touching.push(reach);
-                pieces.push(owned);
-            }
-            // The surface in a divided cell is its children's.
-            if let Some(list) = touching.get_mut(node) {
-                *list = Vec::new();
-            }
-            if let Some(list) = pieces.get_mut(node) {
-                *list = Vec::new();
-            }
-        }
+        divide_nodes(grid, tree, surface, solid, touching, pieces, &divided)?;
         first = end;
+    }
+    Ok(())
+}
+
+/// Divide the leaves `divided` of `tree` into eight each, sorting the surface each holds
+/// (`touching`, `pieces`) into the new cells.
+fn divide_nodes(
+    grid: &Grid,
+    tree: &mut Tree,
+    surface: &Triangles,
+    solid: &Solid,
+    touching: &mut Vec<Vec<u32>>,
+    pieces: &mut Vec<Vec<Piece>>,
+    divided: &[usize],
+) -> Result<()> {
+    let children = fieldcraft_parallel::map(divided.len(), |i| -> Result<Vec<(Kind, Vec<u32>, Vec<Piece>)>> {
+        let broken = || Error::Internal("a cell to divide is missing".into());
+        let node = *divided.get(i).ok_or_else(broken)?;
+        let cell = tree.nodes.get(node).ok_or_else(broken)?;
+        let reach = touching.get(node).ok_or_else(broken)?;
+        let (level, at) = (usize::from(cell.level), cell.position());
+        let finer = grid.step(level + 1);
+        (0..8usize)
+            .map(|child| {
+                let at = [2 * at[0] + (child & 1), 2 * at[1] + ((child >> 1) & 1), 2 * at[2] + ((child >> 2) & 1)];
+                let (lo, hi) = (grid.fine_lo(level + 1, at), grid.fine_hi(level + 1, at));
+                let (reach, owned) = grid::sort_into_box(surface.corners, reach, lo, hi, finer);
+                // A cell that owns a piece is cut; a part of a cell wholly inside is inside;
+                // any other lies on one side of the surface, which its centre decides.
+                let kind = if !owned.is_empty() {
+                    Kind::Cut
+                } else if cell.kind == Kind::Inside || solid.contains([0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1]), 0.5 * (lo[2] + hi[2])])? {
+                    Kind::Inside
+                } else {
+                    Kind::Outside
+                };
+                Ok((kind, reach, owned))
+            })
+            .collect()
+    });
+    for (node, children) in divided.iter().zip(children) {
+        let children = children?;
+        let mut kinds = [Kind::Outside; 8];
+        for (kind, child) in kinds.iter_mut().zip(&children) {
+            *kind = child.0;
+        }
+        if children.len() != kinds.len() {
+            return Err(Error::Internal("a divided cell has not eight children".into()));
+        }
+        tree.divide(*node, kinds)?;
+        for (_, reach, owned) in children {
+            touching.push(reach);
+            pieces.push(owned);
+        }
+        // The surface in a divided cell is its children's.
+        if let Some(list) = touching.get_mut(*node) {
+            *list = Vec::new();
+        }
+        if let Some(list) = pieces.get_mut(*node) {
+            *list = Vec::new();
+        }
     }
     Ok(())
 }
@@ -937,13 +1070,15 @@ fn solve_at(
     }
     let grid = Grid::over(lo, hi, options.cell_size, options.offset, MAX_CELLS)?;
     let mut triangles = Vec::with_capacity(surface.triangles().len());
+    // The finest cells there can be: divided for the surface's curvature, then where gaps end.
+    let finest = (options.refine + if options.separate { options.gaps } else { 0 }).min(MAX_REFINE);
     for t in surface.triangles() {
         // On the planes of the finest cells there may be: a face of the part that lies on one
         // lies on it exactly.
         let corner = |v: u32| {
             vertices
                 .get(v as usize)
-                .map(|x| grid.snap_to(*x, options.refine))
+                .map(|x| grid.snap_to(*x, finest))
                 .ok_or_else(|| Error::Internal("a surface triangle names a missing vertex".into()))
         };
         triangles.push([corner(t[0])?, corner(t[1])?, corner(t[2])?]);
@@ -992,8 +1127,108 @@ fn solve_at(
         divide_cells(&grid, &mut tree, &on_grid, &solid, &mut touching, &mut pieces, options.refine, options.turn(), marker)?;
     }
 
-    // The unknowns, numbered in a fill-reducing order.
-    let mut space = Space::new(&tree, &shapes.modes, p);
+    // The cut cells: their quadrature, and the separate pieces of material each holds. Where
+    // a gap between such pieces ends, the cells are divided and the new ones integrated
+    // ([`Options::gaps`]), round by round.
+    let rule = gauss_legendre(p + 1);
+    let surface_rule = gauss_legendre(2 * p + 1);
+    let (second_rule, third_rule) = (gauss_legendre(2 * p + 1), gauss_legendre(3 * p + 2));
+    let mut cuts: Vec<Option<CutLeaf>> = Vec::new();
+    let mut links: Vec<[u32; 4]> = Vec::new();
+    // What the ends of gaps may cost: as many cells again as hold material, or [`GAP_CELLS`]
+    // where that is more.
+    let allowed = tree.nodes.iter().filter(|cell| cell.is_leaf() && cell.material()).count().max(GAP_CELLS);
+    let (mut added, mut holding) = (0usize, 0usize);
+    for round in 0..=options.gaps.min(MAX_REFINE) {
+        cuts.resize(tree.nodes.len(), None);
+        let todo: Vec<usize> = (0..tree.nodes.len())
+            .filter(|node| {
+                tree.nodes.get(*node).is_some_and(|cell| cell.is_leaf() && cell.kind == Kind::Cut) && cuts.get(*node).is_some_and(Option::is_none)
+            })
+            .collect();
+        let integrated = fieldcraft_parallel::map(todo.len(), |index| -> Result<CutLeaf> {
+            let broken = || Error::Internal("a cut cell is missing".into());
+            let node = *todo.get(index).ok_or_else(broken)?;
+            let cell = tree.nodes.get(node).ok_or_else(broken)?;
+            let level = usize::from(cell.level);
+            let rules = [&rule[..], &second_rule[..], &third_rule[..]];
+            islands::integrate(
+                &shapes.tables,
+                grid.fine_lo(level, cell.position()),
+                grid.step(level),
+                touching.get(node).map(Vec::as_slice).unwrap_or_default(),
+                pieces.get(node).map(Vec::as_slice).unwrap_or_default(),
+                &on_grid,
+                &solid,
+                rules,
+                // The octree is as much shallower as the cell is smaller.
+                options.depth.saturating_sub(level),
+                MAX_CELL_POINTS,
+                options.separate,
+            )
+        });
+        for (node, leaf) in todo.iter().zip(integrated) {
+            if let Some(slot) = cuts.get_mut(*node) {
+                *slot = Some(leaf?);
+            }
+        }
+        if !options.separate {
+            break;
+        }
+        let held = |node: usize| -> Option<Held> {
+            let cell = tree.nodes.get(node)?;
+            let level = usize::from(cell.level);
+            Some(Held {
+                lo: grid.fine_lo(level, cell.position()),
+                hi: grid.fine_hi(level, cell.position()),
+                pieces: pieces.get(node).map(Vec::as_slice).unwrap_or_default(),
+                of_piece: cuts.get(node).and_then(Option::as_ref).map(|leaf| leaf.of_piece.as_slice()).unwrap_or_default(),
+            })
+        };
+        links = islands::links(&tree, &solid, &held)?;
+        let sides = islands::sides(&tree, &links, &held);
+        let islands_of = |node: u32| cuts.get(node as usize).and_then(Option::as_ref).map_or(1, CutLeaf::islands);
+        let divided = crate::space::holding(&tree, &islands_of, &links, &sides, Options::GAP, &|level| grid.step(level));
+        if divided.is_empty() {
+            break;
+        }
+        // Each divided cell is seven cells more at most. Past the levels allowed, or past what
+        // the ends of gaps may cost, the cells that are left hold their gaps' sides together:
+        // the ones that do so over more than twice the widths asked for are counted.
+        let more = 7 * divided.len();
+        if round == options.gaps.min(MAX_REFINE) || added + more > allowed || tree.nodes.len() + 8 * divided.len() > 2 * MAX_CELLS {
+            holding = crate::space::holding(&tree, &islands_of, &links, &sides, 2.0 * Options::GAP, &|level| grid.step(level)).len();
+            break;
+        }
+        added += more;
+        divide_nodes(&grid, &mut tree, &on_grid, &solid, &mut touching, &mut pieces, &divided)?;
+        for node in divided {
+            if let Some(slot) = cuts.get_mut(node) {
+                *slot = None;
+            }
+        }
+    }
+    cuts.resize(tree.nodes.len(), None);
+    let cut_of = |node: usize| cuts.get(node).and_then(Option::as_ref);
+    // The pieces of surface an island of a cell owns: all of the cell's where it has one island.
+    let pieces_of = |node: usize, island: usize| -> Cow<[Piece]> {
+        let all = pieces.get(node).map(Vec::as_slice).unwrap_or_default();
+        match cut_of(node).map(|leaf| leaf.of_piece.as_slice()).filter(|of_piece| !of_piece.is_empty()) {
+            Some(of_piece) => Cow::Owned(all.iter().zip(of_piece).filter(|(_, of)| usize::from(**of) == island).map(|(piece, _)| *piece).collect()),
+            None => Cow::Borrowed(all),
+        }
+    };
+
+    // The unknowns, numbered in a fill-reducing order: every island of a cell an element, and
+    // the functions told apart that material does not join.
+    let mut space = Space::with_islands(
+        &tree,
+        &shapes.modes,
+        p,
+        &|node| cut_of(node as usize).map_or(1, CutLeaf::islands),
+        options.separate.then_some(&links[..]),
+    );
+    let separated = space.told_apart;
     let elements = space.elements.len();
     if elements == 0 {
         return Err(Error::Invalid("no cell holds material: the surface must be closed and oriented outward".into()));
@@ -1030,9 +1265,6 @@ fn solve_at(
     let mut load = vec![0.0; unknowns];
 
     // A cell the surface does not cut: every one of a level has the same matrices.
-    let rule = gauss_legendre(p + 1);
-    let surface_rule = gauss_legendre(2 * p + 1);
-    let (second_rule, third_rule) = (gauss_legendre(2 * p + 1), gauss_legendre(3 * p + 2));
     let mut whole = Vec::with_capacity(m);
     for (z, wz) in &rule {
         for (y, wy) in &rule {
@@ -1082,23 +1314,30 @@ fn solve_at(
         let level = usize::from(cell.level);
         let size = grid.step(level);
         let corner = grid.fine_lo(level, cell.position());
-        let touching = touching.get(node).map(Vec::as_slice).unwrap_or_default();
-        let pieces = pieces.get(node).map(Vec::as_slice).unwrap_or_default();
-        let mut volume = cell::Volume::new(&shapes);
-        let rules = [&rule[..], &second_rule[..], &third_rule[..]];
-        // The octree is as much shallower as the cell is smaller.
-        let depth = options.depth.saturating_sub(level);
-        let points = grid::visit_cut_quadrature(corner, size, touching, &on_grid, &solid, rules, depth, MAX_CELL_POINTS, |point| volume.add(&point))?;
+        let island = space.island(element);
+        let leaf = cut_of(node).ok_or_else(missing)?;
+        let inside = leaf.inside.get(island).ok_or_else(missing)?;
+        let pieces = pieces_of(node, island);
         let mut scratch = Scratch::default();
-        let mut stiffness = cell::stiffness(&shapes, size, &volume.inside, &lame, &mut scratch);
-        if !volume.outside.is_zero() {
-            let outside = cell::stiffness(&shapes, size, &volume.outside, &outside_material, &mut scratch);
+        let mut stiffness = cell::stiffness(&shapes, size, inside, &lame, &mut scratch);
+        // To an island the rest of the cell is outside it: the other islands too.
+        let rest;
+        let outside = if leaf.inside.len() > 1 {
+            let mut sum = leaf.outside.clone();
+            leaf.inside.iter().enumerate().filter(|(other, _)| *other != island).for_each(|(_, other)| sum.absorb(other));
+            rest = sum;
+            &rest
+        } else {
+            &leaf.outside
+        };
+        if !outside.is_zero() {
+            let outside = cell::stiffness(&shapes, size, outside, &outside_material, &mut scratch);
             for (total, fictitious) in stiffness.iter_mut().zip(&outside) {
                 *total += fictitious;
             }
         }
-        let mut load = body_load(&cell::body(&shapes, size, &volume.inside, &mut scratch));
-        let boundary = cell::boundary(&shapes, corner, size, pieces, &on_surface, &lame, &surface_rule, &mut scratch);
+        let mut load = body_load(&cell::body(&shapes, size, inside, &mut scratch));
+        let boundary = cell::boundary(&shapes, corner, size, &pieces, &on_surface, &lame, &surface_rule, &mut scratch);
         for (total, surface_load) in load.iter_mut().zip(&boundary.load) {
             *total += surface_load;
         }
@@ -1123,7 +1362,8 @@ fn solve_at(
             stiffness = map.matrix(m, &stiffness);
             load = map.vector(m, &load);
         }
-        let cut = Cut { nitsche, volume: 0.125 * size * size * size * volume.inside.total(), points, inside: volume.inside };
+        // The points of a cell are counted with its first island.
+        let cut = Cut { nitsche, volume: 0.125 * size * size * size * inside.total(), points: if island == 0 { leaf.points } else { 0 } };
         Ok(Integrated { stiffness: Some(stiffness), load: Some(load), cut: Some(cut) })
     };
 
@@ -1141,18 +1381,22 @@ fn solve_at(
         largest_nitsche: 0.0,
         fictitious,
         levels: [0; MAX_REFINE + 1],
+        split_cells: cuts.iter().flatten().filter(|leaf| leaf.islands() > 1).count(),
+        separated: 3 * separated,
+        holding,
+        joined: false,
     };
     let mut nitsche = vec![0.0; elements];
     let mut fractions = vec![1.0; elements];
     let mut material = vec![([0.0; 3], [1.0; 3]); elements];
-    let mut inside: Vec<Option<Moments>> = vec![None; elements];
     for block in fieldcraft_parallel::blocks(elements, block_size) {
         let first = block.start;
         let cells = fieldcraft_parallel::map(block.len(), |i| integrate(first + i));
         for (i, integrated) in cells.into_iter().enumerate() {
             let integrated = integrated?;
             let element = first + i;
-            let (_, cell, whole) = cell_of(element)?;
+            let (node, cell, whole) = cell_of(element)?;
+            let island = space.island(element);
             let nodes = space.functions(element);
             let (cell_stiffness, cell_load) =
                 (integrated.stiffness.as_ref().unwrap_or(&whole.stiffness), integrated.load.as_ref().unwrap_or(&whole.load));
@@ -1165,12 +1409,15 @@ fn solve_at(
                 }
             }
             let size = grid.step(usize::from(cell.level));
-            if let Some(count) = stats.levels.get_mut(usize::from(cell.level)) {
+            // A cell is counted with its first island.
+            if island == 0
+                && let Some(count) = stats.levels.get_mut(usize::from(cell.level))
+            {
                 *count += 1;
             }
             match integrated.cut {
                 Some(cut) => {
-                    stats.cut_cells += 1;
+                    stats.cut_cells += usize::from(island == 0);
                     stats.quadrature_points += cut.points;
                     stats.volume += cut.volume;
                     stats.smallest_fraction = stats.smallest_fraction.min(cut.volume / (size * size * size));
@@ -1179,15 +1426,13 @@ fn solve_at(
                     }
                     // A uniform box with the material's middle and spread: its half extent is
                     // √3 standard deviations.
-                    if let (Some(place), Some((mean, deviation))) = (material.get_mut(element), cut.inside.spread()) {
+                    let spread = cut_of(node).and_then(|leaf| leaf.inside.get(island)).and_then(Moments::spread);
+                    if let (Some(place), Some((mean, deviation))) = (material.get_mut(element), spread) {
                         *place = (mean, deviation.map(|sigma| 3f64.sqrt() * sigma));
                     }
                     stats.largest_nitsche = stats.largest_nitsche.max(cut.nitsche);
                     if let Some(parameter) = nitsche.get_mut(element) {
                         *parameter = cut.nitsche;
-                    }
-                    if let Some(moments) = inside.get_mut(element) {
-                        *moments = Some(cut.inside);
                     }
                 }
                 None => {
@@ -1217,10 +1462,10 @@ fn solve_at(
         let first = block.start;
         let energies = fieldcraft_parallel::map(block.len(), |i| {
             let element = first + i;
-            let Ok((_, cell, whole)) = cell_of(element) else { return 0.0 };
+            let Ok((node, cell, whole)) = cell_of(element) else { return 0.0 };
             let local = space.local(element, &u);
             let own;
-            let k = match inside.get(element).and_then(Option::as_ref) {
+            let k = match cut_of(node).and_then(|leaf| leaf.inside.get(space.island(element))) {
                 Some(moments) => {
                     own = cell::stiffness(&shapes, grid.step(usize::from(cell.level)), moments, &lame, &mut Scratch::default());
                     &own
@@ -1237,11 +1482,10 @@ fn solve_at(
             strain_energy += energy;
         }
     }
-    drop(inside);
 
     // The reactions of the supported faces.
-    let pieces_of = |element: usize| space.elements.get(element).and_then(|node| pieces.get(*node as usize)).map(Vec::as_slice).unwrap_or_default();
-    let supported: Vec<usize> = (0..elements).filter(|element| on_surface.supports(pieces_of(*element))).collect();
+    let pieces_of = |element: usize| pieces_of(space.elements.get(element).map_or(usize::MAX, |node| *node as usize), space.island(element));
+    let supported: Vec<usize> = (0..elements).filter(|element| on_surface.supports(&pieces_of(*element))).collect();
     let mut reactions: BTreeMap<u32, [f64; 3]> = BTreeMap::new();
     for block in fieldcraft_parallel::blocks(supported.len(), block_size) {
         let first = block.start;
@@ -1253,7 +1497,7 @@ fn solve_at(
             let local = space.local(element, &u);
             let parameter = nitsche.get(element).copied().unwrap_or(0.0);
             let corner = grid.fine_lo(level, cell.position());
-            cell::reaction(&shapes, corner, grid.step(level), pieces_of(element), &on_surface, &lame, &surface_rule, parameter, &local, &mut own);
+            cell::reaction(&shapes, corner, grid.step(level), &pieces_of(element), &on_surface, &lame, &surface_rule, parameter, &local, &mut own);
             own
         });
         // Element by element, in order.
@@ -1268,9 +1512,18 @@ fn solve_at(
     }
     let reactions = reactions.into_iter().map(|(face, force)| Reaction { face, force }).collect();
 
+    // The cells of several islands, for reading the solution: which island a point is in.
+    let mut split = BTreeMap::new();
+    for (node, leaf) in cuts.iter().enumerate() {
+        if let (Some(leaf), Some(owned), Ok(node)) = (leaf.as_ref().filter(|leaf| !leaf.of_piece.is_empty()), pieces.get(node), u32::try_from(node)) {
+            split.insert(node, (owned.clone(), leaf.of_piece.clone()));
+        }
+    }
+    drop(cuts);
     // The positions of the modes were for the ordering only.
     space.xyz = Vec::new();
-    Ok(Solution { grid, shapes, lame, tree, space, fractions, material, u, stats, strain_energy, reactions })
+    let near = if separated > 0 { (0..elements).map(|element| space.around(element, NEAR_LINKS).unwrap_or_default()).collect() } else { Vec::new() };
+    Ok(Solution { grid, shapes, lame, tree, space, split, near, fractions, material, u, stats, strain_energy, reactions })
 }
 
 #[cfg(test)]

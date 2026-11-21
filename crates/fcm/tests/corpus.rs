@@ -8,7 +8,9 @@
 //! displacement is finite everywhere on the surface. The change of the strain energy from degree
 //! 2 to degree 3 on the same grid is printed as a measure of how far degree 2 is from converged.
 //! Degree 3 is solved a second time with the cells divided once where the surface is curved
-//! (`Options::refine`), which must hold the same.
+//! (`Options::refine`), and a third time with the cells divided where gaps end as well
+//! (`Options::gaps`), which must hold the same. Where a cell holds separate pieces of material
+//! (`Options::separate`: the fins of the heat sink, the ribs) the line says how many cells do.
 //!
 //! The numbers are in the consistent set millimetre, newton, megapascal (and tonne).
 
@@ -32,10 +34,10 @@ struct Row {
     failed: bool,
 }
 
-fn run(surface: &BoundarySurface, clamped: u32, cell: f64, degree: usize, refine: usize) -> Result<(Solution, f64), String> {
+fn run(surface: &BoundarySurface, clamped: u32, cell: f64, degree: usize, refine: usize, gaps: usize) -> Result<(Solution, f64), String> {
     let supports = [Support { face: clamped, fixed: [true; 3], value: [0.0; 3] }];
     let loads = [Load::Gravity { acceleration: [0.0, 0.0, -GRAVITY] }];
-    let options = Options { degree, refine, offset: [0.37, 0.21, 0.43], ..Options::new(cell) };
+    let options = Options { degree, refine, gaps, offset: [0.37, 0.21, 0.43], ..Options::new(cell) };
     let started = Instant::now();
     match catch_unwind(AssertUnwindSafe(|| solve(surface, &STEEL, &supports, &loads, &options, &Limits::default()))) {
         Ok(Ok(solution)) => Ok((solution, started.elapsed().as_secs_f64())),
@@ -105,9 +107,12 @@ fn every_corpus_part_solves_under_its_own_weight() {
             );
             let mut failed = false;
             let mut energies = Vec::new();
-            for (degree, refine) in [(2, 0), (3, 0), (3, 1)] {
-                let divided = if refine > 0 { format!(" divided {refine}") } else { String::new() };
-                match run(&surface, clamped, cell, degree, refine) {
+            for (degree, refine, gaps) in [(2, 0, 0), (3, 0, 0), (3, 1, 0), (3, 1, 3)] {
+                let mut divided = if refine > 0 { format!(" divided {refine}") } else { String::new() };
+                if gaps > 0 {
+                    divided += &format!(" and {gaps} where gaps end");
+                }
+                match run(&surface, clamped, cell, degree, refine, gaps) {
                     Err(e) => {
                         line += &format!(" | p{degree}{divided}: {e}");
                         failed = true;
@@ -127,10 +132,21 @@ fn every_corpus_part_solves_under_its_own_weight() {
                         if refine == 0 {
                             energies.push(solution.strain_energy);
                         }
-                        let bad = volume_error > 1e-3 || !(reaction_error < 1e-3) || lost > 0 || !(solution.strain_energy > 0.0);
+                        // The pieces of material told apart, and whether that could not be solved.
+                        let apart = match (stats.split_cells, stats.separated, stats.joined) {
+                            (_, _, true) => ", JOINED".to_string(),
+                            (0, 0, _) => String::new(),
+                            (cells, unknowns, _) => {
+                                format!(
+                                    ", {cells} cells of several pieces ({unknowns} unknowns more, {} cells still hold a gap's sides together)",
+                                    stats.holding
+                                )
+                            }
+                        };
+                        let bad = volume_error > 1e-3 || !(reaction_error < 1e-3) || lost > 0 || !(solution.strain_energy > 0.0) || stats.joined;
                         failed |= bad;
                         line += &format!(
-                            " | p{degree}{divided}: {}+{} cells, {} unknowns, {seconds:.1} s, volume error {volume_error:.1e}, reaction error {reaction_error:.1e}, smallest fraction {:.0e}, largest displacement {largest:.2e} mm, energy {:.4e}{}{}",
+                            " | p{degree}{divided}: {}+{} cells, {} unknowns, {seconds:.1} s, volume error {volume_error:.1e}, reaction error {reaction_error:.1e}, smallest fraction {:.0e}, largest displacement {largest:.2e} mm, energy {:.4e}{apart}{}{}",
                             stats.inside_cells,
                             stats.cut_cells,
                             stats.unknowns,

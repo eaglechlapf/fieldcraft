@@ -35,16 +35,26 @@
 //!    the cell first. Points outside the part are weighted with [`Options::fictitious`]. The
 //!    points are not summed mode pair by mode pair: they are summed into the Legendre moments of
 //!    the cell's material, from which every cell matrix follows by sum factorisation.
-//! 5. **Supports**: prescribed displacement components of a face, imposed weakly by Nitsche's
+//! 5. **Islands** ([`Options::separate`], [`islands`]): a cell that holds material in separate
+//!    pieces (the two flanges at the open corner of a sheet metal part, the two sides of a slit)
+//!    carries shape functions of its own for each piece, and two cells share the functions of
+//!    the face between them only where material goes on through it. One polynomial a cell
+//!    would join the pieces: the gap would be welded shut wherever a cell reaches across it.
+//!    Where a gap ends, the cell at its root still holds the two sides together over its own
+//!    length, so the cells whose functions do that are divided ([`Options::gaps`]).
+//! 6. **Supports**: prescribed displacement components of a face, imposed weakly by Nitsche's
 //!    method on the face's own triangles, with the stabilisation parameter of each cell from that
 //!    cell's eigenvalue problem (no penalty number to choose).
-//! 6. **Loads**: pressures, tractions and forces integrated over the face's triangles, gravity
+//! 7. **Loads**: pressures, tractions and forces integrated over the face's triangles, gravity
 //!    over the part's quadrature points.
-//! 7. **Solution**: assembled into [`fieldcraft_solver`]'s sparse matrix, ordered by its nested
+//! 8. **Solution**: assembled into [`fieldcraft_solver`]'s sparse matrix, ordered by its nested
 //!    dissection and factored by its Cholesky. Displacement and stress are evaluated anywhere in
 //!    the part from the cell's polynomial.
 //!
-//! This is a first version: one body, linear elastic, isotropic, static. Its accuracy is
+//! This is a first version: one body, linear elastic, isotropic, static. On thin sheet it is
+//! stiff: cells of degree 3 a dozen sheet thicknesses across bend a plate 5 to 12 % too little
+//! (`tests/tray.rs`), which finer cells or a higher degree lower slowly, and every cell carries
+//! the full degree through the thickness, where a plate needs two. Its accuracy is
 //! bounded by the tessellation of curved faces, by the fictitious stiffness, which shows in the
 //! stress of a cell that holds very little material, and by the grid: on cells as large as a
 //! hole's radius the stress at the hole is within a few per cent only from degree 5 on
@@ -78,6 +88,7 @@ mod dense;
 pub mod gauss;
 pub mod grid;
 pub mod inside;
+pub mod islands;
 pub mod legendre;
 mod moments;
 mod refine;

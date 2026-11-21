@@ -185,3 +185,52 @@ pub fn ring(
     }
     quads.surface()
 }
+
+/// The faces of [`fork`]: the end of its root, the tips of its lower and upper prongs, and the
+/// rest.
+pub const ROOT: u32 = 0;
+pub const TIP_LOWER: u32 = 1;
+pub const TIP_UPPER: u32 = 2;
+pub const SKIN: u32 = 3;
+
+/// A fork: a root block from x = 0 to `root` and two prongs of `thickness` from there to
+/// `root + length`, the lower from y = 0 and the upper `gap` above it, all from z = 0 to `depth`.
+pub fn fork(root: f64, length: f64, thickness: f64, gap: f64, depth: f64) -> BoundarySurface {
+    let (tip, top) = (root + length, 2.0 * thickness + gap);
+    // The spans along y: the lower prong, the gap, the upper prong.
+    let spans = [(0.0, thickness), (thickness, thickness + gap), (thickness + gap, top)];
+    let mut quads = Quads::default();
+    // A quad in a plane across `axis` at `at`, over [u0, u1] × [v0, v1] of the next two axes.
+    let mut face = |axis: usize, at: f64, u: (f64, f64), v: (f64, f64), outward: f64, tag: u32| {
+        let corner = |s: f64, t: f64| {
+            let mut p = [0.0; 3];
+            p[axis] = at;
+            p[(axis + 1) % 3] = s;
+            p[(axis + 2) % 3] = t;
+            p
+        };
+        let mut normal = [0.0; 3];
+        normal[axis] = outward;
+        quads.add([corner(u.0, v.0), corner(u.1, v.0), corner(u.1, v.1), corner(u.0, v.1)], normal, tag);
+    };
+    for (index, span) in spans.into_iter().enumerate() {
+        // Across x: the root's end, the end of the gap and the tips.
+        face(0, 0.0, span, (0.0, depth), -1.0, ROOT);
+        face(0, if index == 1 { root } else { tip }, span, (0.0, depth), 1.0, [TIP_LOWER, SKIN, TIP_UPPER][index]);
+        // Across z: the root, and the prongs.
+        for (z, outward) in [(0.0, -1.0), (depth, 1.0)] {
+            face(2, z, (0.0, root), span, outward, SKIN);
+            if index != 1 {
+                face(2, z, (root, tip), span, outward, SKIN);
+            }
+        }
+    }
+    // Across y: under and over the fork, and the two faces of the gap.
+    for (y, outward) in [(0.0, -1.0), (top, 1.0)] {
+        face(1, y, (0.0, depth), (0.0, root), outward, SKIN);
+        face(1, y, (0.0, depth), (root, tip), outward, SKIN);
+    }
+    face(1, thickness, (0.0, depth), (root, tip), 1.0, SKIN);
+    face(1, thickness + gap, (0.0, depth), (root, tip), -1.0, SKIN);
+    quads.surface()
+}

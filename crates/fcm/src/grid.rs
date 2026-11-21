@@ -438,6 +438,21 @@ pub struct QuadPoint {
     pub inside: bool,
 }
 
+/// A run of quadrature points of a cut cell that lie on one side of the surface: the Gauss
+/// points of one segment of a line through the cell, or of a box the surface does not reach.
+#[derive(Debug, Clone, Copy)]
+pub struct Span<'a> {
+    /// Whether the run lies inside the part.
+    pub inside: bool,
+    /// The surface triangles the segment ends on, at its lower and its upper end; [`NO_TRIANGLE`]
+    /// where it ends on the box, and for a box the surface does not reach.
+    pub ends: [u32; 2],
+    pub points: &'a [QuadPoint],
+}
+
+/// No triangle ([`Span::ends`]).
+pub const NO_TRIANGLE: u32 = u32::MAX;
+
 /// The surface as the quadrature of cut cells reads it, triangle by triangle.
 #[derive(Debug, Clone, Copy)]
 pub struct Triangles<'a> {
@@ -495,6 +510,24 @@ pub fn visit_cut_quadrature(
     max_points: usize,
     mut visit: impl FnMut(QuadPoint),
 ) -> Result<usize> {
+    visit_spans(lo, h, touching, surface, solid, rules, depth, max_points, |span| span.points.iter().for_each(|point| visit(*point)))
+}
+
+/// [`visit_cut_quadrature`], handing the points over run by run ([`Span`]): each run lies on one
+/// side of the surface, and a run inside the part that ends on the surface names the triangles
+/// it ends on, which bound the piece of material it lies in.
+#[allow(clippy::too_many_arguments)]
+pub fn visit_spans(
+    lo: [f64; 3],
+    h: f64,
+    touching: &[u32],
+    surface: &Triangles,
+    solid: &Solid,
+    rules: [&[(f64, f64)]; 3],
+    depth: usize,
+    max_points: usize,
+    mut visit: impl FnMut(Span),
+) -> Result<usize> {
     let depth = depth.min(MAX_DEPTH);
     let triangles = surface.corners;
     let physical = |xi: [f64; 3]| [lo[0] + 0.5 * (xi[0] + 1.0) * h, lo[1] + 0.5 * (xi[1] + 1.0) * h, lo[2] + 0.5 * (xi[2] + 1.0) * h];
@@ -504,6 +537,7 @@ pub fn visit_cut_quadrature(
     // Boxes still to do: the lowest corner in natural coordinates, the level and the triangles
     // that reach the parent. Children are pushed last to first, so they are done in order.
     let mut stack: Vec<([f64; 3], usize, Vec<u32>)> = vec![([-1.0; 3], 0, touching.to_vec())];
+    let mut run: Vec<QuadPoint> = Vec::with_capacity(per_leaf);
     while let Some((corner, level, candidates)) = stack.pop() {
         let size = 2.0 / (1u64 << level) as f64;
         let half = 0.5 * size;
@@ -526,14 +560,16 @@ pub fn visit_cut_quadrature(
             }
             count += per_leaf;
             let inside = solid.contains(centre)?;
+            run.clear();
             for (gz, wz) in rule {
                 for (gy, wy) in rule {
                     for (gx, wx) in rule {
                         let xi = [corner[0] + half * (gx + 1.0), corner[1] + half * (gy + 1.0), corner[2] + half * (gz + 1.0)];
-                        visit(QuadPoint { xi, weight: wx * wy * wz * half * half * half, inside });
+                        run.push(QuadPoint { xi, weight: wx * wy * wz * half * half * half, inside });
                     }
                 }
             }
+            visit(Span { inside, ends: [NO_TRIANGLE; 2], points: &run });
             continue;
         }
         // The lines run along the axis the leaf's triangles face most (by area).
@@ -610,7 +646,7 @@ pub fn visit_cut_quadrature(
             }
         }
         thin(&mut third, tiny);
-        let (mut second, mut first): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
+        let (mut second, mut first): (Vec<f64>, Vec<(f64, u32)>) = (Vec::new(), Vec::new());
         for span_c in third.windows(2) {
             for (gc, wc) in third_rule {
                 let at_c = 0.5 * (span_c[0] + span_c[1]) + 0.5 * (span_c[1] - span_c[0]) * gc;
@@ -632,16 +668,16 @@ pub fn visit_cut_quadrature(
                         let weight_b = wb * (span_b[1] - span_b[0]) / h;
                         // Along the line, split where it pierces a triangle.
                         first.clear();
-                        first.extend([leaf_lo[axis], leaf_hi[axis]]);
+                        first.extend([(leaf_lo[axis], NO_TRIANGLE), (leaf_hi[axis], NO_TRIANGLE)]);
                         for t in &cut {
                             if let Some(at) = triangles.get(*t as usize).and_then(|triangle| pierce(triangle, axis, at_b, at_c))
                                 && at > leaf_lo[axis]
                                 && at < leaf_hi[axis]
                             {
-                                first.push(at);
+                                first.push((at, *t));
                             }
                         }
-                        tidy(&mut first, tiny);
+                        tidy_pierced(&mut first, tiny);
                         if count + first.len() * rule.len() > max_points {
                             return Err(full());
                         }
@@ -649,14 +685,17 @@ pub fn visit_cut_quadrature(
                         x[b] = at_b;
                         x[c] = at_c;
                         for span in first.windows(2) {
-                            x[axis] = 0.5 * (span[0] + span[1]);
+                            let ((from, lower), (to, upper)) = (span[0], span[1]);
+                            x[axis] = 0.5 * (from + to);
                             let inside = solid.contains(x)?;
+                            run.clear();
                             for (g, w) in rule {
                                 let mut at = x;
-                                at[axis] += 0.5 * (span[1] - span[0]) * g;
+                                at[axis] += 0.5 * (to - from) * g;
                                 let xi = [2.0 * (at[0] - lo[0]) / h - 1.0, 2.0 * (at[1] - lo[1]) / h - 1.0, 2.0 * (at[2] - lo[2]) / h - 1.0];
-                                visit(QuadPoint { xi, weight: weight_b * weight_c * w * (span[1] - span[0]) / h, inside });
+                                run.push(QuadPoint { xi, weight: weight_b * weight_c * w * (to - from) / h, inside });
                             }
+                            visit(Span { inside, ends: [lower, upper], points: &run });
                             count += rule.len();
                         }
                     }
@@ -728,6 +767,26 @@ fn tidy(cuts: &mut Vec<f64>, tiny: f64) {
     }
     if upper > lower {
         kept.push(upper);
+    }
+    *cuts = kept;
+}
+
+/// [`tidy`] for the points where a line pierces triangles, each with its triangle
+/// ([`NO_TRIANGLE`] for the two ends of the line in the box): the same points are kept, each
+/// with the triangle of the first that fell on it.
+fn tidy_pierced(cuts: &mut Vec<(f64, u32)>, tiny: f64) {
+    cuts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let (Some(&(lower, _)), Some(&(upper, _))) = (cuts.first(), cuts.last()) else { return };
+    let mut kept = vec![(lower, NO_TRIANGLE)];
+    let mut last = lower;
+    for &(at, triangle) in cuts.iter() {
+        if at - last > tiny && upper - at > tiny {
+            kept.push((at, triangle));
+            last = at;
+        }
+    }
+    if upper > lower {
+        kept.push((upper, NO_TRIANGLE));
     }
     *cuts = kept;
 }
