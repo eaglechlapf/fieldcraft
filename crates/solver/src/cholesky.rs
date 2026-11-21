@@ -25,9 +25,11 @@
 //! operations fixed by the matrix and the constants [`TILE`] and [`PANEL`]: sums over a
 //! supernode's columns run in column order from zero, and updates are subtracted in supernode
 //! order. Disjoint subtrees of the supernodal tree are factored concurrently (a supernode reads
-//! only its descendants), and the dense work of a large supernode is split into row tiles;
-//! neither changes any entry's sequence of operations, so the factor is the same bit for bit on
-//! any number of threads and on every platform (multiplications and additions are never fused).
+//! only its descendants), the dense work of a large supernode is split into row tiles, and the
+//! products of the updates a supernode receives are computed several at a time and subtracted
+//! in supernode order; none of this changes any entry's sequence of operations, so the factor
+//! is the same bit for bit on any number of threads and on every platform (multiplications and
+//! additions are never fused).
 //!
 //! A pivot at or below `PIVOT_TOLERANCE` times the matrix's own diagonal entry means the matrix
 //! is singular to working precision (an unconstrained rigid-body motion, a disconnected part, a
@@ -53,6 +55,10 @@ const MR: usize = 8;
 
 /// Columns of a micro-tile of [`products`]: MR × NR sums stay in registers.
 const NR: usize = 4;
+
+/// Entries of the products of a supernode's updates that are computed and held at once
+/// ([`Context::assemble`]): 32 MB.
+const BATCH: usize = 1 << 22;
 
 /// Dense work (multiply–adds) from which a kernel's tiles run in parallel.
 const PARALLEL_WORK: usize = 1 << 21;
@@ -798,6 +804,19 @@ impl<T: Scalar> Context<'_, T> {
     /// descendant K that reaches it (Y = L, or L D), in supernode order; the descendants are
     /// `done[k - base]`.
     pub(crate) fn assemble<S: Supernode<T>>(&self, j: usize, done: &[S], base: usize, own: &mut [T]) -> std::result::Result<(), FactorError> {
+        self.assemble_in_batches(j, done, base, own, BATCH)
+    }
+
+    /// [`Context::assemble`] with the products of at most `batch` entries held at once (always
+    /// one update's): the result does not depend on it.
+    fn assemble_in_batches<S: Supernode<T>>(
+        &self,
+        j: usize,
+        done: &[S],
+        base: usize,
+        own: &mut [T],
+        batch: usize,
+    ) -> std::result::Result<(), FactorError> {
         let rows = self.s.rows(j);
         let cols = self.s.cols(j);
         let (m, w, f) = (rows.len(), cols.len(), cols.start);
@@ -819,16 +838,18 @@ impl<T: Scalar> Context<'_, T> {
                 }
             }
         }
-        // The descendants' updates, in supernode order.
-        let mut relative = Vec::new();
-        for u in self.updates.get(j).map(Vec::as_slice).unwrap_or_default() {
+        // The descendants' updates, subtracted in supernode order. Their products are computed
+        // several at a time, as many as hold `batch` entries together: each is a sum over one
+        // descendant's own columns, the same whichever thread computes it and whenever.
+        let list = self.updates.get(j).map(Vec::as_slice).unwrap_or_default();
+        // An update's product by tiles, where its rows are in J's structure, and its size.
+        let product = |u: &Update| -> std::result::Result<(Vec<Vec<T>>, Vec<usize>, usize, usize), FactorError> {
             let done_k = done.get(u.k.wrapping_sub(base)).ok_or_else(|| internal("an update from outside the subtree"))?;
-            let lk = done_k.values();
             let (kr, kw) = (self.s.rows(u.k), self.s.cols(u.k).len());
             let below = kr.get(u.p1..).unwrap_or_default();
             let (mu, wu) = (below.len(), u.p2 - u.p1);
             // Positions of K's rows in J's structure (both sorted).
-            relative.clear();
+            let mut relative = Vec::with_capacity(mu);
             let mut at = 0;
             for r in below {
                 while rows.get(at).is_some_and(|x| x < r) {
@@ -839,8 +860,31 @@ impl<T: Scalar> Context<'_, T> {
                 }
                 relative.push(at);
             }
-            let tiles = products(&Panel { m: kr.len(), data: lk }, 0..kw, u.p1, mu, wu, done_k.pivots());
-            subtract(own, m, &tiles, mu, wu, |i| relative.get(i).copied().unwrap_or(0));
+            let tiles = products(&Panel { m: kr.len(), data: done_k.values() }, 0..kw, u.p1, mu, wu, done_k.pivots());
+            Ok((tiles, relative, mu, wu))
+        };
+        let size = |u: &Update| self.s.rows(u.k).len().saturating_sub(u.p1).saturating_mul(u.p2 - u.p1);
+        let mut from = 0;
+        while from < list.len() {
+            let (mut to, mut held) = (from, 0usize);
+            while let Some(u) = list.get(to).filter(|u| to == from || held.saturating_add(size(u)) <= batch) {
+                held = held.saturating_add(size(u));
+                to += 1;
+            }
+            let several = list.get(from..to).unwrap_or_default();
+            // Little work is done here, by the thread that has it.
+            let work = several.iter().fold(0usize, |sum, u| sum.saturating_add(size(u).saturating_mul(self.s.cols(u.k).len())));
+            let found: Vec<std::result::Result<(Vec<Vec<T>>, Vec<usize>, usize, usize), FactorError>> = if several.len() > 1 && work >= PARALLEL_WORK
+            {
+                parallel::map(several.len(), |i| several.get(i).map_or_else(|| Err(internal("an update is missing")), product))
+            } else {
+                several.iter().map(&product).collect()
+            };
+            for result in found {
+                let (tiles, relative, mu, wu) = result?;
+                subtract(own, m, &tiles, mu, wu, |i| relative.get(i).copied().unwrap_or(0));
+            }
+            from = to;
         }
         Ok(())
     }
@@ -851,7 +895,13 @@ impl Context<'_, f64> {
     /// Factor supernode `j` into `own`; its descendants' values are `done[k - base]`. Fails with
     /// the first column (postorder) whose pivot is not positive.
     fn supernode(&self, j: usize, done: &[Vec<f64>], base: usize, own: &mut [f64]) -> std::result::Result<(), FactorError> {
-        self.assemble(j, done, base, own)?;
+        self.supernode_in_batches(j, done, base, own, BATCH)
+    }
+
+    /// [`Context::supernode`] with its updates in batches of `batch` entries
+    /// ([`Context::assemble_in_batches`]).
+    fn supernode_in_batches(&self, j: usize, done: &[Vec<f64>], base: usize, own: &mut [f64], batch: usize) -> std::result::Result<(), FactorError> {
+        self.assemble_in_batches(j, done, base, own, batch)?;
         let rows = self.s.rows(j);
         let cols = self.s.cols(j);
         let (m, w, f) = (rows.len(), cols.len(), cols.start);
@@ -1530,6 +1580,19 @@ mod tests {
         for threads in [2, 7] {
             let other = parallel::with_threads(threads, || Factor::new(&upper, usize::MAX)).unwrap();
             assert!(one.values.iter().flatten().zip(other.values.iter().flatten()).all(|(a, b)| a.to_bits() == b.to_bits()), "{threads} threads");
+        }
+        // The products of a supernode's updates one at a time, a few at a time or all at once:
+        // they are subtracted in the same order, so the factor is the same.
+        let symbolic = Symbolic::new(&upper, usize::MAX).unwrap();
+        assert!(symbolic.updates.iter().any(|list| list.len() > 8), "a supernode with many updates");
+        let lower = symbolic.numeric(&upper).unwrap();
+        for batch in [0, 4096, usize::MAX] {
+            let mut values = symbolic.allocate().unwrap();
+            parallel::with_threads(5, || {
+                symbolic.factor(&lower, &mut values, |context, j, done, base, own| context.supernode_in_batches(j, done, base, own, batch))
+            })
+            .unwrap();
+            assert!(one.values.iter().flatten().zip(values.iter().flatten()).all(|(a, b)| a.to_bits() == b.to_bits()), "batches of {batch}");
         }
     }
 
