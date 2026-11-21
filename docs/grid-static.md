@@ -183,8 +183,8 @@ What the rounds are for, and what they are not for:
 - **They find what the surface does not show.** A sheet metal part has a bend at every wall,
   and the load goes through one of them: `refine` divides the cells of all of them once, the
   rounds divide the cells of the one that carries the load again and again. On the tray of
-  [Narrow gaps](#narrow-gaps-sheet-metal-corners-slits-fins), hung by one wall, the sag is 12 %
-  low without a round, 7 % low after one and 4 % low after two (in the tensor product; the
+  [Narrow gaps](#narrow-gaps-sheet-metal-corners-slits-fins), hung by one wall, the sag is 9 %
+  low without a round, 4 % low after one and 0.6 % low after two (in the tensor product; the
   trunk space, below, gets there in half the time).
 - **They do not replace `refine` at a hole or a fillet.** The indicator follows the strain
   energy, and a stress peak holds little of it. On a plate with a hole of the radius of one
@@ -214,7 +214,7 @@ cells make up for what it lacks, and it is the cheaper way to the same accuracy:
 |---|---|---|
 | Hole of one cell's radius, cells divided twice there, degree 3: stress at the hole over six grid positions | ± 0.7 %, 78 000 unknowns | ± 1.1 %, 24 000 unknowns |
 | the same, trunk space at degree 4 | | ± 0.5 %, 42 000 unknowns |
-| Tray hung by one wall, two rounds: sag | −3.8 %, 322 000 unknowns, 20 s | −4.3 %, 145 000 unknowns, 10 s |
+| Tray hung by one wall, two rounds: sag | −0.6 %, 322 000 unknowns, 20 s | −1.1 %, 145 000 unknowns, 10 s |
 | Tray bolted, two rounds: sag | −0.2 % after one round (the second does not fit), 15 s | 0.0 %, 156 000 unknowns, 11 s |
 | Sample bracket as the form opens, degree 3: peak on the fillet | 212.5 MPa (−0.2 %), 145 000 unknowns, 4.3 s | 210.5 MPa (−1.2 %), 40 000 unknowns, 1.4 s |
 | the same, trunk space at degree 4 | | 212.4 MPa (−0.3 %), 73 000 unknowns, 2.7 s |
@@ -367,20 +367,22 @@ the other nothing.
 walls 50 mm high bent up from its floor (inside bend radius 2 mm), holes in the floor and the
 walls, and four open corners, where the ends of two walls are 2 mm apart. The form as it opens
 gives cells of 25 mm, a dozen sheet thicknesses. The reference is FieldCraft's own mesh solve of
-the same model on quadratic tetrahedra of 4 mm (920 000 unknowns; 44 s to mesh and 26 s to
+the same model on quadratic tetrahedra of 4 mm (920 000 unknowns; 44 s to mesh and 20 s to
 solve, and only with `max_factor_entries` raised to 1.5 billion: with the default the mesh
-solve is refused).
+solve is refused). Both are read at the same point, the mesh's node on the passage's edge at
+(30, 0, 2): hung by one wall the sag changes by 0.02 mm for every millimetre there, and the
+mesh solve gives 2.104 and 2.106 mm on tetrahedra of 3 and 2.5 mm.
 
 | | Bolted at four holes, 1 kPa on the floor: sag at the passage | Hung by one wall, 100 N on the opposite wall: sag at the passage |
 |---|---|---|
-| Mesh solve (reference) | 0.1532 mm | 2.175 mm |
-| Grid, gaps joined | 0.1508 mm (−1.6 %), 4 s | 0.027 mm (−98.8 %), 4 s |
-| Grid, gaps open, no cells divided where they end (the solver's option, not the form's) | 0.1518 mm (−0.9 %) | 1.054 mm (−52 %) |
-| Grid, gaps open, tensor product, no round that follows the solution (`"basis": "tensor", "adapt": 0`) | 0.1520 mm (−0.8 %), 5 s | 1.914 mm (−12 %), 5 s |
-| the same on cells of 12.5 mm | | 2.042 mm (−6 %), 10 s |
-| Grid, gaps open, tensor product, rounds that follow the solution (`"basis": "tensor"`) | 0.1530 mm (−0.2 %), 15 s | 2.093 mm (−3.8 %), 20 s |
-| Grid, gaps open, trunk space, no round (`"adapt": 0`) | 0.1497 mm (−2.3 %), 2.5 s | 1.834 mm (−15.7 %), 2.4 s |
-| **Grid as the form opens** (gaps open, trunk space, rounds that follow the solution) | **0.1532 mm (0.0 %), 11 s** | **2.082 mm (−4.3 %), 10 s** |
+| Mesh solve (reference) | 0.1532 mm | 2.105 mm |
+| Grid, gaps joined | 0.1508 mm (−1.6 %), 4 s | 0.027 mm (−98.7 %), 4 s |
+| Grid, gaps open, no cells divided where they end (the solver's option, not the form's) | 0.1518 mm (−0.9 %) | 1.054 mm (−50 %) |
+| Grid, gaps open, tensor product, no round that follows the solution (`"basis": "tensor", "adapt": 0`) | 0.1520 mm (−0.8 %), 5 s | 1.914 mm (−9.1 %), 5 s |
+| the same on cells of 12.5 mm | | 2.042 mm (−3.0 %), 10 s |
+| Grid, gaps open, tensor product, rounds that follow the solution (`"basis": "tensor"`) | 0.1530 mm (−0.2 %), 15 s | 2.093 mm (−0.6 %), 20 s |
+| Grid, gaps open, trunk space, no round (`"adapt": 0`) | 0.1497 mm (−2.3 %), 2.5 s | 1.834 mm (−12.9 %), 2.4 s |
+| **Grid as the form opens** (gaps open, trunk space, rounds that follow the solution) | **0.1532 mm (0.0 %), 11 s** | **2.082 mm (−1.1 %), 10 s** |
 
 Bolted, the corners carry little, and joined or open the floor sags the same to a per cent.
 Hung by one wall, everything goes through the bend along that wall and the side walls end free
@@ -394,11 +396,11 @@ concentrates. A section through that bend alone (the wall, the bend and a strip 
 measured once, not kept as a test) is 8 % too stiff on cells of 25 mm, 6 % with the cells at
 the bend divided once, 2 % divided twice and 0.7 % divided three times. Dividing the cells of
 every bend and hole that far is more than the solver holds (cells of 12.5 mm divided once are
-6 % low with 400 000 unknowns), which is what the rounds that follow the solution are for:
+3 % low with 400 000 unknowns), which is what the rounds that follow the solution are for:
 they divide the cells of the bend that carries the load. In the trunk space, which a thin
-body takes, the tray hung by one wall is 4.3 % low after two of them with 145 000 unknowns,
-and 2.8 % low after three (`"adapt": 3`, 219 000 unknowns, 21 s); bolted, the sag is within
-0.1 % after two. The von Mises stress at seven points of the floor (measured once, not kept as
+body takes, the tray hung by one wall is 1.1 % low after two of them with 145 000 unknowns,
+and 0.5 % above the mesh solve after three (`"adapt": 3`, 219 000 unknowns, 21 s), which is
+about as well as the mesh solve itself is known; bolted, the sag is within 0.1 % after two. The von Mises stress at seven points of the floor (measured once, not kept as
 a test) is within 1 % of the mesh solve's at six of them and 4 % low at one, where it is up
 to 14 % low without the rounds.
 

@@ -141,8 +141,8 @@ pub enum Basis {
     /// `where_the_refined_grid_sits`) the stress is within ± 1.1 % at degree 3 with a third of
     /// the tensor product's unknowns, which has ± 0.7 %, and within ± 0.5 % at degree 4 with
     /// a little over half of them. On a sheet metal tray hung by one wall (`tests/tray.rs`),
-    /// with two rounds of [`Options::adapt`], the sag is 4.4 % low with 143 000 unknowns where
-    /// the tensor product is 3.9 % low with 322 000 and takes twice as long.
+    /// with two rounds of [`Options::adapt`], the sag is 1.2 % low with 143 000 unknowns where
+    /// the tensor product is 0.8 % low with 322 000 and takes twice as long.
     Trunk,
 }
 
@@ -288,9 +288,8 @@ impl Options {
     /// share below one converges (Dörfler); a small one divides few cells a round and needs
     /// many rounds, each a whole solve, and a large one divides cells that did not need it.
     /// Measured on the sheet metal tray of `tests/tray.rs`, hung by one wall (the sag against
-    /// 2.175 mm, from the grid's own cells): two rounds at 0.5 leave it about 14 % low, at 0.8
-    /// 12 %, at 0.9 6 % with 163 000 unknowns in 14 s, at 0.95 5 % with a quarter more
-    /// unknowns.
+    /// 2.105 mm, from the grid's own cells): two rounds at 0.5 leave it about 11 % low, at 0.8
+    /// 9 %, at 0.9 3 % with 163 000 unknowns, at 0.95 2 % with a quarter more unknowns.
     pub const SHARE: f64 = 0.9;
     /// The distance between two rounds' solutions below which a caller may take the result as
     /// settled ([`Options::settle`]): 5 % in the energy norm, the permissible error of the

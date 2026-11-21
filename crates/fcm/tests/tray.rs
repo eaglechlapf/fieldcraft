@@ -15,10 +15,15 @@
 //!
 //! The reference is FieldCraft's own solver on a body-fitted mesh of the same part: quadratic
 //! tetrahedra of 4 mm (157 000 elements, 920 000 unknowns), on which the floor's edge at the
-//! passage sags 0.1532 mm bolted (0.1533 mm on tetrahedra of 2.5 mm) and 2.175 mm hung by the
-//! wall. That is a cross-check between two solvers of ours, not a closed form: the tolerances
-//! say how far the grid is from it, and the hung tray is a hard case for both (a plate of 2 mm
-//! bent over 300 mm, with stress concentrated where the bend meets the corner reliefs).
+//! passage, at the mesh's node at (30, 0, 2), sags 0.1532 mm bolted (0.1533 mm on tetrahedra of
+//! 2.5 mm) and 2.105 mm hung by the wall (2.104 mm on tetrahedra of 3 mm, 2.106 mm on 2.5 mm).
+//! The sag of the hung tray changes by 0.02 mm for every millimetre along y there, so the
+//! point matters: the node 2.9 mm from it along the passage's edge, at (29.86, −2.86, 2), sags
+//! 2.175 mm, which an earlier version of this test took for the reference and so read every
+//! grid as 3.3 % lower than it is. That is a cross-check between two solvers of ours, not a
+//! closed form: the tolerances say how far the grid is from it, and the hung tray is a hard
+//! case for both (a plate of 2 mm bent over 300 mm, with stress concentrated where the bend
+//! meets the corner reliefs).
 //!
 //! What is left of the error once the corners are open is the bend along the fixed wall, which
 //! cells of 12.5 mm do not resolve. A section through it alone (the wall, the bend and a strip
@@ -64,7 +69,7 @@ const VOLUME: f64 = 361_623.99;
 /// The sag of the floor's edge at the passage, at (30, 0, 2), on the body-fitted mesh (the
 /// module's reference): bolted and hung by the back wall, mm.
 const BOLTED: f64 = 0.1532;
-const HUNG: f64 = 2.175;
+const HUNG: f64 = 2.105;
 /// A twentieth of the tray's diagonal: the cell an application takes when none is given.
 const CELL: f64 = 25.12468905280223;
 
@@ -177,26 +182,26 @@ fn a_sheet_metal_tray_with_open_corners() {
     // cells of degree 3.
     let (divided, account) = sag(&tray, true, &grid(true, 4));
     println!("hung, cells divided where the gaps end: {divided:.4} mm of {HUNG} ({account})");
-    assert!((divided / HUNG - 1.0).abs() < 0.15, "{divided}");
+    assert!((divided / HUNG - 1.0).abs() < 0.12, "{divided}");
 
     // And with the cells divided where the solution is least resolved, which is the bend along
     // the wall that holds the tray: two rounds, neither of which settles it within 5 %.
     let rounds = Options { adapt: 2, settle: Options::SETTLED, ..grid(true, 4) };
     let (adapted, account) = sag(&tray, true, &rounds);
     println!("hung, two rounds that follow the solution: {adapted:.4} mm of {HUNG} ({account})");
-    assert!((adapted / HUNG - 1.0).abs() < 0.05, "{adapted}");
+    assert!((adapted / HUNG - 1.0).abs() < 0.02, "{adapted}");
     // From the grid's own cells, with none divided for the curvature of a bend or a hole, the
     // same two rounds do better than one level at every bend and hole, with fewer unknowns.
     let (followed, account) = sag(&tray, true, &Options { refine: 0, ..rounds });
     println!("hung, two rounds from the grid's own cells: {followed:.4} mm of {HUNG} ({account})");
-    assert!((followed / HUNG - 1.0).abs() < 0.08 && (followed / HUNG - 1.0).abs() < (divided / HUNG - 1.0).abs(), "{followed}");
+    assert!((followed / HUNG - 1.0).abs() < 0.05 && (followed / HUNG - 1.0).abs() < (divided / HUNG - 1.0).abs(), "{followed}");
 
     // The trunk space, half the unknowns a cell: the same two rounds leave the tray as close
     // with fewer than half the unknowns.
     let trunk = Options { basis: Basis::Trunk, ..rounds };
     let (reduced, account) = sag(&tray, true, &trunk);
     println!("hung, two rounds in the trunk space: {reduced:.4} mm of {HUNG} ({account})");
-    assert!((reduced / HUNG - 1.0).abs() < 0.055, "{reduced}");
+    assert!((reduced / HUNG - 1.0).abs() < 0.025, "{reduced}");
 
     // Bolted. The corners carry little.
     for (separate, gaps, tolerance) in [(false, 0, 0.02), (true, 4, 0.012)] {

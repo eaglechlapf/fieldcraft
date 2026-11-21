@@ -51,11 +51,11 @@ const DEFAULT_REFINE: u64 = 1;
 /// The rounds of refinement that follow the solution (`fieldcraft_fcm::Options::adapt`) when
 /// none are given and the body is thin for its grid ([`THIN`]); none otherwise. `refine` sees a
 /// fillet or a hole and not that a bend of a sheet carries the load. On the sheet metal tray of
-/// `crates/fcm/tests/tray.rs`, hung by one wall, the deflection is 12 % low without a round in
-/// 7 s, 7 % low after one in 15 s and 4 % low after two in 30 s; on the sample bracket, which is
+/// `crates/fcm/tests/tray.rs`, hung by one wall, the deflection is 9 % low without a round in
+/// 5 s, 4 % low after one in 12 s and 0.6 % low after two in 20 s; on the sample bracket, which is
 /// not thin, a round changes the strain energy by 0.03 % and the peak by less than 0.5 %
 /// (docs/grid-static.md). Those figures are the tensor product's; a thin body takes the trunk
-/// space (`"basis": "auto"`), in which the same two rounds leave the tray 4.4 % low with fewer
+/// space (`"basis": "auto"`), in which the same two rounds leave the tray 1.1 % low with fewer
 /// than half the unknowns, in half the time.
 const THIN_ROUNDS: usize = 2;
 /// The levels of refinement where a gap ends (`fieldcraft_fcm::Options::gaps`), with the gaps
@@ -102,7 +102,7 @@ const OFFSET: [f64; 3] = [0.37, 0.21, 0.43];
 /// A body is thin for its grid when a cell is more than this many of its mean thicknesses
 /// across (twice its volume over its surface's area): the reply then says what to expect. On
 /// the sheet metal tray of `crates/fcm/tests/tray.rs`, 2 mm thick on cells of 25 mm, the
-/// deflection is 1 % low where the floor carries the load and 12 % low where a bend does.
+/// deflection is 1 % low where the floor carries the load and 9 % low where a bend does.
 const THIN: f64 = 4.0;
 /// Names shown of a list in a message.
 const NAMED: usize = 8;

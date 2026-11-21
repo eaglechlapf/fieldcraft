@@ -66,7 +66,7 @@
 //!    are evaluated anywhere in the part from the cell's polynomial.
 //!
 //! This is a first version: one body, linear elastic, isotropic, static. On thin sheet it is
-//! stiff: cells of degree 3 a dozen sheet thicknesses across bend a plate 5 to 12 % too little
+//! stiff: cells of degree 3 a dozen sheet thicknesses across bend a plate 3 to 9 % too little
 //! (`tests/tray.rs`), which finer cells or a higher degree lower slowly, and every cell carries
 //! the full degree through the thickness, where a plate needs two. Its accuracy is
 //! bounded by the tessellation of curved faces, by the fictitious stiffness, which shows in the
