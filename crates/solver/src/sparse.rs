@@ -211,12 +211,38 @@ pub fn add_block<T: Scalar>(k: &mut Csr<T>, layout: &DofLayout, nodes: &[usize],
     if data.len() != width * width {
         return Err(Error::Internal("element matrix size".into()));
     }
-    for (i, &a) in nodes.iter().enumerate() {
-        for (j, &b) in nodes.iter().enumerate() {
-            let block = Block::new(k, layout, a, b, kinds)?;
-            for r in 0..per {
-                for c in 0..per {
-                    add_at(k, block.rows[r] + block.cols[c], data.get((per * i + r) * width + per * j + c).copied().unwrap_or(T::ZERO));
+    // Each node once: its first unknown and that row's pattern, where the rows of its `kinds`
+    // start, and where they sit among the node's unknowns.
+    struct Place {
+        first: usize,
+        pattern: (usize, usize),
+        rows: [usize; MAX_KINDS],
+        cols: [usize; MAX_KINDS],
+    }
+    let missing = |kind| Error::Internal(format!("an element degree of freedom ({kind:?}) its node does not have"));
+    let mut places = Vec::with_capacity(nodes.len());
+    for &a in nodes {
+        let first = layout.range(a).start;
+        let pattern = (k.ptr.get(first).copied().unwrap_or(0), k.ptr.get(first + 1).copied().unwrap_or(0));
+        let mut place = Place { first, pattern, rows: [0; MAX_KINDS], cols: [0; MAX_KINDS] };
+        for ((row, col), kind) in place.rows.iter_mut().zip(&mut place.cols).zip(kinds.iter()) {
+            let r = layout.dof(a, kind).ok_or_else(|| missing(kind))?;
+            *row = k.ptr.get(r).copied().unwrap_or(0);
+            *col = layout.kinds(a).position(kind).ok_or_else(|| missing(kind))?;
+        }
+        places.push(place);
+    }
+    let (idx, val) = (&k.idx, &mut k.val);
+    for (i, a) in places.iter().enumerate() {
+        let pattern = idx.get(a.pattern.0..a.pattern.1).ok_or_else(|| Error::Internal("pattern".into()))?;
+        for (j, b) in places.iter().enumerate() {
+            // Where b's block starts in each row of a: the rows of a node share one pattern.
+            let at = pattern.binary_search(&b.first).map_err(|_| Error::Internal("entry outside the pattern".into()))?;
+            for (r, row) in a.rows.iter().take(per).enumerate() {
+                for (c, col) in b.cols.iter().take(per).enumerate() {
+                    if let (Some(x), Some(v)) = (val.get_mut(row + at + col), data.get((per * i + r) * width + per * j + c)) {
+                        *x += *v;
+                    }
                 }
             }
         }
