@@ -7,6 +7,8 @@
 //! carries the weight (the reaction is density × gravity × volume, straight up), and the
 //! displacement is finite everywhere on the surface. The change of the strain energy from degree
 //! 2 to degree 3 on the same grid is printed as a measure of how far degree 2 is from converged.
+//! Degree 3 is solved a second time with the cells divided once where the surface is curved
+//! (`Options::refine`), which must hold the same.
 //!
 //! The numbers are in the consistent set millimetre, newton, megapascal (and tonne).
 
@@ -30,10 +32,10 @@ struct Row {
     failed: bool,
 }
 
-fn run(surface: &BoundarySurface, clamped: u32, cell: f64, degree: usize) -> Result<(Solution, f64), String> {
+fn run(surface: &BoundarySurface, clamped: u32, cell: f64, degree: usize, refine: usize) -> Result<(Solution, f64), String> {
     let supports = [Support { face: clamped, fixed: [true; 3], value: [0.0; 3] }];
     let loads = [Load::Gravity { acceleration: [0.0, 0.0, -GRAVITY] }];
-    let options = Options { degree, offset: [0.37, 0.21, 0.43], ..Options::new(cell) };
+    let options = Options { degree, refine, offset: [0.37, 0.21, 0.43], ..Options::new(cell) };
     let started = Instant::now();
     match catch_unwind(AssertUnwindSafe(|| solve(surface, &STEEL, &supports, &loads, &options, &Limits::default()))) {
         Ok(Ok(solution)) => Ok((solution, started.elapsed().as_secs_f64())),
@@ -103,10 +105,11 @@ fn every_corpus_part_solves_under_its_own_weight() {
             );
             let mut failed = false;
             let mut energies = Vec::new();
-            for degree in [2, 3] {
-                match run(&surface, clamped, cell, degree) {
+            for (degree, refine) in [(2, 0), (3, 0), (3, 1)] {
+                let divided = if refine > 0 { format!(" divided {refine}") } else { String::new() };
+                match run(&surface, clamped, cell, degree, refine) {
                     Err(e) => {
-                        line += &format!(" | p{degree}: {e}");
+                        line += &format!(" | p{degree}{divided}: {e}");
                         failed = true;
                     }
                     Ok((solution, seconds)) => {
@@ -121,11 +124,13 @@ fn every_corpus_part_solves_under_its_own_weight() {
                                 _ => lost += 1,
                             }
                         }
-                        energies.push(solution.strain_energy);
+                        if refine == 0 {
+                            energies.push(solution.strain_energy);
+                        }
                         let bad = volume_error > 1e-3 || !(reaction_error < 1e-3) || lost > 0 || !(solution.strain_energy > 0.0);
                         failed |= bad;
                         line += &format!(
-                            " | p{degree}: {}+{} cells, {} unknowns, {seconds:.1} s, volume error {volume_error:.1e}, reaction error {reaction_error:.1e}, smallest fraction {:.0e}, largest displacement {largest:.2e} mm, energy {:.4e}{}{}",
+                            " | p{degree}{divided}: {}+{} cells, {} unknowns, {seconds:.1} s, volume error {volume_error:.1e}, reaction error {reaction_error:.1e}, smallest fraction {:.0e}, largest displacement {largest:.2e} mm, energy {:.4e}{}{}",
                             stats.inside_cells,
                             stats.cut_cells,
                             stats.unknowns,

@@ -41,7 +41,7 @@ const GRAIN: usize = 4096;
 const NEAR: f64 = 1e-6; // unit-factors: relative to the cell size
 /// A cut cell that holds less than this fraction of its volume in material is a sliver: its
 /// stress is read with its neighbours' ([`Solution::stress`], where the measurement is).
-const SLIVER: f64 = 0.1; // unit-factors: a fraction of a cell's volume
+const SLIVER: f64 = 0.1;
 /// A polynomial whose weight in the stress at a point is below this fraction of the largest is
 /// left out of the mean ([`Solution::stress`]): it could move the result by no more than this
 /// fraction of the difference between it and the others.
@@ -486,6 +486,13 @@ impl Solution {
         self.fractions.get(element).copied()
     }
 
+    /// The size of the cell that holds a point of the part (with refinement, the cell that is
+    /// not divided). The solution is one polynomial over that length, so its stress is read
+    /// well at points this far apart over the degree.
+    pub fn cell_size(&self, x: [f64; 3]) -> Option<f64> {
+        self.locate(x).map(|(_, _, size)| size)
+    }
+
     /// The displacement at a point of the part; `None` outside the cells that hold material
     /// (with refinement, the cells that are not divided). In the part of a cut cell outside the
     /// material it is the cell's polynomial continued.
@@ -684,13 +691,18 @@ fn chebyshev(p: usize, x: f64) -> f64 {
     value
 }
 
-fn factor_error(e: FactorError) -> Error {
+/// What makes a model smaller, for the message of a limit.
+fn smaller(refine: usize) -> &'static str {
+    if refine > 0 { "use a larger cell size, a lower degree or fewer levels of refinement" } else { "use a larger cell size or a lower degree" }
+}
+
+fn factor_error(e: FactorError, refine: usize) -> Error {
     match e {
         FactorError::NotPositiveDefinite { column } | FactorError::Singular { column } => Error::Singular(format!(
             "the stiffness is singular to working precision (equation {column}): the supports leave a rigid motion of the part free, or a cell holds so little material that the fictitious stiffness no longer determines its unknowns"
         )),
         FactorError::TooLarge { entries, limit } => {
-            Error::Limit(format!("the factorization needs {entries} entries; the limit is {limit} (use a larger cell size or a lower degree)"))
+            Error::Limit(format!("the factorization needs {entries} entries; the limit is {limit} ({})", smaller(refine)))
         }
         FactorError::OutOfMemory { entries } => Error::Limit(format!("no memory for a factorization of {entries} entries")),
         FactorError::Internal(message) => Error::Internal(message),
@@ -988,12 +1000,10 @@ fn solve_at(
     }
     let unknowns = 3 * space.count;
     if unknowns > limits.max_dofs {
-        return Err(Error::Limit(format!("{unknowns} unknowns; the limit is {} (use a larger cell size or a lower degree)", limits.max_dofs)));
+        return Err(Error::Limit(format!("{unknowns} unknowns; the limit is {} ({})", limits.max_dofs, smaller(options.refine))));
     }
     let too_large = |entries: usize| {
-        Error::Limit(format!(
-            "the stiffness would have {entries} entries; the limit is {MAX_MATRIX_ENTRIES} (use a larger cell size or a lower degree)"
-        ))
+        Error::Limit(format!("the stiffness would have {entries} entries; the limit is {MAX_MATRIX_ENTRIES} ({})", smaller(options.refine)))
     };
     let blocks =
         (0..elements).fold(0usize, |sum, element| sum.saturating_add(space.functions(element).len().saturating_mul(space.functions(element).len())));
@@ -1190,7 +1200,7 @@ fn solve_at(
 
     // The solution.
     stiffness.mirror_lower();
-    let factor = Factor::new(&UpperColumns::from_symmetric(&stiffness), limits.max_factor_entries).map_err(factor_error)?;
+    let factor = Factor::new(&UpperColumns::from_symmetric(&stiffness), limits.max_factor_entries).map_err(|e| factor_error(e, options.refine))?;
     stats.factor_entries = factor.entries();
     let mut u = load;
     factor.solve(&mut u)?;
@@ -1485,6 +1495,7 @@ mod tests {
         // The cells beside them are full, and a point outside the cells has no fraction.
         assert!((solution.material_fraction([0.1, 0.2, 0.1]).unwrap() - 1.0).abs() < 1e-12);
         assert!(solution.material_fraction([5.0, 0.2, 0.1]).is_none());
+        assert_eq!((solution.cell_size([0.1, 0.2, 0.1]), solution.cell_size([5.0, 0.2, 0.1])), (Some(0.25), None));
         // Chebyshev's polynomials: T₁ = x, T₃ = 4x³ − 3x.
         assert_eq!((chebyshev(1, 1.5), chebyshev(3, 1.0), chebyshev(3, 2.0)), (1.5, 1.0, 26.0));
     }

@@ -59,7 +59,12 @@
 //! therefore read as the mean of the polynomials of the cells around the point, each weighted
 //! by its estimated error ([`Solution::stress`]).
 //! The solution itself is not changed by that: the unknowns of such a cell are still determined
-//! by little material, which costs conditioning and not accuracy elsewhere. The system is
+//! by little material, which costs conditioning and not accuracy elsewhere. The part is known by
+//! the triangles of its surface alone, and small cells resolve the creases between the facets of
+//! a concave fillet as the notches they are: on the bracket of `tests/bracket.rs` cells of a
+//! third of the fillet's radius read the peak 4 to 7 % high over facets of a chordal error of
+//! 1/25 of a cell and within 0.7 % at 1/200, so the surface is to be triangulated far more
+//! finely than the smallest cell. The system is
 //! factored directly, so memory grows quickly with the degree: the caps in [`solve()`] refuse a
 //! model that would not fit. [`Solution::change_from`] compares two solutions as an indicator of
 //! convergence.
