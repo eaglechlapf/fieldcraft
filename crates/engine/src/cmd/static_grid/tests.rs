@@ -401,7 +401,7 @@ fn rounds_follow_the_solution_where_the_body_is_thin_for_the_grid() {
     let thin_note = |r: &Value| r["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("thin for this grid"));
     // Cells of 5 mm: not thin, no round unless one is asked for.
     let plain = s.execute("solve.static.grid", &json!({"cell_size": 5, "degree": 2, "refine": 0})).unwrap();
-    assert_eq!((plain["thin"].as_bool(), plain["adapt"].as_u64()), (Some(false), Some(0)), "{plain}");
+    assert_eq!((plain["thin"].as_bool(), plain["adapt"].as_u64(), plain["basis"].as_str()), (Some(false), Some(0), Some("tensor")), "{plain}");
     assert!(plain["settled"].is_null() && !thin_note(&plain), "{plain}");
     let auto = s.execute("solve.static.grid", &json!({"cell_size": 5, "degree": 2, "refine": 0, "adapt": "auto"})).unwrap();
     assert_eq!((auto["unknowns"].as_u64(), auto["strain_energy"].as_f64()), (plain["unknowns"].as_u64(), plain["strain_energy"].as_f64()), "{auto}");
@@ -416,7 +416,12 @@ fn rounds_follow_the_solution_where_the_body_is_thin_for_the_grid() {
     // Cells of 17 mm: thin. Rounds run without being asked, and the reply says where the
     // result stands; with none, it says what to expect.
     let coarse = s.execute("solve.static.grid", &json!({"cell_size": 17, "degree": 2, "refine": 0})).unwrap();
-    assert_eq!(coarse["thin"].as_bool(), Some(true), "{coarse}");
+    assert_eq!((coarse["thin"].as_bool(), coarse["basis"].as_str()), (Some(true), Some("trunk")), "{coarse}");
+    // The full tensor product when it is asked for, with more unknowns on the same cells.
+    let full = s.execute("solve.static.grid", &json!({"cell_size": 17, "degree": 2, "refine": 0, "adapt": 0, "basis": "tensor"})).unwrap();
+    let reduced = s.execute("solve.static.grid", &json!({"cell_size": 17, "degree": 2, "refine": 0, "adapt": 0, "basis": "trunk"})).unwrap();
+    assert_eq!((full["basis"].as_str(), reduced["basis"].as_str()), (Some("tensor"), Some("trunk")), "{full}");
+    assert!(full["unknowns"].as_u64() > reduced["unknowns"].as_u64(), "{full} {reduced}");
     assert!((1..=2).contains(&coarse["adapt"].as_u64().unwrap()) && coarse["settled"].is_f64(), "{coarse}");
     let none = s.execute("solve.static.grid", &json!({"cell_size": 17, "degree": 2, "refine": 0, "adapt": 0})).unwrap();
     assert_eq!((none["thin"].as_bool(), none["adapt"].as_u64()), (Some(true), Some(0)), "{none}");
@@ -461,6 +466,10 @@ fn hostile_params_never_panic() {
         json!({"cell_size": 5, "degree": 1e300}),
         json!({"cell_size": 5, "degree": "cubic"}),
         json!({"cell_size": 5, "degree": 2, "refine": 7}),
+        json!({"cell_size": 5, "degree": 2, "basis": "cubic"}),
+        json!({"cell_size": 5, "degree": 2, "basis": 7}),
+        json!({"cell_size": 5, "degree": 2, "basis": null}),
+        json!({"cell_size": 5, "degree": 2, "basis": "x".repeat(100_000)}),
         json!({"cell_size": 5, "degree": 2, "adapt": 7}),
         json!({"cell_size": 5, "degree": 2, "adapt": -1}),
         json!({"cell_size": 5, "degree": 2, "adapt": 1.5}),

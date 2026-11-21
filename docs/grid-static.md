@@ -80,6 +80,7 @@ mesh; each solve replaces the step's result.
 | `body` | the only body | The body of the open design to solve, on its own. |
 | `cell_size` | 1/20 of the bounding-box diagonal | The size of the grid's cubic cells (a length). |
 | `degree` | 3 | The polynomial degree of the shape functions, 1 to 8. |
+| `basis` | `"auto"` | The shape functions of a cell. `"tensor"`: every product of the polynomials along the three axes up to the degree. `"trunk"`: only those of total degree up to it, half the unknowns a cell at degree 3. `"auto"`: the trunk space for a body that is thin for the grid, the tensor product otherwise. The reply's `basis` names the one used. See [Rounds that follow the solution](#rounds-that-follow-the-solution). |
 | `refine` | 1 | Levels of local refinement, 0 to 6: a cell across which the surface is curved more tightly than it resolves is divided into eight, this many times at most. `levels` in the reply counts the cells of each level. |
 | `adapt` | `"auto"` | Rounds of refinement that follow the solution, 0 to 6: the step is solved, the cells the solution is least resolved in are divided, and it is solved again. `"auto"`: up to two rounds for a body that is thin for the grid (a cell more than four of its mean thicknesses across), none otherwise. The reply's `adapt` counts the rounds run and `settled` is the change of the strain energy in the last. See [Rounds that follow the solution](#rounds-that-follow-the-solution). |
 | `settle` | 0.05 | The rounds end once one moves the solution by no more than this fraction in the energy norm (0.05 is a change of the strain energy of 0.25 %). 0 runs every round. |
@@ -183,7 +184,8 @@ What the rounds are for, and what they are not for:
   and the load goes through one of them: `refine` divides the cells of all of them once, the
   rounds divide the cells of the one that carries the load again and again. On the tray of
   [Narrow gaps](#narrow-gaps-sheet-metal-corners-slits-fins), hung by one wall, the sag is 12 %
-  low without a round, 7 % low after one and 4 % low after two.
+  low without a round, 7 % low after one and 4 % low after two (in the tensor product; the
+  trunk space, below, gets there in half the time).
 - **They do not replace `refine` at a hole or a fillet.** The indicator follows the strain
   energy, and a stress peak holds little of it. On a plate with a hole of the radius of one
   cell in tension (degree 3, `crates/fcm/tests/hole.rs`), the stress at the hole over six
@@ -197,8 +199,34 @@ So the form leaves **Adaptive rounds** empty, which is `"auto"`: up to two round
 is thin for the grid (a cell is more than four of its mean thicknesses across, the thickness
 taken as twice the volume over the surface's area), where a bend or a thin wall is likely to
 carry the load on cells that do not resolve it, and none otherwise. A number runs that many
-rounds on any body; 0 runs none, for a first look at a sheet metal part in a quarter of the
+rounds on any body; 0 runs none, for a first look at a sheet metal part in a fifth of the
 time.
+
+**The shape functions** (`basis`) go with the rounds. The tensor product carries every product
+of the polynomials along the three axes up to the degree, 64 functions a cell at degree 3. The
+trunk space of Szabó and Babuška carries only those of total degree up to the degree, 32 a
+cell: it still holds every polynomial of that degree, and lacks the products beyond it. Cell
+for cell it is the less accurate, and on cells that are the same everywhere it needs about two
+degrees more for the same stress. Where the cells are divided as the part needs it, smaller
+cells make up for what it lacks, and it is the cheaper way to the same accuracy:
+
+| | Tensor product | Trunk space |
+|---|---|---|
+| Hole of one cell's radius, cells divided twice there, degree 3: stress at the hole over six grid positions | ± 0.7 %, 78 000 unknowns | ± 1.1 %, 24 000 unknowns |
+| the same, trunk space at degree 4 | | ± 0.5 %, 42 000 unknowns |
+| Tray hung by one wall, two rounds: sag | −3.8 %, 322 000 unknowns, 36 s | −4.3 %, 145 000 unknowns, 20 s |
+| Tray bolted, two rounds: sag | −0.2 % after one round (the second does not fit), 27 s | 0.0 %, 156 000 unknowns, 20 s |
+| Sample bracket as the form opens, degree 3: peak on the fillet | 212.5 MPa (−0.2 %), 145 000 unknowns, 7 s | 210.5 MPa (−1.2 %), 40 000 unknowns, 2 s |
+| the same, trunk space at degree 4 | | 212.4 MPa (−0.3 %), 73 000 unknowns, 5 s |
+
+The form's **Shape functions** is *Automatic*: the trunk space for a body that is thin for the
+grid, where the rounds divide the cells anyway, and the tensor product otherwise, which is what
+every other table on this page was measured with. For a part that does not fit the solver's
+caps, or takes long, the trunk space at one degree more is worth trying.
+
+A round takes the cells it leaves as they are from the round before: integrating a cell the
+surface cuts is the most work a cell takes (on one thread, more than the factorization of a
+sheet metal part), and a round leaves most cells as they were.
 
 **The triangulation matters with small cells.** The solver knows the body by its triangles
 alone, and a solution on small cells resolves the creases between the facets of a concave fillet
@@ -323,9 +351,11 @@ solve is refused).
 | Mesh solve (reference) | 0.1532 mm | 2.175 mm |
 | Grid, gaps joined | 0.1508 mm (−1.6 %), 6 s | 0.027 mm (−98.8 %), 6 s |
 | Grid, gaps open, no cells divided where they end (the solver's option, not the form's) | 0.1518 mm (−0.9 %) | 1.054 mm (−52 %) |
-| Grid, gaps open, no round that follows the solution (`"adapt": 0`) | 0.1520 mm (−0.8 %), 11 s | 1.915 mm (−12 %), 9 s |
+| Grid, gaps open, tensor product, no round that follows the solution (`"basis": "tensor", "adapt": 0`) | 0.1520 mm (−0.8 %), 11 s | 1.915 mm (−12 %), 9 s |
 | the same on cells of 12.5 mm | | 2.044 mm (−6 %), about 20 s |
-| **Grid as the form opens** (gaps open, rounds that follow the solution) | **0.1530 mm (−0.2 %), 27 s** | **2.093 mm (−3.8 %), 36 s** |
+| Grid, gaps open, tensor product, rounds that follow the solution (`"basis": "tensor"`) | 0.1530 mm (−0.2 %), 27 s | 2.093 mm (−3.8 %), 36 s |
+| Grid, gaps open, trunk space, no round (`"adapt": 0`) | 0.1497 mm (−2.3 %), 4 s | 1.834 mm (−15.7 %), 4 s |
+| **Grid as the form opens** (gaps open, trunk space, rounds that follow the solution) | **0.1532 mm (0.0 %), 20 s** | **2.082 mm (−4.3 %), 20 s** |
 
 Bolted, the corners carry little, and joined or open the floor sags the same to a per cent.
 Hung by one wall, everything goes through the bend along that wall and the side walls end free
@@ -337,19 +367,21 @@ bend along the clamped wall, 2 mm of sheet bent to an inside radius of 2 mm, in 
 all of it: they resolve neither the bend nor the reliefs at its ends, where the stress
 concentrates. A section through that bend alone (the wall, the bend and a strip of the floor;
 measured once, not kept as a test) is 8 % too stiff on cells of 25 mm, 6 % with the cells at
-the bend divided once, 2 % divided twice and 0.7 % divided three times. Dividing the cells of every bend and hole that far is
-more than the solver holds (cells of 12.5 mm divided once are 6 % low with 400 000 unknowns),
-which is what the rounds that follow the solution are for: they divide the cells of the bend
-that carries the load, and the tray hung by one wall is 3.8 % low after two of them with
-322 000 unknowns. Bolted, the first round moves the sag from 0.8 % to 0.2 % low; the second
-would need more than the factorization's default cap and is left out, which the reply says.
+the bend divided once, 2 % divided twice and 0.7 % divided three times. Dividing the cells of
+every bend and hole that far is more than the solver holds (cells of 12.5 mm divided once are
+6 % low with 400 000 unknowns), which is what the rounds that follow the solution are for:
+they divide the cells of the bend that carries the load. In the trunk space, which a thin
+body takes, the tray hung by one wall is 4.3 % low after two of them with 145 000 unknowns,
+and 2.8 % low after three (`"adapt": 3`, 219 000 unknowns, 42 s); bolted, the sag is within
+0.1 % after two. The von Mises stress at seven points of the floor (measured once, not kept as
+a test) is within 1 % of the mesh solve's at six of them and 4 % low at one, where it is up
+to 14 % low without the rounds.
 
 Each round still divides a cell along all three axes where a bend needs it across the bend
-only, and every cell carries the full degree through the thickness, where a plate needs two.
-So the rounds buy accuracy at a price: the default takes 36 s on this tray where a solve
-without them takes 9 s, and the reply's warning says when the result was still changing as
-they ended (here by 2.7 % of the strain energy in the last round). Cells that follow the sheet
-(divided across a bend only, a lower degree through the thickness) are the next step for it.
+only. So the rounds buy accuracy at a price: the default takes 20 s on this tray where a solve
+without them takes 4 s, and the reply's warning says when the result was still changing as
+they ended (here by 4 % of the strain energy in the last round). Cells that follow the sheet
+(divided across a bend only) are the next step for it.
 
 The gaps stay as wide as they are: the solve is linear, and two sides that would close and
 touch under load pass through each other. `"gaps": "joined"` (the form's **Narrow gaps**) solves

@@ -2782,6 +2782,9 @@ pub const SOLVE_STATIC_GRID: &[Field] = &[
     int("degree", "Degree", 1, super::static_grid::MAX_DEGREE)
         .help("The polynomial degree of the shape functions on every cell. With one cell per radius of a hole or fillet the stress peak is good to about 10 % at degree 3, 6.5 % at degree 4 and 3 % at degree 5.")
         .def("3"),
+    choice("basis", "Shape functions", &[("auto", "Automatic"), ("tensor", "Full"), ("trunk", "Reduced")])
+        .help("Full: every product of the polynomials along the three axes up to the degree. Reduced: only those of total degree up to the degree, half the unknowns a cell at degree 3; less accurate cell for cell, and as accurate in less time where cells are divided. Automatic: reduced for a body that is thin for the grid (sheet metal), full otherwise.")
+        .def("\"auto\""),
     int("refine", "Refinement levels", 0, super::static_grid::MAX_REFINE)
         .help("Divides the cells across which the surface is curved more tightly than they resolve (a fillet or hole with fewer than two cells to its radius at degree 4, four at degree 3) into eight, this many times at most. A coarse grid then resolves a small feature without fine cells everywhere. 0 keeps the grid the same everywhere.")
         .def("1"),
