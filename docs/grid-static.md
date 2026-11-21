@@ -81,9 +81,11 @@ mesh; each solve replaces the step's result.
 | `cell_size` | 1/20 of the bounding-box diagonal | The size of the grid's cubic cells (a length). |
 | `degree` | 3 | The polynomial degree of the shape functions, 1 to 8. |
 | `refine` | 1 | Levels of local refinement, 0 to 6: a cell across which the surface is curved more tightly than it resolves is divided into eight, this many times at most. `levels` in the reply counts the cells of each level. |
+| `adapt` | `"auto"` | Rounds of refinement that follow the solution, 0 to 6: the step is solved, the cells the solution is least resolved in are divided, and it is solved again. `"auto"`: up to two rounds for a body that is thin for the grid (a cell more than four of its mean thicknesses across), none otherwise. The reply's `adapt` counts the rounds run and `settled` is the change of the strain energy in the last. See [Rounds that follow the solution](#rounds-that-follow-the-solution). |
+| `settle` | 0.05 | The rounds end once one moves the solution by no more than this fraction in the energy norm (0.05 is a change of the strain energy of 0.25 %). 0 runs every round. |
 | `gaps` | `"open"` | `"open"`: material on the two sides of a gap narrower than a cell has unknowns of its own on each side, and the cells where such a gap ends are divided (four times at most). `"joined"`: the part is solved as if such gaps were welded shut wherever a cell reaches across them. See [Narrow gaps](#narrow-gaps-sheet-metal-corners-slits-fins). |
 | `check_convergence` | false | Also solve one degree lower on the same grid and report the change (`convergence`); needs degree 2 or more. |
-| `tolerance` | 1/250 of the smallest cell, at most 1e-3 of the diagonal | The chordal tolerance of the surface's triangulation, which is all the solver knows of the geometry. The smallest cell is `cell_size` halved `refine` times. |
+| `tolerance` | 1/250 of the smallest cell, at most 1e-3 of the diagonal | The chordal tolerance of the surface's triangulation, which is all the solver knows of the geometry. The smallest cell is `cell_size` halved once for every level of `refine` and every round of `adapt`. |
 | `sample_size` | `cell_size` / `degree` | The results are read at points of the surface no farther apart than this; where cells are divided, as much closer as the cells are smaller. |
 | `max_dofs` | 6 000 000 | A cap on the unknowns; may only be lowered. |
 | `max_factor_entries` | 400 000 000 | A cap on the entries of the factorization (8 bytes each), as for `solve.static`. |
@@ -151,9 +153,52 @@ closed-form and published values (`crates/fcm/tests/benchmarks.rs`):
 | the same, top and side | one per radius | 4 | +4.4 %, +26.8 % | +0.1 %, +0.2 % | |
 | Elliptic membrane (NAFEMS LE1), stress at D | 0.5 m | 3 | +10.4 % | +1.0 % | +0.03 % |
 
-Refinement follows the curvature of the surface and nothing else. It does not look at the
+These levels follow the curvature of the surface and nothing else. They do not look at the
 solution: a stress that peaks at a sharp re-entrant edge or where a support ends is not refined
-towards, and a curved face that carries no stress is refined all the same.
+towards, and a curved face that carries no stress is refined all the same. The rounds below do
+look at it.
+
+### Rounds that follow the solution
+
+With **Adaptive rounds** (`adapt`) the step is solved, the cells the solution is least resolved
+in are divided into eight, and the step is solved again, as many times as there are rounds. How
+well a cell resolves the solution is read from the solution itself: the strain energy of the
+part of it that only the functions of the highest degree carry in that cell, which is none
+where the lower degrees already represent the field (the hierarchic indicator of the p-version:
+Szabó & Babuška, *Finite Element Analysis*, 1991). The cells that carry nine tenths of the sum
+are divided, largest first (Dörfler, 1996). Each round is a whole solve on a larger system.
+
+The rounds end early once one moves the solution by no more than `settle`: the distance between
+two rounds' solutions in the energy norm, relative to the solution, which is the square root of
+the change of the strain energy. The default of 5 % (a change of the strain energy of 0.25 %) is
+the permissible error Zienkiewicz & Zhu take in the examples of their adaptive procedure (1987).
+A round whose system would be too large is left out, and the result is the solution before it.
+The reply's `settled` is the change of the strain energy in the last round, and a warning says
+so when the result was still changing as the rounds ended. Like **Check convergence**, this
+tells how much the last refinement still moved the result; it is not a bound of the error.
+
+What the rounds are for, and what they are not for:
+
+- **They find what the surface does not show.** A sheet metal part has a bend at every wall,
+  and the load goes through one of them: `refine` divides the cells of all of them once, the
+  rounds divide the cells of the one that carries the load again and again. On the tray of
+  [Narrow gaps](#narrow-gaps-sheet-metal-corners-slits-fins), hung by one wall, the sag is 12 %
+  low without a round, 7 % low after one and 4 % low after two.
+- **They do not replace `refine` at a hole or a fillet.** The indicator follows the strain
+  energy, and a stress peak holds little of it. On a plate with a hole of the radius of one
+  cell in tension (degree 3, `crates/fcm/tests/hole.rs`), the stress at the hole over six
+  positions of the grid is within ± 10 % on the grid's own cells, still ± 7 % after two rounds
+  and ± 1.6 % after three, where two levels of `refine` give ± 0.7 % in the time of the two
+  rounds. On the sample bracket, one round on top of the default level changes the strain
+  energy by 0.001 % and the peak on the fillet from 212.5 to 211.2 MPa (reference 213), for
+  three to four times the run time.
+
+So the form leaves **Adaptive rounds** empty, which is `"auto"`: up to two rounds when the body
+is thin for the grid (a cell is more than four of its mean thicknesses across, the thickness
+taken as twice the volume over the surface's area), where a bend or a thin wall is likely to
+carry the load on cells that do not resolve it, and none otherwise. A number runs that many
+rounds on any body; 0 runs none, for a first look at a sheet metal part in a quarter of the
+time.
 
 **The triangulation matters with small cells.** The solver knows the body by its triangles
 alone, and a solution on small cells resolves the creases between the facets of a concave fillet
@@ -278,8 +323,9 @@ solve is refused).
 | Mesh solve (reference) | 0.1532 mm | 2.175 mm |
 | Grid, gaps joined | 0.1508 mm (−1.6 %), 6 s | 0.027 mm (−98.8 %), 6 s |
 | Grid, gaps open, no cells divided where they end (the solver's option, not the form's) | 0.1518 mm (−0.9 %) | 1.054 mm (−52 %) |
-| **Grid as the form opens** (gaps open) | **0.1520 mm (−0.8 %), 9 s** | **1.915 mm (−12 %), 9 s** |
-| The same on cells of 12.5 mm | | 2.044 mm (−6 %), about 20 s |
+| Grid, gaps open, no round that follows the solution (`"adapt": 0`) | 0.1520 mm (−0.8 %), 11 s | 1.915 mm (−12 %), 9 s |
+| the same on cells of 12.5 mm | | 2.044 mm (−6 %), about 20 s |
+| **Grid as the form opens** (gaps open, rounds that follow the solution) | **0.1530 mm (−0.2 %), 27 s** | **2.093 mm (−3.8 %), 36 s** |
 
 Bolted, the corners carry little, and joined or open the floor sags the same to a per cent.
 Hung by one wall, everything goes through the bend along that wall and the side walls end free
@@ -287,15 +333,23 @@ at its corners: joined to it they carry the load as ribs, and the tray sags an e
 what it does.
 
 **Thin sheet is the solver's hard case.** What is left of the error in the hung tray is the
-bend along the clamped wall, 2 mm of sheet bent to an inside radius of 2 mm, on cells of
-12.5 mm that hold all of it: the cells resolve neither the bend nor the reliefs at its ends,
-where the stress concentrates. Finer cells lower it slowly (−6 % on cells of 12.5 mm divided
-once, with 400 000 unknowns), because the cells are cubes and are divided along all three axes
-where a bend needs it across the bend only, and because every cell carries the full degree
-through the thickness, where a plate needs two. So for sheet metal: read the deflection of a
-part whose load goes through a bend as up to a tenth too small on the default grid, and check
-with **Check convergence** or a smaller cell size. Cells that follow the sheet (divided across
-a bend only, a lower degree through the thickness) are the next step for it.
+bend along the clamped wall, 2 mm of sheet bent to an inside radius of 2 mm, in cells that hold
+all of it: they resolve neither the bend nor the reliefs at its ends, where the stress
+concentrates. A section through that bend alone (the wall, the bend and a strip of the floor;
+measured once, not kept as a test) is 8 % too stiff on cells of 25 mm, 6 % with the cells at
+the bend divided once, 2 % divided twice and 0.7 % divided three times. Dividing the cells of every bend and hole that far is
+more than the solver holds (cells of 12.5 mm divided once are 6 % low with 400 000 unknowns),
+which is what the rounds that follow the solution are for: they divide the cells of the bend
+that carries the load, and the tray hung by one wall is 3.8 % low after two of them with
+322 000 unknowns. Bolted, the first round moves the sag from 0.8 % to 0.2 % low; the second
+would need more than the factorization's default cap and is left out, which the reply says.
+
+Each round still divides a cell along all three axes where a bend needs it across the bend
+only, and every cell carries the full degree through the thickness, where a plate needs two.
+So the rounds buy accuracy at a price: the default takes 36 s on this tray where a solve
+without them takes 9 s, and the reply's warning says when the result was still changing as
+they ended (here by 2.7 % of the strain energy in the last round). Cells that follow the sheet
+(divided across a bend only, a lower degree through the thickness) are the next step for it.
 
 The gaps stay as wide as they are: the solve is linear, and two sides that would close and
 touch under load pass through each other. `"gaps": "joined"` (the form's **Narrow gaps**) solves

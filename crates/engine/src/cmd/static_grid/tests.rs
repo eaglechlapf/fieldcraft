@@ -385,6 +385,49 @@ fn gravity_loads_the_volume() {
     assert!(close(r["applied_total"][2].as_f64().unwrap(), -weight, 1e-9) && close(r["reaction_total"][2].as_f64().unwrap(), weight, 1e-6), "{r}");
 }
 
+/// The rounds that follow the solution: asked for by number, and run without being asked on a
+/// body that is thin for its grid (a cell more than four of its mean thicknesses, here 4 mm,
+/// across). The block is held at one end and pushed across, a cantilever in bending.
+#[test]
+fn rounds_follow_the_solution_where_the_body_is_thin_for_the_grid() {
+    let (_dir, mut s) = block();
+    s.limits.max_grid_dofs = 40_000;
+    s.run_script(&json!([
+        {"command": "model.boundary_condition.create", "params": {"name": "Wall", "type": "fixed", "target": {"set": "x0"}}},
+        {"command": "model.load.create", "params": {"name": "Push", "type": "pressure", "set": "z0", "magnitude": 1.0}},
+        {"command": "model.step.create", "params": {"name": "Bend", "procedure": {"type": "static"}, "boundary_conditions": ["Wall"], "loads": ["Push"]}},
+    ]))
+    .unwrap();
+    let thin_note = |r: &Value| r["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("thin for this grid"));
+    // Cells of 5 mm: not thin, no round unless one is asked for.
+    let plain = s.execute("solve.static.grid", &json!({"cell_size": 5, "degree": 2, "refine": 0})).unwrap();
+    assert_eq!((plain["thin"].as_bool(), plain["adapt"].as_u64()), (Some(false), Some(0)), "{plain}");
+    assert!(plain["settled"].is_null() && !thin_note(&plain), "{plain}");
+    let auto = s.execute("solve.static.grid", &json!({"cell_size": 5, "degree": 2, "refine": 0, "adapt": "auto"})).unwrap();
+    assert_eq!((auto["unknowns"].as_u64(), auto["strain_energy"].as_f64()), (plain["unknowns"].as_u64(), plain["strain_energy"].as_f64()), "{auto}");
+    // One round, to the end (`settle` 0): more unknowns, and how much the round changed the
+    // strain energy (either way: the support is imposed weakly, more firmly on smaller cells).
+    let asked = s.execute("solve.static.grid", &json!({"cell_size": 5, "degree": 2, "refine": 0, "adapt": 1, "settle": 0})).unwrap();
+    assert_eq!(asked["adapt"].as_u64(), Some(1), "{asked}");
+    assert!(asked["unknowns"].as_u64() > plain["unknowns"].as_u64() && asked["levels"][1].as_u64().unwrap() > 0, "{asked}");
+    let settled = asked["settled"].as_f64().unwrap();
+    assert!(settled != 0.0 && settled.abs() < 0.2, "{asked}");
+    assert!(close(asked["strain_energy"].as_f64().unwrap() * (1.0 - settled), plain["strain_energy"].as_f64().unwrap(), 1e-9), "{asked}");
+    // Cells of 17 mm: thin. Rounds run without being asked, and the reply says where the
+    // result stands; with none, it says what to expect.
+    let coarse = s.execute("solve.static.grid", &json!({"cell_size": 17, "degree": 2, "refine": 0})).unwrap();
+    assert_eq!(coarse["thin"].as_bool(), Some(true), "{coarse}");
+    assert!((1..=2).contains(&coarse["adapt"].as_u64().unwrap()) && coarse["settled"].is_f64(), "{coarse}");
+    let none = s.execute("solve.static.grid", &json!({"cell_size": 17, "degree": 2, "refine": 0, "adapt": 0})).unwrap();
+    assert_eq!((none["thin"].as_bool(), none["adapt"].as_u64()), (Some(true), Some(0)), "{none}");
+    assert!(thin_note(&none) && none["unknowns"].as_u64() < coarse["unknowns"].as_u64(), "{none}");
+    // A round that would be too large is left out, and the reply says so.
+    s.limits.max_grid_dofs = none["unknowns"].as_u64().unwrap() as usize + 10;
+    let capped = s.execute("solve.static.grid", &json!({"cell_size": 17, "degree": 2, "refine": 0})).unwrap();
+    assert_eq!((capped["adapt"].as_u64(), capped["unknowns"].as_u64()), (Some(0), none["unknowns"].as_u64()), "{capped}");
+    assert!(capped["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("too large to solve")), "{capped}");
+}
+
 #[test]
 fn hostile_params_never_panic() {
     let (_dir, mut s) = pulled();
@@ -418,6 +461,18 @@ fn hostile_params_never_panic() {
         json!({"cell_size": 5, "degree": 1e300}),
         json!({"cell_size": 5, "degree": "cubic"}),
         json!({"cell_size": 5, "degree": 2, "refine": 7}),
+        json!({"cell_size": 5, "degree": 2, "adapt": 7}),
+        json!({"cell_size": 5, "degree": 2, "adapt": -1}),
+        json!({"cell_size": 5, "degree": 2, "adapt": 1.5}),
+        json!({"cell_size": 5, "degree": 2, "adapt": "always"}),
+        json!({"cell_size": 5, "degree": 2, "adapt": null}),
+        json!({"cell_size": 5, "degree": 2, "adapt": 1e300}),
+        json!({"cell_size": 5, "degree": 2, "adapt": 6, "settle": 0}),
+        json!({"cell_size": 5, "degree": 2, "settle": -1}),
+        json!({"cell_size": 5, "degree": 2, "settle": 2}),
+        json!({"cell_size": 5, "degree": 2, "settle": 1e300}),
+        json!({"cell_size": 5, "degree": 2, "settle": "soon"}),
+        json!({"cell_size": 5, "degree": 2, "settle": null}),
         json!({"cell_size": 5, "degree": 2, "refine": -1}),
         json!({"cell_size": 5, "degree": 2, "refine": 1.5}),
         json!({"cell_size": 5, "degree": 2, "refine": "fine"}),

@@ -936,7 +936,7 @@ enum Row {
 fn solve_summary(ui: &mut egui::Ui, t: &Tokens, v: &Value, units: Option<&DisplaySystem>) {
     let Some(m) = v.as_object() else { return value(ui, t, egui::Id::unique("fc_reply_solve"), v, 0) };
     let steady = m.get("frames").and_then(Value::as_u64).is_some_and(|n| n <= 1);
-    let rows: [(&str, &str, Row); 29] = [
+    let rows: [(&str, &str, Row); 31] = [
         ("step", "Step", Row::Text),
         ("body", "Body", Row::Text),
         ("max_displacement", "Max |U|", Row::Peak(Quantity::Length)),
@@ -963,6 +963,8 @@ fn solve_summary(ui: &mut egui::Ui, t: &Tokens, v: &Value, units: Option<&Displa
         ("unknowns", "Unknowns", Row::Count),
         ("cells", "Cells with material", Row::Count),
         ("gap_cells", "Cells across open gaps", Row::Count),
+        ("adapt", "Adaptive rounds", Row::Count),
+        ("settled", "Change of energy in the last round", Row::Number(Quantity::Dimensionless)),
         ("volume", "Volume in the cells", Row::Number(Quantity::Volume)),
         ("surface_volume", "Volume of the body", Row::Number(Quantity::Volume)),
         ("strain_energy", "Strain energy", Row::Number(Quantity::Energy)),

@@ -32,7 +32,7 @@ use crate::{CommandKind, CommandSpec, EngineError, Result, Session, StepResult};
 pub const STATIC_GRID: CommandSpec = CommandSpec {
     id: "solve.static.grid",
     label: "Solve Static Step on a Grid",
-    params: r#"{"step": "Load", "body": "Bracket", "cell_size": 4.0, "degree": 3, "refine": 1, "gaps": "open", "check_convergence": false, "tolerance": 0.05, "sample_size": 1.0, "max_dofs": 6000000, "max_factor_entries": 400000000, "threads": 8} — solves a linear static step (the only one when `step` is left out) for one body of the open design (the only one when `body` is left out) with no volume mesh, by the finite cell method: the body's surface, triangulated within `tolerance` (a length; default 1/250 of the smallest cell, `cell_size` halved `refine` times, and at most 1e-3 of the body's bounding-box diagonal), is embedded in a grid of cubic cells of `cell_size` (a length; default 1/20 of the diagonal) carrying shape functions of polynomial `degree` (1 to 8, default 3). With `refine` (0 to 6 levels, default 1) a cell across which the surface is curved more tightly than it resolves (fewer than two cells to the radius of a fillet or hole at degree 4, four at degree 3) is divided into eight, level by level, so a coarse grid resolves a small feature without fine cells everywhere; `levels` in the reply counts the cells of each level. Material on the two sides of a gap that is narrower than a cell (the open corner of a sheet metal part, a slit, the fins of a heat sink) is kept apart, as it is in the part, with unknowns of its own on each side, and the cells where such a gap ends are divided (up to four times) until they are no more than two and a half widths of the gap across, so that the cell at the root holds the two sides together over no more than that; `gap_cells` in the reply counts the cells that hold several such pieces. `"gaps": "joined"` solves the part as if every such gap were welded shut wherever a cell reaches across it. The body takes the isotropic elastic material of its solid section (a section on a set that names the body); the step's boundary conditions fix displacement components of whole faces (fixed, displacement, symmetry about a global plane) and its loads act on whole faces (force as a total, traction, pressure) or on the body (gravity): each must act on a set of geometry faces of this body. Refused, changing nothing: another kind of boundary condition or load, a set of nodes, elements, edges or vertices, a reference point, an orthotropic material, a cell of a partitioned body, and a model with contacts, ties, couplings, point masses or springs. Keeps the result in the session, sampled at the vertices of the body's surface refined to `sample_size` (a length; default `cell_size`/`degree`; where cells are divided, as much finer as the cells are), where results.contour, results.deformed and solve.probe read it (its points are labelled above every mesh label); it is not written to model files. Returns the `unknowns`, the `cells` that hold material (under `grid` the grid's `cells` along x, y and z, those `inside` the part and those its surface `cut`s), the run time in `seconds`, the largest von Mises stress and displacement with where they are (`at`, and the `face`), the reaction of every supported face, the applied and reaction totals, the `volume` the solver integrated against the surface's (`surface_volume`), the strain energy and `warnings`. With `check_convergence` (degree 2 or more) the step is also solved one degree lower on the same grid, and `convergence` gives how far the two solutions are apart, each a fraction: `peak_von_mises` (the change of the largest von Mises stress over the sampled points), `von_mises` (the largest change at any one point, of the peak) and `strain_energy`; an indicator of convergence, not a bound of the error. `max_dofs` caps the unknowns and may only be lowered; `max_factor_entries` and `threads` as for solve.static. A stress peak at a hole or a fillet is within about 1 % with two cells per radius of the smallest stressed feature at degree 4, or four at degree 3, which `refine` gives where the surface is curved; displacements and reactions need far less (docs/grid-static.md)"#,
+    params: r#"{"step": "Load", "body": "Bracket", "cell_size": 4.0, "degree": 3, "refine": 1, "adapt": "auto", "settle": 0.05, "gaps": "open", "check_convergence": false, "tolerance": 0.05, "sample_size": 1.0, "max_dofs": 6000000, "max_factor_entries": 400000000, "threads": 8} — solves a linear static step (the only one when `step` is left out) for one body of the open design (the only one when `body` is left out) with no volume mesh, by the finite cell method: the body's surface, triangulated within `tolerance` (a length; default 1/250 of the smallest cell, `cell_size` halved once for every level of `refine` and round of `adapt`, and at most 1e-3 of the body's bounding-box diagonal), is embedded in a grid of cubic cells of `cell_size` (a length; default 1/20 of the diagonal) carrying shape functions of polynomial `degree` (1 to 8, default 3). With `refine` (0 to 6 levels, default 1) a cell across which the surface is curved more tightly than it resolves (fewer than two cells to the radius of a fillet or hole at degree 4, four at degree 3) is divided into eight, level by level, so a coarse grid resolves a small feature without fine cells everywhere; `levels` in the reply counts the cells of each level. `refine` sees what the surface shows, not where the load goes: with `adapt` (0 to 6 rounds) the step is solved, the cells the solution is least resolved in are divided, and it is solved again, each round a whole solve; the rounds end early once one moves the solution by no more than `settle` (a fraction, default 0.05: the distance between two rounds' solutions in the energy norm, which is a change of the strain energy of 0.25 %; 0 runs every round), and a round too large to solve is left out. `"adapt": "auto"`, the default, runs up to two rounds for a body that is thin for its grid (a cell more than four of its mean thicknesses across: sheet metal, where a bend carries the load on cells far wider than the sheet is thick) and none otherwise. The reply's `adapt` counts the rounds run, `settled` is the change of the strain energy in the last one, as a fraction (null without a round), and `thin` says whether the body is thin for the grid; a warning tells when the result was still changing as the rounds ended. Material on the two sides of a gap that is narrower than a cell (the open corner of a sheet metal part, a slit, the fins of a heat sink) is kept apart, as it is in the part, with unknowns of its own on each side, and the cells where such a gap ends are divided (up to four times) until they are no more than two and a half widths of the gap across, so that the cell at the root holds the two sides together over no more than that; `gap_cells` in the reply counts the cells that hold several such pieces. `"gaps": "joined"` solves the part as if every such gap were welded shut wherever a cell reaches across it. The body takes the isotropic elastic material of its solid section (a section on a set that names the body); the step's boundary conditions fix displacement components of whole faces (fixed, displacement, symmetry about a global plane) and its loads act on whole faces (force as a total, traction, pressure) or on the body (gravity): each must act on a set of geometry faces of this body. Refused, changing nothing: another kind of boundary condition or load, a set of nodes, elements, edges or vertices, a reference point, an orthotropic material, a cell of a partitioned body, and a model with contacts, ties, couplings, point masses or springs. Keeps the result in the session, sampled at the vertices of the body's surface refined to `sample_size` (a length; default `cell_size`/`degree`; where cells are divided, as much finer as the cells are), where results.contour, results.deformed and solve.probe read it (its points are labelled above every mesh label); it is not written to model files. Returns the `unknowns`, the `cells` that hold material (under `grid` the grid's `cells` along x, y and z, those `inside` the part and those its surface `cut`s), the run time in `seconds`, the largest von Mises stress and displacement with where they are (`at`, and the `face`), the reaction of every supported face, the applied and reaction totals, the `volume` the solver integrated against the surface's (`surface_volume`), the strain energy and `warnings`. With `check_convergence` (degree 2 or more) the step is also solved one degree lower on the same grid, and `convergence` gives how far the two solutions are apart, each a fraction: `peak_von_mises` (the change of the largest von Mises stress over the sampled points), `von_mises` (the largest change at any one point, of the peak) and `strain_energy`; an indicator of convergence, not a bound of the error. `max_dofs` caps the unknowns and may only be lowered; `max_factor_entries` and `threads` as for solve.static. A stress peak at a hole or a fillet is within about 1 % with two cells per radius of the smallest stressed feature at degree 4, or four at degree 3, which `refine` gives where the surface is curved; displacements and reactions need far less (docs/grid-static.md)"#,
     form: Some(super::forms::SOLVE_STATIC_GRID),
     kind: CommandKind::Model,
     requires: &[Requirement::Design, Requirement::Material, Requirement::Section, Requirement::Step],
@@ -48,6 +48,14 @@ pub(super) const MAX_REFINE: i64 = fieldcraft_fcm::grid::MAX_REFINE as i64;
 /// and at the default cell size it takes the peak on the sample bracket's fillet from 6 % off to
 /// within 0.5 % (docs/grid-static.md).
 const DEFAULT_REFINE: u64 = 1;
+/// The rounds of refinement that follow the solution (`fieldcraft_fcm::Options::adapt`) when
+/// none are given and the body is thin for its grid ([`THIN`]); none otherwise. `refine` sees a
+/// fillet or a hole and not that a bend of a sheet carries the load. On the sheet metal tray of
+/// `crates/fcm/tests/tray.rs`, hung by one wall, the deflection is 12 % low without a round in
+/// 7 s, 7 % low after one in 15 s and 4 % low after two in 30 s; on the sample bracket, which is
+/// not thin, a round changes the strain energy by 0.03 % and the peak by less than 0.5 %
+/// (docs/grid-static.md).
+const THIN_ROUNDS: usize = 2;
 /// The levels of refinement where a gap ends (`fieldcraft_fcm::Options::gaps`), with the gaps
 /// open: from a cell of a twentieth of the part to one of 1/320, which is two and a half widths
 /// of a gap of 1/800 of the part (0.6 mm in a part of half a metre). A narrower gap is still
@@ -625,6 +633,16 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let default_degree = Options::new(1.0).degree;
     let degree = super::mesh::optional_count(p, "degree", default_degree as u64, 1..=MAX_DEGREE as u64)?;
     let levels = super::mesh::optional_count(p, "refine", DEFAULT_REFINE, 0..=MAX_REFINE as u64)?;
+    // The rounds that follow the solution: a number, or as many as the body needs.
+    let asked_rounds = match p.get("adapt") {
+        None => None,
+        Some(Value::String(auto)) if auto == "auto" => None,
+        Some(_) => Some(super::mesh::optional_count(p, "adapt", 0, 0..=MAX_REFINE as u64)?),
+    };
+    let settle = super::optional_number(p, "settle", Options::SETTLED)?;
+    if !(0.0..=1.0).contains(&settle) {
+        return Err(EngineError::invalid("settle", "must be a fraction from 0 to 1 (0 runs every round)"));
+    }
     let open_gaps = match opt::<String>(p, "gaps")?.as_deref() {
         None | Some("open") => true,
         Some("joined") => false,
@@ -665,8 +683,14 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
         MIN_RELATIVE_CELL * diagonal..=MAX_RELATIVE_CELL * diagonal,
         "1e-3 of the body's bounding-box diagonal to twice it",
     )?;
+    // A thin body on cells much wider than it is thick: a cell is more than `THIN` of its mean
+    // thicknesses (twice its volume over its surface's area) across.
+    let volume = crate::units::geometry().to_si(Quantity::Volume, measure.volume).unwrap_or(f64::NAN);
+    let skin = crate::units::geometry().to_si(Quantity::Area, measure.area).unwrap_or(f64::NAN);
+    let thin = skin > 0.0 && cell_size * skin > THIN * 2.0 * volume;
+    let rounds = asked_rounds.unwrap_or(if thin { THIN_ROUNDS } else { 0 });
     // The facets are far smaller than the smallest cell, and no coarser than a mesher takes them.
-    let smallest_cell = cell_size / (1u64 << levels) as f64;
+    let smallest_cell = cell_size / (1u64 << (levels + rounds).min(MAX_REFINE as usize)) as f64;
     let tolerance = length(
         "tolerance",
         (DEFAULT_TOLERANCE_PER_CELL * smallest_cell).clamp(MIN_RELATIVE_TOLERANCE * diagonal, DEFAULT_RELATIVE_TOLERANCE * diagonal),
@@ -691,16 +715,6 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
 
     // Before the solver starts on its grid: the unknowns of the cells the body fills alone (p³
     // modes a cell, three unknowns a mode) are a lower bound of the system's.
-    let volume = crate::units::geometry().to_si(Quantity::Volume, measure.volume).unwrap_or(f64::NAN);
-    // A thin body on cells much wider than it is thick.
-    let skin: f64 = areas.values().map(|(area, _)| area).sum();
-    if skin > 0.0 && cell_size * skin > THIN * 2.0 * volume {
-        warnings.push(format!(
-            "the body is thin for this grid (about {} thick on cells of {}): where a bend or a thin wall carries the load, the deflection can be up to a tenth too small; `check_convergence` or a smaller cell size shows how far the result is from settled",
-            shown(2.0 * volume / skin),
-            shown(cell_size),
-        ));
-    }
     let least = 3.0 * (degree as f64).powi(3) * volume / cell_size.powi(3);
     if least > limits.max_dofs as f64 {
         return Err(EngineError::Solver(fieldcraft_solver::Error::Limit(format!(
@@ -714,6 +728,8 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let grid = Options {
         degree,
         refine: levels,
+        adapt: rounds,
+        settle,
         separate: open_gaps,
         gaps: if open_gaps { GAP_LEVELS } else { 0 },
         offset: OFFSET,
@@ -767,6 +783,32 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
             sampled.points.len(),
             shown(longest),
             shown(sample_size),
+        ));
+    }
+    // How far the result is from settled, where the grid is coarse for the part.
+    // Every round asked for (`settle` 0) is read against the default.
+    let bar = if settle > 0.0 { settle } else { Options::SETTLED };
+    let still_moving = stats.rounds > 0 && stats.settled.abs().sqrt() > bar;
+    if still_moving || stats.left_out {
+        warnings.push(format!(
+            "the result was still changing when the rounds of refinement ended: the last one changed the strain energy by {:.2} %{}{}",
+            100.0 * stats.settled.abs(),
+            if thin {
+                format!(" (the body is thin for this grid, about {} thick on cells of {})", shown(2.0 * volume / skin), shown(cell_size))
+            } else {
+                String::new()
+            },
+            if stats.left_out {
+                "; one more round would have been too large to solve (a smaller `cell_size` with fewer rounds, or a higher `max_factor_entries`, goes further)"
+            } else {
+                "; more rounds (`adapt`) or a smaller `cell_size` bring it closer"
+            },
+        ));
+    } else if thin && stats.rounds == 0 {
+        warnings.push(format!(
+            "the body is thin for this grid (about {} thick on cells of {}): where a bend or a thin wall carries the load, the deflection can be up to a tenth too small; rounds of refinement (`adapt`) or a smaller `cell_size` show how far the result is from settled",
+            shown(2.0 * volume / skin),
+            shown(cell_size),
         ));
     }
     if stats.joined {
@@ -835,6 +877,11 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
         // The cells that are not divided, by level: the grid's own first.
         // Every level that has cells: those divided where gaps end lie below the others.
         "levels": stats.levels.iter().take(stats.levels.iter().rposition(|cells| *cells > 0).map_or(1, |last| last + 1).max(levels + 1)).collect::<Vec<_>>(),
+        // The rounds that followed the solution, and how much the last one still changed the
+        // strain energy.
+        "adapt": stats.rounds,
+        "thin": thin,
+        "settled": if stats.rounds > 0 { json!(stats.settled) } else { Value::Null },
         "gaps": if open_gaps && !stats.joined { "open" } else { "joined" },
         // The cells that hold separate pieces of material, and the unknowns that keeping them
         // apart added; none where no cell holds a gap.
