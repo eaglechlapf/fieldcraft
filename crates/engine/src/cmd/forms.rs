@@ -2784,14 +2784,14 @@ pub const SOLVE_STATIC_GRID: &[Field] = &[
         .def("3"),
     int("refine", "Refinement levels", 0, super::static_grid::MAX_REFINE)
         .help("Divides the cells across which the surface is curved more tightly than they resolve (a fillet or hole with fewer than two cells to its radius at degree 4, four at degree 3) into eight, this many times at most. A coarse grid then resolves a small feature without fine cells everywhere. 0 keeps the grid the same everywhere.")
-        .def("0"),
+        .def("1"),
     flag("check_convergence", "Check convergence")
         .help("Also solves one degree lower on the same grid and reports how much the peak von Mises stress and the strain energy changed: an indicator of convergence, not a bound of the error."),
     positive("tolerance", "Chordal tolerance", D::Length)
-        .help("Largest distance between the triangulated surface, which is all the solver knows of the body, and the true curved surface.")
-        .hint("1e-3 of the diagonal"),
+        .help("Largest distance between the triangulated surface, which is all the solver knows of the body, and the true curved surface. Small cells resolve the facets of a fillet as notches, so it is far below the smallest cell.")
+        .hint("smallest cell / 250"),
     positive("sample_size", "Result sampling", D::Length)
-        .help("The results are read at points of the body's surface no farther apart than this, for the contours.")
+        .help("The results are read at points of the body's surface no farther apart than this, for the contours. Where cells are divided, the points are as much closer as the cells are smaller.")
         .hint("cell size / degree"),
     MAX_DOFS,
     MAX_FACTOR,

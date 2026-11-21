@@ -32,7 +32,7 @@ use crate::{CommandKind, CommandSpec, EngineError, Result, Session, StepResult};
 pub const STATIC_GRID: CommandSpec = CommandSpec {
     id: "solve.static.grid",
     label: "Solve Static Step on a Grid",
-    params: r#"{"step": "Load", "body": "Bracket", "cell_size": 4.0, "degree": 3, "refine": 0, "check_convergence": false, "tolerance": 0.05, "sample_size": 1.0, "max_dofs": 6000000, "max_factor_entries": 400000000, "threads": 8} — solves a linear static step (the only one when `step` is left out) for one body of the open design (the only one when `body` is left out) with no volume mesh, by the finite cell method: the body's surface, triangulated within `tolerance` (a length; default 1e-3 of the body's bounding-box diagonal), is embedded in a grid of cubic cells of `cell_size` (a length; default 1/20 of the diagonal) carrying shape functions of polynomial `degree` (1 to 8, default 3). With `refine` (0 to 6 levels, default 0) a cell across which the surface is curved more tightly than it resolves (fewer than two cells to the radius of a fillet or hole at degree 4, four at degree 3) is divided into eight, level by level, so a coarse grid resolves a small feature without fine cells everywhere; `levels` in the reply counts the cells of each level. The body takes the isotropic elastic material of its solid section (a section on a set that names the body); the step's boundary conditions fix displacement components of whole faces (fixed, displacement, symmetry about a global plane) and its loads act on whole faces (force as a total, traction, pressure) or on the body (gravity): each must act on a set of geometry faces of this body. Refused, changing nothing: another kind of boundary condition or load, a set of nodes, elements, edges or vertices, a reference point, an orthotropic material, a cell of a partitioned body, and a model with contacts, ties, couplings, point masses or springs. Keeps the result in the session, sampled at the vertices of the body's surface refined to `sample_size` (a length; default `cell_size`/`degree`), where results.contour, results.deformed and solve.probe read it (its points are labelled above every mesh label); it is not written to model files. Returns the `unknowns`, the `cells` that hold material (under `grid` the grid's `cells` along x, y and z, those `inside` the part and those its surface `cut`s), the run time in `seconds`, the largest von Mises stress and displacement with where they are (`at`, and the `face`), the reaction of every supported face, the applied and reaction totals, the `volume` the solver integrated against the surface's (`surface_volume`), the strain energy and `warnings`. With `check_convergence` (degree 2 or more) the step is also solved one degree lower on the same grid, and `convergence` gives how far the two solutions are apart, each a fraction: `peak_von_mises` (the change of the largest von Mises stress over the sampled points), `von_mises` (the largest change at any one point, of the peak) and `strain_energy`; an indicator of convergence, not a bound of the error. `max_dofs` caps the unknowns and may only be lowered; `max_factor_entries` and `threads` as for solve.static. The grid is the same everywhere: a stress peak at a hole or a fillet is within about 1 % with two cells per radius of the smallest stressed feature at degree 4, or four at degree 3; displacements and reactions need far less (docs/grid-static.md)"#,
+    params: r#"{"step": "Load", "body": "Bracket", "cell_size": 4.0, "degree": 3, "refine": 1, "check_convergence": false, "tolerance": 0.05, "sample_size": 1.0, "max_dofs": 6000000, "max_factor_entries": 400000000, "threads": 8} — solves a linear static step (the only one when `step` is left out) for one body of the open design (the only one when `body` is left out) with no volume mesh, by the finite cell method: the body's surface, triangulated within `tolerance` (a length; default 1/250 of the smallest cell, `cell_size` halved `refine` times, and at most 1e-3 of the body's bounding-box diagonal), is embedded in a grid of cubic cells of `cell_size` (a length; default 1/20 of the diagonal) carrying shape functions of polynomial `degree` (1 to 8, default 3). With `refine` (0 to 6 levels, default 1) a cell across which the surface is curved more tightly than it resolves (fewer than two cells to the radius of a fillet or hole at degree 4, four at degree 3) is divided into eight, level by level, so a coarse grid resolves a small feature without fine cells everywhere; `levels` in the reply counts the cells of each level. The body takes the isotropic elastic material of its solid section (a section on a set that names the body); the step's boundary conditions fix displacement components of whole faces (fixed, displacement, symmetry about a global plane) and its loads act on whole faces (force as a total, traction, pressure) or on the body (gravity): each must act on a set of geometry faces of this body. Refused, changing nothing: another kind of boundary condition or load, a set of nodes, elements, edges or vertices, a reference point, an orthotropic material, a cell of a partitioned body, and a model with contacts, ties, couplings, point masses or springs. Keeps the result in the session, sampled at the vertices of the body's surface refined to `sample_size` (a length; default `cell_size`/`degree`; where cells are divided, as much finer as the cells are), where results.contour, results.deformed and solve.probe read it (its points are labelled above every mesh label); it is not written to model files. Returns the `unknowns`, the `cells` that hold material (under `grid` the grid's `cells` along x, y and z, those `inside` the part and those its surface `cut`s), the run time in `seconds`, the largest von Mises stress and displacement with where they are (`at`, and the `face`), the reaction of every supported face, the applied and reaction totals, the `volume` the solver integrated against the surface's (`surface_volume`), the strain energy and `warnings`. With `check_convergence` (degree 2 or more) the step is also solved one degree lower on the same grid, and `convergence` gives how far the two solutions are apart, each a fraction: `peak_von_mises` (the change of the largest von Mises stress over the sampled points), `von_mises` (the largest change at any one point, of the peak) and `strain_energy`; an indicator of convergence, not a bound of the error. `max_dofs` caps the unknowns and may only be lowered; `max_factor_entries` and `threads` as for solve.static. A stress peak at a hole or a fillet is within about 1 % with two cells per radius of the smallest stressed feature at degree 4, or four at degree 3, which `refine` gives where the surface is curved; displacements and reactions need far less (docs/grid-static.md)"#,
     form: Some(super::forms::SOLVE_STATIC_GRID),
     kind: CommandKind::Model,
     requires: &[Requirement::Design, Requirement::Material, Requirement::Section, Requirement::Step],
@@ -43,10 +43,25 @@ pub const STATIC_GRID: CommandSpec = CommandSpec {
 pub(super) const MAX_DEGREE: i64 = 8;
 /// The most levels of local refinement the solver takes (`fieldcraft_fcm::Options::refine`).
 pub(super) const MAX_REFINE: i64 = fieldcraft_fcm::grid::MAX_REFINE as i64;
+/// The levels of local refinement when none are given. One level costs two to five times the
+/// unknowns on a part with curved faces and nothing on one without (`crates/fcm/tests/corpus.rs`),
+/// and at the default cell size it takes the peak on the sample bracket's fillet from 6 % off to
+/// within 0.5 % (docs/grid-static.md).
+const DEFAULT_REFINE: u64 = 1;
+/// The smallest cell against the grid's own: divided `MAX_REFINE` times.
+const LEAST_SCALE: f64 = 1.0 / (1u64 << fieldcraft_fcm::grid::MAX_REFINE) as f64;
 /// The default cell size and chordal tolerance, relative to the body's bounding-box diagonal:
 /// the meshers' defaults (an element a twentieth of the part, the tessellation a thousandth).
 const DEFAULT_RELATIVE_CELL: f64 = 1.0 / 20.0;
 const DEFAULT_RELATIVE_TOLERANCE: f64 = super::hex::DEFAULT_RELATIVE_TOLERANCE;
+/// The default chordal tolerance against the smallest cell of the grid (`cell_size` halved
+/// `refine` times), where that is finer than the meshers' default. The solver knows the body by
+/// its triangles alone, and a solution on small cells resolves the creases between the facets of
+/// a concave fillet as the notches they are. On the sample bracket (an R6 fillet, 213 MPa) the
+/// peak on grids with cells of 1.5 to 2.2 mm at the fillet is 4 to 7 % high at a tolerance of
+/// 0.088 mm (1e-3 of the diagonal), up to 4 % high at 0.02 mm and within 0.5 % from 0.01 mm on
+/// (docs/grid-static.md).
+const DEFAULT_TOLERANCE_PER_CELL: f64 = 1.0 / 250.0;
 /// The smallest chordal tolerance, relative to the diagonal (the hex meshers' floor).
 const MIN_RELATIVE_TOLERANCE: f64 = 1e-5;
 /// The smallest cell, relative to the diagonal: far below what the solver's grid can hold.
@@ -441,6 +456,13 @@ struct Sampled {
     capped: Option<f64>,
 }
 
+/// The least of `scale` at the two ends and the middle of an edge, the same from either end.
+fn at_edge(points: &[[f64; 3]], a: u32, b: u32, scale: &impl Fn([f64; 3]) -> f64) -> f64 {
+    let (Some(p), Some(q)) = (points.get(a as usize), points.get(b as usize)) else { return 1.0 };
+    let middle = [0.5 * (p[0] + q[0]), 0.5 * (p[1] + q[1]), 0.5 * (p[2] + q[2])];
+    scale(*p).min(scale(*q)).min(scale(middle)).clamp(LEAST_SCALE, 1.0)
+}
+
 fn edge_length(points: &[[f64; 3]], a: u32, b: u32) -> f64 {
     match (points.get(a as usize), points.get(b as usize)) {
         (Some(p), Some(q)) => Vec3::from(*p).dist(Vec3::from(*q)),
@@ -448,11 +470,13 @@ fn edge_length(points: &[[f64; 3]], a: u32, b: u32) -> f64 {
     }
 }
 
-/// The surface's triangles refined until no edge is longer than `size`: every pass halves each
-/// longer edge and cuts the triangles on it into two, three or four, by the edges they have
-/// halved. Whether an edge is halved depends on its length alone, so the two triangles on it
-/// agree and the surface stays closed. Stops at `max_points` points.
-fn refine(surface: &BoundarySurface, size: f64, max_points: usize) -> Sampled {
+/// The surface's triangles refined until no edge is longer than `size`, or than `size` times
+/// what `scale` gives at an end or the middle of the edge where that is less (a number from 0
+/// to 1: the grid's cells divided there against its own): every pass halves each longer edge
+/// and cuts the triangles on it into two, three or four, by the edges they have halved. Whether
+/// an edge is halved depends on the edge alone, so the two triangles on it agree and the
+/// surface stays closed. Stops at `max_points` points.
+fn refine(surface: &BoundarySurface, size: f64, scale: impl Fn([f64; 3]) -> f64, max_points: usize) -> Sampled {
     let mut points = surface.points().to_vec();
     let mut triangles = surface.triangles().to_vec();
     let mut tri_face: Vec<u32> = (0..triangles.len()).map(|t| surface.tri_face().get(t).copied().unwrap_or(u32::MAX)).collect();
@@ -464,7 +488,8 @@ fn refine(surface: &BoundarySurface, size: f64, max_points: usize) -> Sampled {
         for t in &triangles {
             for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
                 let length = edge_length(&points, a, b);
-                if length > size {
+                // The least of the three scales first: the cells are seldom divided.
+                if length > size * LEAST_SCALE && length > size * at_edge(&points, a, b, &scale) {
                     long.push(key(a, b));
                     longest = longest.max(length);
                 }
@@ -580,7 +605,7 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
     // The solver's default degree, read off its default options.
     let default_degree = Options::new(1.0).degree;
     let degree = super::mesh::optional_count(p, "degree", default_degree as u64, 1..=MAX_DEGREE as u64)?;
-    let levels = super::mesh::optional_count(p, "refine", 0, 0..=MAX_REFINE as u64)?;
+    let levels = super::mesh::optional_count(p, "refine", DEFAULT_REFINE, 0..=MAX_REFINE as u64)?;
     let check_convergence = opt::<bool>(p, "check_convergence")?.unwrap_or(false);
     if check_convergence && degree < 2 {
         return Err(EngineError::invalid("check_convergence", "compares with the solution one degree lower: it needs a degree of 2 or more"));
@@ -610,17 +635,19 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
             Err(EngineError::invalid(key, format!("must be a length from {} to {} ({why})", shown(*range.start()), shown(*range.end()))))
         }
     };
-    let tolerance = length(
-        "tolerance",
-        DEFAULT_RELATIVE_TOLERANCE * diagonal,
-        MIN_RELATIVE_TOLERANCE * diagonal..=diagonal,
-        "1e-5 of the body's bounding-box diagonal to all of it",
-    )?;
     let cell_size = length(
         "cell_size",
         DEFAULT_RELATIVE_CELL * diagonal,
         MIN_RELATIVE_CELL * diagonal..=MAX_RELATIVE_CELL * diagonal,
         "1e-3 of the body's bounding-box diagonal to twice it",
+    )?;
+    // The facets are far smaller than the smallest cell, and no coarser than a mesher takes them.
+    let smallest_cell = cell_size / (1u64 << levels) as f64;
+    let tolerance = length(
+        "tolerance",
+        (DEFAULT_TOLERANCE_PER_CELL * smallest_cell).clamp(MIN_RELATIVE_TOLERANCE * diagonal, DEFAULT_RELATIVE_TOLERANCE * diagonal),
+        MIN_RELATIVE_TOLERANCE * diagonal..=diagonal,
+        "1e-5 of the body's bounding-box diagonal to all of it",
     )?;
     let finest = cell_size / (MAX_SAMPLES_PER_DEGREE * degree as f64);
     let sample_size =
@@ -656,7 +683,8 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
         let solution = fieldcraft_fcm::solve(&surface, &material, &supports, &loads, &grid, &limits).map_err(grid_error)?;
         fieldcraft_model::progress::stage(&format!("{}: results", shape.name), None, "");
         fieldcraft_model::progress::check()?;
-        let sampled = refine(&surface, sample_size, MAX_SAMPLES);
+        // Where the cells are divided the polynomials are shorter, and the points closer.
+        let sampled = refine(&surface, sample_size, |x| solution.cell_size(x).map_or(1.0, |leaf| leaf / cell_size), MAX_SAMPLES);
         let values = sample(&solution, &sampled.points);
         // The p-extension's own check: the same step one degree lower on the same grid, and how
         // far the two solutions are apart at the sampled points.

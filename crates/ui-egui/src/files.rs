@@ -1196,10 +1196,11 @@ impl ModelApp {
         if o.command == "solve.static.grid" {
             let label = crate::command_label(o.command);
             done = format!("{label}: {} (details in the panel)", crate::reply::summary_in(o.command, &o.reply, Some(self.session.units())));
-            let taken: serde_json::Map<String, Value> = ["step", "body", "cell_size", "degree", "check_convergence", "tolerance", "sample_size"]
-                .into_iter()
-                .filter_map(|key| o.reply.get(key).filter(|v| !v.is_null()).map(|v| (key.to_string(), v.clone())))
-                .collect();
+            let taken: serde_json::Map<String, Value> =
+                ["step", "body", "cell_size", "degree", "refine", "check_convergence", "tolerance", "sample_size"]
+                    .into_iter()
+                    .filter_map(|key| o.reply.get(key).filter(|v| !v.is_null()).map(|v| (key.to_string(), v.clone())))
+                    .collect();
             let params = self.session.params_with_units(o.command, &Value::Object(taken));
             crate::context::opened(self, crate::context::Opened::Reply);
             self.reply = Some(crate::reply::Reply { command: o.command.into(), label: label.into(), params, value: o.reply.clone() });
