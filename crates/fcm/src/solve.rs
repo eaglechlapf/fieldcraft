@@ -10,7 +10,7 @@ use fieldcraft_fem::{DofLayout, DofSet};
 use fieldcraft_mesh::surface::BoundarySurface;
 use fieldcraft_solver::Limits;
 use fieldcraft_solver::cholesky::{Factor, FactorError, PIVOT_TOLERANCE, UpperColumns};
-use fieldcraft_solver::ordering::fill_reducing_order;
+use fieldcraft_solver::ordering::element_dissection;
 use fieldcraft_solver::sparse::{NodeGraph, add_block};
 
 use crate::cell::{self, Face, Lame, Shapes, Surface};
@@ -1458,9 +1458,23 @@ fn solve_at(
     if blocks > MAX_MATRIX_ENTRIES {
         return Err(too_large(blocks.saturating_mul(9)));
     }
+    // Nested dissection by elements: the functions of a cell all couple, so a separator is
+    // the functions two groups of cells share, not a layer of functions through the cells.
     let order = {
-        let graph = NodeGraph::new(space.count, (0..elements).map(|element| space.functions(element)));
-        fill_reducing_order(&space.xyz, &graph.adjacency)
+        let lists: Vec<&[usize]> = (0..elements).map(|element| space.functions(element)).collect();
+        let centres: Vec<[f64; 3]> = lists
+            .iter()
+            .map(|list| {
+                let mut centre = [0.0; 3];
+                for at in list.iter().filter_map(|mode| space.xyz.get(*mode)) {
+                    for a in 0..3 {
+                        centre[a] += at[a] / list.len() as f64;
+                    }
+                }
+                centre
+            })
+            .collect();
+        element_dissection(space.count, &lists, &centres)
     };
     space.renumber(&order)?;
     let layout = DofLayout::uniform(0..space.count as u32, DofSet::TRANSLATIONS);

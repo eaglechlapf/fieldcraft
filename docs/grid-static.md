@@ -23,7 +23,7 @@ ways and compared.
    **Solve**, and click **Grid Static** in the *Implicit* panel, beside *Static*. Or press
    Ctrl+K (⌘K) and type `grid`.
 3. Leave the form as it is and click **OK**. The solve runs in the background, with Cancel, and
-   takes about 7 seconds. Left empty, the cell size is 1/20 of the body's bounding-box diagonal
+   takes about 4 seconds. Left empty, the cell size is 1/20 of the body's bounding-box diagonal
    (4.39 mm here); the degree is 3, and **Refinement levels** is 1: the cells at the fillet and
    the holes are divided once, to 2.2 mm. Tick **Check convergence** to solve one degree lower
    as well and see how much the result still changed.
@@ -199,7 +199,7 @@ So the form leaves **Adaptive rounds** empty, which is `"auto"`: up to two round
 is thin for the grid (a cell is more than four of its mean thicknesses across, the thickness
 taken as twice the volume over the surface's area), where a bend or a thin wall is likely to
 carry the load on cells that do not resolve it, and none otherwise. A number runs that many
-rounds on any body; 0 runs none, for a first look at a sheet metal part in a fifth of the
+rounds on any body; 0 runs none, for a first look at a sheet metal part in a quarter of the
 time.
 
 **The shape functions** (`basis`) go with the rounds. The tensor product carries every product
@@ -214,10 +214,10 @@ cells make up for what it lacks, and it is the cheaper way to the same accuracy:
 |---|---|---|
 | Hole of one cell's radius, cells divided twice there, degree 3: stress at the hole over six grid positions | ± 0.7 %, 78 000 unknowns | ± 1.1 %, 24 000 unknowns |
 | the same, trunk space at degree 4 | | ± 0.5 %, 42 000 unknowns |
-| Tray hung by one wall, two rounds: sag | −3.8 %, 322 000 unknowns, 32 s | −4.3 %, 145 000 unknowns, 15 s |
-| Tray bolted, two rounds: sag | −0.2 % after one round (the second does not fit), 23 s | 0.0 %, 156 000 unknowns, 15 s |
-| Sample bracket as the form opens, degree 3: peak on the fillet | 212.5 MPa (−0.2 %), 145 000 unknowns, 7 s | 210.5 MPa (−1.2 %), 40 000 unknowns, 2 s |
-| the same, trunk space at degree 4 | | 212.4 MPa (−0.3 %), 73 000 unknowns, 5 s |
+| Tray hung by one wall, two rounds: sag | −3.8 %, 322 000 unknowns, 20 s | −4.3 %, 145 000 unknowns, 10 s |
+| Tray bolted, two rounds: sag | −0.2 % after one round (the second does not fit), 15 s | 0.0 %, 156 000 unknowns, 11 s |
+| Sample bracket as the form opens, degree 3: peak on the fillet | 212.5 MPa (−0.2 %), 145 000 unknowns, 4.3 s | 210.5 MPa (−1.2 %), 40 000 unknowns, 1.4 s |
+| the same, trunk space at degree 4 | | 212.4 MPa (−0.3 %), 73 000 unknowns, 2.7 s |
 
 The form's **Shape functions** is *Automatic*: the trunk space for a body that is thin for the
 grid, where the rounds divide the cells anyway, and the tensor product otherwise, which is what
@@ -235,12 +235,23 @@ work grows with the number of triangles in a cell, not with its square. The repl
 therefore agrees with `surface_volume` to rounding (6e-13 on the sheet metal tray of
 [Narrow gaps](#narrow-gaps-sheet-metal-corners-slits-fins), where sampling the cells left
 1e-5). Sampling them took a fifth of that tray's solve on 24 threads and close to half of it
-on one; the exact integrals take a tenth of that time, so the tray as the form opens takes 15 s
-where it took 21 s, and 83 s on one thread where it took 137 s. One kind of cell is still
+on one; the exact integrals take a tenth of that time. One kind of cell is still
 sampled, on an octree of smaller boxes where the surface in it is curved: a cell whose highest
 corner lies on the body's surface, as when a face of the part lies exactly in a plane of the
 grid. The grid starts off the body's corner by an odd fraction of a cell so that this is rare;
 it costs time, not accuracy.
+
+**The unknowns are ordered cell by cell.** The equations are solved by a direct factorization,
+whose size and time depend on the order in which the unknowns are eliminated. The functions of
+a cell all couple with each other, so the part is divided along the faces between cells: the
+cells are split into two groups, the functions the two groups share are eliminated last, and
+each group is divided again (a nested dissection by elements, the cut chosen as the one that
+shares the fewest functions among those that leave each group a third of the cells). On the
+tray the factor then has 86 million entries where dividing the part by the positions of its
+functions, through the cells, gave 150 million, and takes about a third of the work; over 300 solves
+of other parts the factor is a quarter smaller on average and never larger. That is most of
+why the tray as the form opens takes 10 s where it took 21 s, and why two levels at the sample
+bracket's default cell size fit the default `max_factor_entries` where they did not.
 
 **The triangulation matters with small cells.** A solution on small cells resolves the creases
 between the facets of a concave fillet as the notches they are. On the sample bracket, grids with cells of 1.5 to 2.2 mm at the R6
@@ -264,23 +275,23 @@ with the default triangulation:
 | Cell size | Levels | Cells at the fillet | Degree | Unknowns | Time | Peak on the fillet | Against 213 MPa |
 |---|---|---|---|---|---|---|---|
 | 8 mm | 0 | 8 mm | 2 | 5 265 | 0.2 s | 178.9 MPa | −16.0 % |
-| 8 mm | 0 | 8 mm | 3 | 15 960 | 0.5 s | 228.3 MPa | +7.2 % |
-| 8 mm | 0 | 8 mm | 4 | 35 775 | 1.4 s | 214.5 MPa | +0.7 % |
-| 4.39 mm | 0 | 4.39 mm | 3 | 67 890 | 2.1 s | 226.2 MPa | +6.2 % |
-| 4.39 mm | 0 | 4.39 mm | 4 | 155 103 | 8.2 s | 213.6 MPa | +0.3 % |
-| 4 mm | 0 | 4 mm | 3 | 80 340 | 2.5 s | 210.8 MPa | −1.0 % |
-| 4 mm | 0 | 4 mm | 4 | 183 573 | 9.8 s | 210.9 MPa | −1.0 % |
-| 3 mm | 0 | 3 mm | 3 | 153 699 | 6.8 s | 208.1 MPa | −2.3 % |
-| **4.39 mm (the default)** | **1** | **2.2 mm** | **3** | **145 077** | **6.8 s** | **212.5 MPa** | **−0.2 %** |
-| 8 mm | 1 | 4 mm | 3 | 51 816 | 2.0 s | 201.3 MPa | −5.5 % |
-| 8 mm | 2 | 2 mm | 3 | 144 348 | 8.1 s | 211.6 MPa | −0.6 % |
-| 12 mm | 2 | 3 mm | 3 | 94 893 | 4.1 s | 217.7 MPa | +2.2 % |
-| 12 mm | 3 | 1.5 mm | 3 | 256 731 | 19.2 s | 211.1 MPa | −0.9 % |
-| 16 mm | 3 | 2 mm | 3 | 151 449 | 11.2 s | 213.4 MPa | +0.2 % |
-| 8 mm | 1 | 4 mm | 4 | 120 147 | 8.3 s | 208.6 MPa | −2.1 % |
-| 6 mm | 1 | 3 mm | 4 | 226 449 | 17.8 s | 210.6 MPa | −1.1 % |
-| 12 mm | 2 | 3 mm | 4 | 222 009 | 17.8 s | 212.3 MPa | −0.3 % |
-| 16 mm | 2 | 4 mm | 4 | 124 824 | 10.5 s | 217.2 MPa | +2.0 % |
+| 8 mm | 0 | 8 mm | 3 | 15 960 | 0.4 s | 228.3 MPa | +7.2 % |
+| 8 mm | 0 | 8 mm | 4 | 35 775 | 1.0 s | 214.5 MPa | +0.7 % |
+| 4.39 mm | 0 | 4.39 mm | 3 | 67 890 | 1.5 s | 226.2 MPa | +6.2 % |
+| 4.39 mm | 0 | 4.39 mm | 4 | 155 103 | 5.7 s | 213.6 MPa | +0.3 % |
+| 4 mm | 0 | 4 mm | 3 | 80 340 | 1.8 s | 210.8 MPa | −1.0 % |
+| 4 mm | 0 | 4 mm | 4 | 183 573 | 7.0 s | 210.9 MPa | −1.0 % |
+| 3 mm | 0 | 3 mm | 3 | 153 699 | 3.9 s | 208.1 MPa | −2.3 % |
+| **4.39 mm (the default)** | **1** | **2.2 mm** | **3** | **145 077** | **4.3 s** | **212.5 MPa** | **−0.2 %** |
+| 8 mm | 1 | 4 mm | 3 | 51 816 | 1.4 s | 201.3 MPa | −5.5 % |
+| 8 mm | 2 | 2 mm | 3 | 144 348 | 5.1 s | 211.6 MPa | −0.6 % |
+| 12 mm | 2 | 3 mm | 3 | 94 893 | 3.1 s | 217.7 MPa | +2.2 % |
+| 12 mm | 3 | 1.5 mm | 3 | 256 731 | 11.2 s | 211.1 MPa | −0.9 % |
+| 16 mm | 3 | 2 mm | 3 | 151 449 | 5.7 s | 213.4 MPa | +0.2 % |
+| 8 mm | 1 | 4 mm | 4 | 120 147 | 5.5 s | 208.6 MPa | −2.1 % |
+| 6 mm | 1 | 3 mm | 4 | 226 449 | 11.8 s | 210.6 MPa | −1.1 % |
+| 12 mm | 2 | 3 mm | 4 | 222 009 | 12.2 s | 212.3 MPa | −0.3 % |
+| 16 mm | 2 | 4 mm | 4 | 124 824 | 6.0 s | 217.2 MPa | +2.0 % |
 
 (Times on a 24-core desktop. The table was measured again with the narrow gaps open, the
 default: every peak is the same to the digit shown, and a few rows have up to one per cent more
@@ -302,9 +313,9 @@ fillet of 6 mm:
   at degree 3 give 211 to 221 MPa, with none 184 to 243 (`crates/fcm/tests/bracket.rs`, at a
   tolerance of 0.05 mm).
 
-What is refused on this part: two levels at the default cell size (a factorization of 510
-million entries against the cap of 400 million), and degree 4 with one level at the default
-cell size (a stiffness of 228 million entries against the solver's cap of 180 million). The
+What is refused on this part: degree 4 with one level at the default cell size (a stiffness
+of 228 million entries against the solver's cap of 180 million). Two levels at the default cell
+size (cells of 1.1 mm at the fillet, 367 000 unknowns) take 15 s and give 211.2 MPa (−0.8 %). The
 largest displacement is 0.1549 to 0.1550 mm on every grid of the table but the three of 8 mm
 cells with no levels (0.1499, 0.1538 and 0.1546 mm), and the clamped face carries the 2 kN on
 every grid.
@@ -363,13 +374,13 @@ solve is refused).
 | | Bolted at four holes, 1 kPa on the floor: sag at the passage | Hung by one wall, 100 N on the opposite wall: sag at the passage |
 |---|---|---|
 | Mesh solve (reference) | 0.1532 mm | 2.175 mm |
-| Grid, gaps joined | 0.1508 mm (−1.6 %), 6 s | 0.027 mm (−98.8 %), 6 s |
+| Grid, gaps joined | 0.1508 mm (−1.6 %), 4 s | 0.027 mm (−98.8 %), 4 s |
 | Grid, gaps open, no cells divided where they end (the solver's option, not the form's) | 0.1518 mm (−0.9 %) | 1.054 mm (−52 %) |
-| Grid, gaps open, tensor product, no round that follows the solution (`"basis": "tensor", "adapt": 0`) | 0.1520 mm (−0.8 %), 8 s | 1.914 mm (−12 %), 8 s |
-| the same on cells of 12.5 mm | | 2.044 mm (−6 %), about 20 s |
-| Grid, gaps open, tensor product, rounds that follow the solution (`"basis": "tensor"`) | 0.1530 mm (−0.2 %), 23 s | 2.093 mm (−3.8 %), 32 s |
-| Grid, gaps open, trunk space, no round (`"adapt": 0`) | 0.1497 mm (−2.3 %), 3 s | 1.834 mm (−15.7 %), 3 s |
-| **Grid as the form opens** (gaps open, trunk space, rounds that follow the solution) | **0.1532 mm (0.0 %), 15 s** | **2.082 mm (−4.3 %), 15 s** |
+| Grid, gaps open, tensor product, no round that follows the solution (`"basis": "tensor", "adapt": 0`) | 0.1520 mm (−0.8 %), 5 s | 1.914 mm (−12 %), 5 s |
+| the same on cells of 12.5 mm | | 2.042 mm (−6 %), 10 s |
+| Grid, gaps open, tensor product, rounds that follow the solution (`"basis": "tensor"`) | 0.1530 mm (−0.2 %), 15 s | 2.093 mm (−3.8 %), 20 s |
+| Grid, gaps open, trunk space, no round (`"adapt": 0`) | 0.1497 mm (−2.3 %), 2.5 s | 1.834 mm (−15.7 %), 2.4 s |
+| **Grid as the form opens** (gaps open, trunk space, rounds that follow the solution) | **0.1532 mm (0.0 %), 11 s** | **2.082 mm (−4.3 %), 10 s** |
 
 Bolted, the corners carry little, and joined or open the floor sags the same to a per cent.
 Hung by one wall, everything goes through the bend along that wall and the side walls end free
@@ -386,14 +397,14 @@ every bend and hole that far is more than the solver holds (cells of 12.5 mm div
 6 % low with 400 000 unknowns), which is what the rounds that follow the solution are for:
 they divide the cells of the bend that carries the load. In the trunk space, which a thin
 body takes, the tray hung by one wall is 4.3 % low after two of them with 145 000 unknowns,
-and 2.8 % low after three (`"adapt": 3`, 219 000 unknowns, 34 s); bolted, the sag is within
+and 2.8 % low after three (`"adapt": 3`, 219 000 unknowns, 21 s); bolted, the sag is within
 0.1 % after two. The von Mises stress at seven points of the floor (measured once, not kept as
 a test) is within 1 % of the mesh solve's at six of them and 4 % low at one, where it is up
 to 14 % low without the rounds.
 
 Each round still divides a cell along all three axes where a bend needs it across the bend
-only. So the rounds buy accuracy at a price: the default takes 15 s on this tray where a solve
-without them takes 3 s, and the reply's warning says when the result was still changing as
+only. So the rounds buy accuracy at a price: the default takes 10 s on this tray where a solve
+without them takes 2.4 s, and the reply's warning says when the result was still changing as
 they ended (here by 4 % of the strain energy in the last round). Cells that follow the sheet
 (divided across a bend only) are the next step for it.
 

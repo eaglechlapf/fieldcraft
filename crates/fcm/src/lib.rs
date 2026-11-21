@@ -58,9 +58,12 @@
 //!    cell's eigenvalue problem (no penalty number to choose).
 //! 7. **Loads**: pressures, tractions and forces integrated over the face's triangles, gravity
 //!    over the part's quadrature points.
-//! 8. **Solution**: assembled into [`fieldcraft_solver`]'s sparse matrix, ordered by its nested
-//!    dissection and factored by its Cholesky. Displacement and stress are evaluated anywhere in
-//!    the part from the cell's polynomial.
+//! 8. **Solution**: assembled into [`fieldcraft_solver`]'s sparse matrix and factored by its
+//!    Cholesky, the unknowns ordered by its nested dissection by elements
+//!    ([`fieldcraft_solver::ordering::element_dissection`]): the functions of a cell all
+//!    couple, so the part is divided along the functions that two groups of cells share, which
+//!    are far fewer than a layer of functions cut through the cells. Displacement and stress
+//!    are evaluated anywhere in the part from the cell's polynomial.
 //!
 //! This is a first version: one body, linear elastic, isotropic, static. On thin sheet it is
 //! stiff: cells of degree 3 a dozen sheet thicknesses across bend a plate 5 to 12 % too little
