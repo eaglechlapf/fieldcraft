@@ -134,3 +134,54 @@ pub fn corner(reach: [f64; 3]) -> BoundarySurface {
     faces.triangle([x, y, z], [1.0, 1.0, 1.0], INCLINED);
     faces.surface()
 }
+
+/// The faces of [`strip`] on its outer curve are tagged by the caller; these are free for it.
+pub const OUTER_A: u32 = 6;
+pub const OUTER_B: u32 = 7;
+
+/// A plate between two curves in the xy plane, from z = 0 to `thickness`: `curves(i)` gives the
+/// points of the inner and the outer curve for i = 0..=segments, which the caller makes exact
+/// where they must lie in a plane. The faces are [`INNER`], `outer(i)` for the outer segment
+/// from point i, [`AT_Y0`] at i = 0, [`AT_X0`] at i = segments, [`AT_Z0`] and [`AT_Z1`].
+pub fn strip(segments: usize, thickness: f64, curves: impl Fn(usize) -> ([f64; 2], [f64; 2]), outer: impl Fn(usize) -> u32) -> BoundarySurface {
+    let at = |p: [f64; 2], z: f64| [p[0], p[1], z];
+    let mut quads = Quads::default();
+    for i in 0..segments {
+        let ((a0, b0), (a1, b1)) = (curves(i), curves(i + 1));
+        // Out of the plate: away from the inner curve's chord towards the outer one's.
+        let across = [0.5 * (b0[0] + b1[0] - a0[0] - a1[0]), 0.5 * (b0[1] + b1[1] - a0[1] - a1[1]), 0.0];
+        quads.add([at(a0, 0.0), at(a1, 0.0), at(a1, thickness), at(a0, thickness)], [-across[0], -across[1], 0.0], INNER);
+        quads.add([at(b0, 0.0), at(b1, 0.0), at(b1, thickness), at(b0, thickness)], across, outer(i));
+        for (z, outward, tag) in [(0.0, -1.0, AT_Z0), (thickness, 1.0, AT_Z1)] {
+            quads.add([at(a0, z), at(b0, z), at(b1, z), at(a1, z)], [0.0, 0.0, outward], tag);
+        }
+    }
+    for (i, tag) in [(0, AT_Y0), (segments, AT_X0)] {
+        let (a, b) = curves(i);
+        let outward = if i == 0 { [0.0, -1.0, 0.0] } else { [-1.0, 0.0, 0.0] };
+        quads.add([at(a, 0.0), at(b, 0.0), at(b, thickness), at(a, thickness)], outward, tag);
+    }
+    quads.surface()
+}
+
+/// A plate with a hole: [`strip`] closed on itself, the curves running once round. `outer` tags
+/// each outer segment from its two points.
+pub fn ring(
+    segments: usize,
+    thickness: f64,
+    curves: impl Fn(usize) -> ([f64; 2], [f64; 2]),
+    outer: impl Fn([f64; 2], [f64; 2]) -> u32,
+) -> BoundarySurface {
+    let at = |p: [f64; 2], z: f64| [p[0], p[1], z];
+    let mut quads = Quads::default();
+    for i in 0..segments {
+        let ((a0, b0), (a1, b1)) = (curves(i), curves((i + 1) % segments));
+        let across = [0.5 * (b0[0] + b1[0] - a0[0] - a1[0]), 0.5 * (b0[1] + b1[1] - a0[1] - a1[1]), 0.0];
+        quads.add([at(a0, 0.0), at(a1, 0.0), at(a1, thickness), at(a0, thickness)], [-across[0], -across[1], 0.0], INNER);
+        quads.add([at(b0, 0.0), at(b1, 0.0), at(b1, thickness), at(b0, thickness)], across, outer(b0, b1));
+        for (z, outward, tag) in [(0.0, -1.0, AT_Z0), (thickness, 1.0, AT_Z1)] {
+            quads.add([at(a0, z), at(b0, z), at(b1, z), at(a1, z)], [0.0, 0.0, outward], tag);
+        }
+    }
+    quads.surface()
+}
