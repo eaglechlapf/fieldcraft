@@ -10,23 +10,28 @@ use fieldcraft_solver::cholesky::{Factor, FactorError, PIVOT_TOLERANCE, UpperCol
 use fieldcraft_solver::ordering::fill_reducing_order;
 use fieldcraft_solver::sparse::{NodeGraph, add_block};
 
-use crate::cell::{self, Face, Lame, Surface};
+use crate::cell::{self, Face, Lame, Shapes, Surface};
 use crate::gauss::gauss_legendre;
 use crate::grid::{self, Grid, MAX_DEPTH, QuadPoint, cross, dot, sub};
 use crate::inside::Solid;
 use crate::legendre::MAX_DEGREE;
-use crate::space::{Kind, NONE, Space, modes};
+use crate::moments::{Moments, Scratch};
+use crate::space::{Kind, NONE, Space, local_modes};
 use crate::{Error, Result};
 
 /// Cells of the grid, at most (most of them outside the part).
 const MAX_CELLS: usize = 4_000_000;
-/// Entries of the sparse stiffness, at most (8 bytes each for the values, the column indices
-/// and the stiffness of the part alone).
-const MAX_MATRIX_ENTRIES: usize = 120_000_000;
+/// Entries of the sparse stiffness, at most (8 bytes each for the values and the column
+/// indices: 2.9 GB).
+const MAX_MATRIX_ENTRIES: usize = 180_000_000;
 /// Quadrature points of one cut cell, at most.
 const MAX_CELL_POINTS: usize = 4_000_000;
-/// Cells integrated at a time: their matrices are in memory together.
-const BLOCK: usize = 16;
+/// Bytes of cell matrices in memory together: the cells are integrated in blocks of as many as
+/// fit (a cell's stiffness and its three support matrices), at least one and at most
+/// [`MOST_BLOCK`]. The block depends on the degree only, never on the threads, and the cells
+/// are assembled in order whatever it is.
+const BLOCK_BYTES: usize = 1 << 30;
+const MOST_BLOCK: usize = 256;
 /// Cells classified per parallel task.
 const GRAIN: usize = 4096;
 /// A point this close to a grid plane, as a fraction of the cell size, may be evaluated in the
@@ -55,6 +60,19 @@ impl Material {
     }
 }
 
+/// The material of the cell volume outside the part: the material itself with the fraction of
+/// its stiffness.
+fn fictitious_material(lame: &Lame, fraction: f64) -> Lame {
+    Lame { lambda: fraction * lame.lambda, mu: fraction * lame.mu }
+}
+
+/// The fraction of the fictitious stiffness at which the shear stiffness of the fictitious volume
+/// keeps the margin of [`Options::FICTITIOUS`] over the pivot tolerance for this material
+/// ([`Options::fictitious`]): `FICTITIOUS · (λ + 2μ) / 2μ`.
+fn margin_fraction(lame: &Lame) -> f64 {
+    Options::FICTITIOUS * (lame.lambda + 2.0 * lame.mu).max(2.0 * lame.mu) / (2.0 * lame.mu)
+}
+
 /// Prescribed displacement components of a face, in the global axes.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Support {
@@ -79,6 +97,24 @@ pub enum Load {
     Gravity { acceleration: [f64; 3] },
 }
 
+/// The shape functions every cell carries ([`Options::basis`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Basis {
+    /// The full tensor product of the one-dimensional functions of degree p: (p + 1)³ modes a
+    /// cell.
+    #[default]
+    Tensor,
+    /// The trunk space of Szabó and Babuška: the modes of the tensor product whose degrees sum
+    /// to at most p (the two linear functions of an axis not counted). It holds every polynomial
+    /// of total degree p with far fewer modes: 8 + 12 (p − 1) a cell up to degree 3, plus
+    /// 3 (p − 2)(p − 3) from degree 4 and (p − 3)(p − 4)(p − 5)/6 from degree 6 on (74 instead
+    /// of 216 at degree 5). Degree for degree it is less accurate than the tensor product. On
+    /// the benchmarks of `tests/benchmarks.rs` (NAFEMS LE1, a plate with a hole) it reaches the
+    /// tensor product's accuracy about two degrees higher, with half to three quarters of the
+    /// unknowns and half the factor's entries, in no less time: it saves memory, not time.
+    Trunk,
+}
+
 /// How the part is discretised.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Options {
@@ -86,20 +122,44 @@ pub struct Options {
     pub cell_size: f64,
     /// The polynomial degree of the shape functions, 1..=[`MAX_DEGREE`].
     pub degree: usize,
-    /// The depth of the octree under a cut cell, 0..=[`MAX_DEPTH`].
+    /// The depth of the octree under a cut cell where the surface in it is curved,
+    /// 0..=[`MAX_DEPTH`].
     pub depth: usize,
     /// The stiffness of the cell volume outside the part, as a fraction of the material's.
+    ///
+    /// **Nearly incompressible materials.** The factorization measures a pivot against the
+    /// diagonal entry of its equation, which the material's longitudinal stiffness λ + 2μ sets,
+    /// while the smallest pivot of an unknown that lives in the fictitious volume is set by the
+    /// fraction of the shear stiffness 2μ. As Poisson's ratio approaches one half their ratio
+    /// (λ + 2μ) / 2μ = (1 − ν) / (1 − 2ν) grows without bound (2500 at ν = 0.4999), and a
+    /// fraction that is safe for steel leaves the system singular to working precision. When
+    /// that happens the step is solved again with a hundred times the fraction, at most up to
+    /// `FICTITIOUS · (λ + 2μ) / 2μ`, where the fictitious shear stiffness has the margin over the
+    /// pivot tolerance that [`Options::FICTITIOUS`] gives a compressible material; a part that
+    /// is not held stays singular at any fraction. [`Stats::fictitious`] is the fraction the
+    /// solution was computed with. A larger fraction costs accuracy where a cell holds little
+    /// material, and the pressure of a nearly incompressible material shows it first: for a
+    /// block of ν = 0.4999 in tension whose worst cell holds 1.5 % material, the largest stress
+    /// error is 0.3 % of the stress at the fraction 1e-8, 1 % at 2.5e-7 and 8 % at 2.5e-5
+    /// (`tests/patch.rs`).
     pub fictitious: f64,
     /// Where the grid starts: this many cells before the lowest corner of the part's bounding
     /// box, each component in `[0, 1)`.
     pub offset: [f64; 3],
+    /// The shape functions of a cell.
+    pub basis: Basis,
 }
 
 impl Options {
     pub const DEGREE: usize = 3;
-    /// Flat faces are integrated exactly at any depth; a deeper octree shortens the lists of
-    /// triangles a leaf has to look at and costs more points.
-    pub const DEPTH: usize = 1;
+    /// Flat faces are integrated exactly without an octree, so it refines only where the
+    /// surface is curved ([`crate::grid`]), and there the depth sets the accuracy of the cell
+    /// matrices: with too shallow an octree the stress at a curved face moves erratically as
+    /// the degree is raised. Measured on a hole of the radius of one cell (`tests/hole.rs`,
+    /// `depth_of_the_octree`, degrees 3 to 5), the stress at the hole changes by up to 6 % from
+    /// depth 1 to 2, by less than 0.1 % from depth 2 to 3 and by less than 0.02 % from 3 to 4;
+    /// each level about doubles the points of the curved cells.
+    pub const DEPTH: usize = 3;
     /// The stiffness of a cut cell's volume outside the part keeps the unknowns of a cell that
     /// holds little material from being undetermined. The error it adds is of its own order, so
     /// it is as small as the factorization allows: two decades above the pivot the sparse
@@ -108,7 +168,7 @@ impl Options {
 
     /// The defaults with this cell size.
     pub fn new(cell_size: f64) -> Options {
-        Options { cell_size, degree: Options::DEGREE, depth: Options::DEPTH, fictitious: Options::FICTITIOUS, offset: [0.0; 3] }
+        Options { cell_size, degree: Options::DEGREE, depth: Options::DEPTH, fictitious: Options::FICTITIOUS, offset: [0.0; 3], basis: Basis::Tensor }
     }
 
     fn check(&self) -> Result<()> {
@@ -156,15 +216,32 @@ pub struct Stats {
     pub smallest_fraction: f64,
     /// The largest Nitsche parameter of a supported cell, a stiffness per area.
     pub largest_nitsche: f64,
+    /// The fictitious stiffness the solution was computed with: [`Options::fictitious`], or a
+    /// larger fraction when the system was singular to working precision at that one.
+    pub fictitious: f64,
+}
+
+/// How far two solutions of the same step are apart ([`Solution::change_from`]): an indicator
+/// of convergence, not a bound of the error.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Change {
+    /// The change of the strain energy, (U − U_coarser) / U.
+    pub strain_energy: f64,
+    /// The change of the largest von Mises stress over the points, (peak − peak_coarser) / peak.
+    pub peak_von_mises: f64,
+    /// The largest difference of the von Mises stress at any one of the points, as a fraction of
+    /// the peak.
+    pub von_mises: f64,
+    /// The points both solutions have a stress at.
+    pub points: usize,
 }
 
 /// A solved step.
 #[derive(Debug, Clone)]
 pub struct Solution {
     grid: Grid,
-    degree: usize,
+    shapes: Shapes,
     lame: Lame,
-    modes: usize,
     slot: Vec<u32>,
     cell_modes: Vec<usize>,
     /// Three displacement coefficients per mode.
@@ -214,9 +291,10 @@ impl Solution {
     /// The displacement and its gradient ∂uᵢ/∂xⱼ at `x`.
     fn field(&self, x: [f64; 3]) -> Option<([f64; 3], [[f64; 3]; 3])> {
         let (slot, xi) = self.locate(x)?;
-        let cell = self.cell_modes.get(slot * self.modes..(slot + 1) * self.modes)?;
+        let modes = self.shapes.len();
+        let cell = self.cell_modes.get(slot * modes..(slot + 1) * modes)?;
         let local = local_unknowns(cell, &self.u);
-        Some(cell::field(self.degree, xi, self.grid.spacing, &local))
+        Some(cell::field(&self.shapes, xi, self.grid.spacing, &local))
     }
 
     /// The displacement at a point of the part; `None` outside the cells that hold material. In
@@ -243,6 +321,51 @@ impl Solution {
     /// The von Mises stress at a point of the part.
     pub fn von_mises(&self, x: [f64; 3]) -> Option<f64> {
         self.stress(x).map(|s| fieldcraft_fem::von_mises(&s))
+    }
+
+    /// How far this solution is from a coarser one of the same step (the same part, material,
+    /// supports and loads; usually one degree lower on the same grid): the relative change of
+    /// the strain energy and of the von Mises stress at `points` (the points of interest, for
+    /// example the vertices of the part's surface).
+    ///
+    /// This is the p-extension's own check (B. Szabó, I. Babuška, *Finite Element Analysis*,
+    /// Wiley 1991: a sequence of solutions of rising degree on one mesh). For Galerkin solutions
+    /// in nested spaces under prescribed loads the energy of their difference is twice the
+    /// difference of their strain energies, so the square root of [`Change::strain_energy`] is
+    /// the distance between the two solutions in the energy norm, relative to the solution.
+    /// Here that holds approximately (the supports are imposed weakly and the cells' volume
+    /// outside the part has a small stiffness). The numbers tell how much the last refinement
+    /// still moved the result. They are an indicator, not a bound: a small change is necessary
+    /// for a converged result and does not prove one, and a stress at a sharp re-entrant edge
+    /// never settles. A ratio whose denominator is zero is zero when nothing changed and
+    /// infinite otherwise.
+    pub fn change_from(&self, coarser: &Solution, points: &[[f64; 3]]) -> Change {
+        let ratio = |change: f64, of: f64| {
+            if of != 0.0 {
+                change / of
+            } else if change == 0.0 {
+                0.0
+            } else {
+                f64::INFINITY
+            }
+        };
+        let (mut peak, mut peak_coarser, mut apart, mut count) = (0.0f64, 0.0f64, 0.0f64, 0usize);
+        for x in points {
+            let (Some(fine), Some(coarse)) = (self.von_mises(*x), coarser.von_mises(*x)) else { continue };
+            if !(fine.is_finite() && coarse.is_finite()) {
+                continue;
+            }
+            peak = peak.max(fine);
+            peak_coarser = peak_coarser.max(coarse);
+            apart = apart.max((fine - coarse).abs());
+            count += 1;
+        }
+        Change {
+            strain_energy: ratio(self.strain_energy - coarser.strain_energy, self.strain_energy),
+            peak_von_mises: ratio(peak - peak_coarser, peak),
+            von_mises: ratio(apart, peak),
+            points: count,
+        }
     }
 }
 
@@ -331,8 +454,9 @@ fn factor_error(e: FactorError) -> Error {
 /// What a cut cell contributes.
 struct CutCell {
     stiffness: Vec<f64>,
-    /// The stiffness of the part alone: no fictitious stiffness, no support terms.
-    physical: Vec<f64>,
+    /// The moments of the part in the cell: its stiffness alone, with no fictitious stiffness
+    /// and no support terms, is computed from them again for the strain energy.
+    inside: Moments,
     load: Vec<f64>,
     nitsche: f64,
     volume: f64,
@@ -355,9 +479,41 @@ pub fn solve(
 ) -> Result<Solution> {
     let lame = material.lame()?;
     options.check()?;
+    // The fictitious stiffness is as small as the factorization allows ([`Options::fictitious`]):
+    // the fraction asked for, then a hundred times more at a time up to the one that keeps the
+    // margin for this material. Each step multiplies the fraction, so the loop ends.
+    let most = margin_fraction(&lame).min(1.0);
+    let mut fictitious = options.fictitious;
+    loop {
+        match solve_at(surface, material, supports, loads, options, limits, fictitious) {
+            Err(Error::Singular(_)) if fictitious < most => fictitious = (fictitious * FICTITIOUS_STEP).min(most),
+            result => return result,
+        }
+    }
+}
+
+/// How much the fictitious stiffness is raised at a time when the system is singular to working
+/// precision: the two decades of margin [`Options::FICTITIOUS`] has over the pivot tolerance.
+const FICTITIOUS_STEP: f64 = 100.0;
+
+/// [`solve`] with the fictitious stiffness `fictitious` in place of the options'.
+fn solve_at(
+    surface: &BoundarySurface,
+    material: &Material,
+    supports: &[Support],
+    loads: &[Load],
+    options: &Options,
+    limits: &Limits,
+    fictitious: f64,
+) -> Result<Solution> {
+    let lame = material.lame()?;
+    options.check()?;
     let p = options.degree;
-    let m = modes(p);
+    let shapes =
+        Shapes::new(p, local_modes(p, options.basis == Basis::Trunk)).ok_or_else(|| Error::Internal("the cell's modes lack a vertex mode".into()))?;
+    let m = shapes.len();
     let n = 3 * m;
+    let block_size = (BLOCK_BYTES / (4 * 8 * n * n)).clamp(1, MOST_BLOCK);
 
     // The surface on the grid.
     let vertices = surface.points();
@@ -409,7 +565,7 @@ pub fn solve(
     .collect::<Result<Vec<Kind>>>()?;
 
     // The unknowns, numbered in a fill-reducing order.
-    let mut space = Space::new(&grid, &kinds, p);
+    let mut space = Space::new(&grid, &kinds, &shapes.modes);
     if space.active.is_empty() {
         return Err(Error::Invalid("no cell holds material: the surface must be closed and oriented outward".into()));
     }
@@ -442,14 +598,12 @@ pub fn solve(
         }
         graph.zero_matrix(&layout)
     };
-    // The stiffness of the part alone, on the same pattern: its values take the matrix's place
-    // while a cell is added to them.
-    let mut physical = vec![0.0; stiffness.val.len()];
     let mut load = vec![0.0; unknowns];
 
     // A cell wholly inside the part: every one has this matrix.
     let rule = gauss_legendre(p + 1);
     let surface_rule = gauss_legendre(2 * p + 1);
+    let (second_rule, third_rule) = (gauss_legendre(2 * p + 1), gauss_legendre(3 * p + 2));
     let mut whole = Vec::with_capacity(m);
     for (z, wz) in &rule {
         for (y, wy) in &rule {
@@ -460,10 +614,13 @@ pub fn solve(
     }
     let body_load =
         |shape_integrals: &[f64]| -> Vec<f64> { (0..n).map(|row| body[row % 3] * shape_integrals.get(row / 3).copied().unwrap_or(0.0)).collect() };
-    let reference = cell::integrate(p, h, &whole);
-    let reference_stiffness = cell::stiffness(m, &reference.inside, &lame);
-    let reference_load = body_load(&reference.body);
+    let (reference_stiffness, reference_load) = {
+        let mut scratch = Scratch::default();
+        let reference = cell::integrate(&shapes, &whole);
+        (cell::stiffness(&shapes, h, &reference.inside, &lame, &mut scratch), body_load(&cell::body(&shapes, h, &reference.inside, &mut scratch)))
+    };
 
+    let outside_material = fictitious_material(&lame, fictitious);
     let cut_cell = |slot: usize| -> Result<Option<CutCell>> {
         let Some(&index) = space.active.get(slot) else { return Err(Error::Internal("an active cell is missing".into())) };
         if kinds.get(index) != Some(&Kind::Cut) {
@@ -473,19 +630,26 @@ pub fn solve(
         let corner = grid.lo(ijk);
         let touching = sorted.touching.get(index).map(Vec::as_slice).unwrap_or_default();
         let pieces = sorted.pieces.get(index).map(Vec::as_slice).unwrap_or_default();
-        let points = grid::cut_quadrature(corner, h, touching, &on_grid, &solid, &rule, options.depth, MAX_CELL_POINTS)?;
-        let volume = cell::integrate(p, h, &points);
-        let physical = cell::stiffness(m, &volume.inside, &lame);
-        let outside = cell::stiffness(m, &volume.outside, &lame);
-        let mut stiffness: Vec<f64> = physical.iter().zip(&outside).map(|(inside, outside)| inside + options.fictitious * outside).collect();
-        let mut load = body_load(&volume.body);
-        let boundary = cell::boundary(p, corner, h, pieces, &on_surface, &lame, &surface_rule);
+        let mut volume = cell::Volume::new(&shapes);
+        let rules = [&rule[..], &second_rule[..], &third_rule[..]];
+        let points =
+            grid::visit_cut_quadrature(corner, h, touching, &on_grid, &solid, rules, options.depth, MAX_CELL_POINTS, |point| volume.add(&point))?;
+        let mut scratch = Scratch::default();
+        let mut stiffness = cell::stiffness(&shapes, h, &volume.inside, &lame, &mut scratch);
+        if !volume.outside.is_zero() {
+            let outside = cell::stiffness(&shapes, h, &volume.outside, &outside_material, &mut scratch);
+            for (total, fictitious) in stiffness.iter_mut().zip(&outside) {
+                *total += fictitious;
+            }
+        }
+        let mut load = body_load(&cell::body(&shapes, h, &volume.inside, &mut scratch));
+        let boundary = cell::boundary(&shapes, corner, h, pieces, &on_surface, &lame, &surface_rule, &mut scratch);
         for (total, surface_load) in load.iter_mut().zip(&boundary.load) {
             *total += surface_load;
         }
         let mut nitsche = 0.0;
         if !boundary.traction.is_empty() {
-            nitsche = cell::nitsche_parameter(p, &stiffness, &boundary.traction).ok_or_else(|| {
+            nitsche = cell::nitsche_parameter(&shapes, &stiffness, &boundary.traction).ok_or_else(|| {
                 Error::Singular(format!(
                     "cell ({}, {}, {}) holds so little material that its stiffness is singular to working precision (move the grid with the offset, or raise the fictitious stiffness)",
                     ijk[0], ijk[1], ijk[2]
@@ -498,7 +662,7 @@ pub fn solve(
                 *total += consistency + nitsche * penalty;
             }
         }
-        Ok(Some(CutCell { stiffness, physical, load, nitsche, volume: volume.volume, points: points.len() }))
+        Ok(Some(CutCell { stiffness, load, nitsche, volume: 0.125 * h * h * h * volume.inside.total(), points, inside: volume.inside }))
     };
 
     // Assembly, cells in order.
@@ -513,24 +677,22 @@ pub fn solve(
         surface_volume: surface.volume(),
         smallest_fraction: 1.0,
         largest_nitsche: 0.0,
+        fictitious,
     };
     let mut nitsche = vec![0.0; space.active.len()];
-    for block in fieldcraft_parallel::blocks(space.active.len(), BLOCK) {
+    let mut inside: Vec<Option<Moments>> = vec![None; space.active.len()];
+    for block in fieldcraft_parallel::blocks(space.active.len(), block_size) {
         let first = block.start;
         let cells = fieldcraft_parallel::map(block.len(), |i| cut_cell(first + i));
         for (i, cut) in cells.into_iter().enumerate() {
             let cut = cut?;
             let slot = first + i;
             let nodes = space.cell(slot);
-            let (cell_stiffness, cell_physical, cell_load) = match &cut {
-                Some(cut) => (&cut.stiffness, &cut.physical, &cut.load),
-                None => (&reference_stiffness, &reference_stiffness, &reference_load),
+            let (cell_stiffness, cell_load) = match &cut {
+                Some(cut) => (&cut.stiffness, &cut.load),
+                None => (&reference_stiffness, &reference_load),
             };
             add_block(&mut stiffness, &layout, nodes, DofSet::TRANSLATIONS, cell_stiffness)?;
-            std::mem::swap(&mut stiffness.val, &mut physical);
-            let added = add_block(&mut stiffness, &layout, nodes, DofSet::TRANSLATIONS, cell_physical);
-            std::mem::swap(&mut stiffness.val, &mut physical);
-            added?;
             for (a, mode) in nodes.iter().enumerate() {
                 for i in 0..3 {
                     if let (Some(total), Some(value)) = (load.get_mut(3 * mode + i), cell_load.get(3 * a + i)) {
@@ -538,7 +700,7 @@ pub fn solve(
                     }
                 }
             }
-            match &cut {
+            match cut {
                 Some(cut) => {
                     stats.cut_cells += 1;
                     stats.quadrature_points += cut.points;
@@ -547,6 +709,9 @@ pub fn solve(
                     stats.largest_nitsche = stats.largest_nitsche.max(cut.nitsche);
                     if let Some(parameter) = nitsche.get_mut(slot) {
                         *parameter = cut.nitsche;
+                    }
+                    if let Some(moments) = inside.get_mut(slot) {
+                        *moments = Some(cut.inside);
                     }
                 }
                 None => {
@@ -564,31 +729,64 @@ pub fn solve(
     let mut u = load;
     factor.solve(&mut u)?;
     drop(factor);
+    drop(stiffness);
     if u.iter().any(|x| !x.is_finite()) {
         return Err(Error::Singular("the solution is not finite: the stiffness is singular to working precision".into()));
     }
 
-    // The strain energy of the part: ½ uᵀ K u with the stiffness of the part alone.
-    std::mem::swap(&mut stiffness.val, &mut physical);
-    drop(physical);
-    stiffness.mirror_lower();
-    let mut forces = vec![0.0; unknowns];
-    stiffness.mul(&u, &mut forces);
-    drop(stiffness);
-    let strain_energy = 0.5 * u.iter().zip(&forces).map(|(x, y)| x * y).sum::<f64>();
+    // The strain energy of the part: ½ uᵀ K u cell by cell, with the stiffness of the part alone.
+    let mut strain_energy = 0.0;
+    for block in fieldcraft_parallel::blocks(space.active.len(), block_size) {
+        let first = block.start;
+        let energies = fieldcraft_parallel::map(block.len(), |i| {
+            let slot = first + i;
+            let local = local_unknowns(space.cell(slot), &u);
+            let own;
+            let k = match inside.get(slot).and_then(Option::as_ref) {
+                Some(moments) => {
+                    own = cell::stiffness(&shapes, h, moments, &lame, &mut Scratch::default());
+                    &own
+                }
+                None => &reference_stiffness,
+            };
+            let mut energy = 0.0;
+            for (row, x) in k.chunks_exact(n).zip(&local) {
+                energy += x * row.iter().zip(&local).map(|(a, b)| a * b).sum::<f64>();
+            }
+            0.5 * energy
+        });
+        for energy in energies {
+            strain_energy += energy;
+        }
+    }
+    drop(inside);
 
     // The reactions of the supported faces.
+    let pieces_of = |slot: usize| space.active.get(slot).and_then(|index| sorted.pieces.get(*index)).map(Vec::as_slice).unwrap_or_default();
+    let supported: Vec<usize> = (0..space.active.len()).filter(|slot| on_surface.supports(pieces_of(*slot))).collect();
     let mut reactions: BTreeMap<u32, [f64; 3]> = BTreeMap::new();
-    for (slot, &index) in space.active.iter().enumerate() {
-        let pieces = sorted.pieces.get(index).map(Vec::as_slice).unwrap_or_default();
-        if !on_surface.supports(pieces) {
-            continue;
+    for block in fieldcraft_parallel::blocks(supported.len(), block_size) {
+        let first = block.start;
+        let cells = fieldcraft_parallel::map(block.len(), |i| {
+            let mut own: BTreeMap<u32, [f64; 3]> = BTreeMap::new();
+            let Some(&slot) = supported.get(first + i) else { return own };
+            let Some(&index) = space.active.get(slot) else { return own };
+            let local = local_unknowns(space.cell(slot), &u);
+            let parameter = nitsche.get(slot).copied().unwrap_or(0.0);
+            cell::reaction(&shapes, grid.lo(grid.coords(index)), h, pieces_of(slot), &on_surface, &lame, &surface_rule, parameter, &local, &mut own);
+            own
+        });
+        // Cell by cell, in order.
+        for own in cells {
+            for (face, force) in own {
+                let total = reactions.entry(face).or_insert([0.0; 3]);
+                for i in 0..3 {
+                    total[i] += force[i];
+                }
+            }
         }
-        let local = local_unknowns(space.cell(slot), &u);
-        let parameter = nitsche.get(slot).copied().unwrap_or(0.0);
-        cell::reaction(p, grid.lo(grid.coords(index)), h, pieces, &on_surface, &lame, &surface_rule, parameter, &local, &mut reactions);
     }
     let reactions = reactions.into_iter().map(|(face, force)| Reaction { face, force }).collect();
 
-    Ok(Solution { grid, degree: p, lame, modes: m, slot: space.slot, cell_modes: space.cell_modes, u, stats, strain_energy, reactions })
+    Ok(Solution { grid, shapes, lame, slot: space.slot, cell_modes: space.cell_modes, u, stats, strain_energy, reactions })
 }

@@ -12,7 +12,7 @@
 mod common;
 
 use common::{X_HI, X_LO, Y_LO, Z_LO, block};
-use fieldcraft_fcm::{Error, Load, Material, Options, Solution, Support, solve};
+use fieldcraft_fcm::{Basis, Error, Load, Material, Options, Solution, Support, solve};
 use fieldcraft_solver::Limits;
 
 const STEEL: Material = Material { young: 210e9, poisson: 0.3, density: 7850.0 };
@@ -117,6 +117,86 @@ fn constant_stress_with_faces_anywhere() {
         assert!((solution.stats.volume - SIZE[0] * SIZE[1] * SIZE[2]).abs() < 1e-13);
         check(&format!("anywhere, degree {degree}, depth {depth}"), &solution, 5e-3);
     }
+}
+
+/// The trunk space holds the linear displacement too: the same patch with far fewer unknowns
+/// than the tensor product of the same degree.
+#[test]
+fn constant_stress_in_the_trunk_space() {
+    for degree in [2, 4] {
+        let options = Options { degree, basis: Basis::Trunk, offset: [0.31, 0.62, 0.13], ..Options::new(0.25) };
+        let solution = tension(&options).unwrap();
+        assert!((solution.stats.volume - SIZE[0] * SIZE[1] * SIZE[2]).abs() < 1e-13);
+        let full = tension(&Options { basis: Basis::Tensor, ..options }).unwrap().stats.unknowns;
+        assert!(solution.stats.unknowns < full, "degree {degree}: {} trunk unknowns, {full} of the tensor product", solution.stats.unknowns);
+        check(&format!("trunk, degree {degree}"), &solution, 5e-3);
+    }
+    // On grid planes the answer is exact, as with the tensor product.
+    let options = Options { degree: 3, basis: Basis::Trunk, ..Options::new(0.25) };
+    check("trunk on grid planes", &tension(&options).unwrap(), 1e-10);
+}
+
+/// A nearly incompressible block cut by the grid: its constant stress is found at the default
+/// fictitious stiffness, to a few tenths of a per cent where a cell holds 1.5 % material (the
+/// pressure, bulk modulus times a change of volume, shows the fictitious stiffness first), and
+/// a larger fictitious stiffness costs accuracy there.
+#[test]
+fn a_nearly_incompressible_block_keeps_its_constant_stress() {
+    let rubber = Material { young: 2e6, poisson: 0.4999, density: 1000.0 };
+    let loads = [Load::Traction { face: X_HI, traction: [STRESS, 0.0, 0.0] }];
+    let errors = |degree: usize, fictitious: f64| -> (f64, f64) {
+        let options = Options { degree, fictitious, offset: [0.31, 0.62, 0.13], ..Options::new(0.25) };
+        let solution = solve(&block([0.0; 3], SIZE), &rubber, &sliding(), &loads, &options, &Limits::default()).unwrap();
+        assert_eq!(solution.stats.fictitious, fictitious, "solved at the fraction asked for");
+        let (mut displacement, mut stress) = (0.0f64, 0.0f64);
+        for fractions in [[0.0, 0.0, 0.0], [0.31, 0.6, 0.41], [1.0, 1.0, 1.0], [0.88, 0.23, 0.0]] {
+            let x = [fractions[0] * SIZE[0], fractions[1] * SIZE[1], fractions[2] * SIZE[2]];
+            let exact =
+                [STRESS * x[0] / rubber.young, -rubber.poisson * STRESS * x[1] / rubber.young, -rubber.poisson * STRESS * x[2] / rubber.young];
+            let (u, s) = (solution.displacement(x).unwrap(), solution.stress(x).unwrap());
+            for i in 0..3 {
+                displacement = displacement.max((u[i] - exact[i]).abs() / (STRESS * SIZE[0] / rubber.young));
+            }
+            stress = stress.max((s[0] - STRESS).abs() / STRESS);
+            for component in &s[1..] {
+                stress = stress.max(component.abs() / STRESS);
+            }
+        }
+        println!(
+            "nearly incompressible, degree {degree}, fictitious {fictitious:.1e}: displacement error {displacement:.2e}, stress error {stress:.2e}"
+        );
+        (displacement, stress)
+    };
+    for degree in [2, 4] {
+        let (displacement, stress) = errors(degree, Options::FICTITIOUS);
+        assert!(displacement < 1e-4 && stress < 5e-3, "degree {degree}: displacement error {displacement:.3e}, stress error {stress:.3e}");
+    }
+    let (_, raised) = errors(4, 2500.0 * Options::FICTITIOUS);
+    assert!(raised > 0.02 && raised < 0.2, "the fictitious stiffness that keeps the pivot margin at ν = 0.4999: stress error {raised:.3e}");
+}
+
+/// The same bits on one thread and on several: cells are integrated in parallel and assembled in
+/// order.
+#[test]
+fn the_result_does_not_depend_on_the_threads() {
+    let run = |threads: usize| {
+        fieldcraft_parallel::with_threads(threads, || {
+            let options = Options { degree: 3, basis: Basis::Trunk, offset: [0.31, 0.62, 0.13], ..Options::new(0.25) };
+            let solution = tension(&options).unwrap();
+            let mut bits = vec![solution.strain_energy.to_bits()];
+            for reaction in &solution.reactions {
+                bits.extend(reaction.force.map(f64::to_bits));
+            }
+            for x in [[0.0; 3], [0.3, 0.2, 0.1], SIZE] {
+                bits.extend(solution.displacement(x).unwrap().map(f64::to_bits));
+                bits.extend(solution.stress(x).unwrap().map(f64::to_bits));
+            }
+            bits
+        })
+    };
+    let one = run(1);
+    assert_eq!(one, run(2));
+    assert_eq!(one, run(7));
 }
 
 #[test]

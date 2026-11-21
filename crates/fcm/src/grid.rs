@@ -17,33 +17,43 @@
 //!
 //! # Quadrature of a cut cell
 //! The integrand of a cut cell jumps at the surface, which Gauss quadrature over the whole cell
-//! would integrate badly. The cell is divided into an octree instead (Düster et al. 2008):
-//! a box the surface reaches is split into eight, down to a depth limit, and every leaf gets the
-//! Gauss rule of the cell's degree. A leaf the surface does not reach is wholly inside or
-//! outside by its centre. Whether a triangle reaches a box is the separating axis test for a
-//! triangle and a box (T. Akenine-Möller, *Fast 3D triangle-box overlap testing*, J. Graphics
-//! Tools 6(1):29–33, 2001) in floating point, with the box grown slightly: it decides only where
-//! the octree refines, never which side a point is on.
-//!
-//! In a leaf the surface does reach, testing each Gauss point on its own would be first order in
-//! the leaf size: the jump lies somewhere between two points. The leaf is integrated one axis at
-//! a time instead (Fubini's theorem), each axis split where the integrand is not smooth:
+//! would integrate badly. A box the surface reaches is integrated one axis at a time instead
+//! (Fubini's theorem), each axis split where the integrand is not smooth:
 //! - along a line, where it pierces a triangle, so every segment lies on one side of the surface.
 //!   The segment's ends come from the triangles in floating point; which side it is on is the
 //!   exact inside test of its midpoint;
 //! - across the lines, the integral along a line is smooth except where a face ends or turns: at
 //!   a feature edge of the surface (the boundary of a B-rep face, or a crease inside one), at an
-//!   edge where the surface turns back along the lines, and where the surface leaves the leaf
+//!   edge where the surface turns back along the lines, and where the surface leaves the box
 //!   through one of the faces the lines end on. The second axis is split where such an edge
-//!   crosses, and the third at the ends of those edges.
+//!   crosses, and the third at the ends of those edges and where two of them cross.
 //!
-//! Every interval gets the Gauss rule of the cell's degree. The lines run along the axis the
-//! leaf's triangles face most. For a part with flat faces this gives the volume exactly (up to
-//! sixteen intervals an axis of a leaf; beyond that, the closest split points are merged). The
-//! edges between the facets of a smooth curved face are not split at, or the points would grow
-//! with the square of the tessellation's fineness: the integral along a line differs from that
-//! of the smooth face by at most the chordal tolerance, so what the rule misses there is of the
-//! order of the tessellation's own error, and it falls with the leaf size.
+//! The lines run along the axis the box's triangles face most.
+//!
+//! **Flat faces are integrated exactly.** The integrand of a cell matrix is a polynomial of
+//! degree 2p along each axis. Along a line, a Gauss rule of p + 1 points integrates it exactly.
+//! Where the surface is flat, the end of a line's segment is a linear function of the other two
+//! coordinates, so the integral along the line is a polynomial of degree 4p + 1 in the second
+//! coordinate; between two edges, which are straight, its integral is in turn a polynomial of
+//! degree 6p + 2 in the third. Rules of 2p + 1 and 3p + 2 points across the lines therefore
+//! integrate a cell cut by flat faces exactly, whatever their directions (up to sixteen
+//! intervals an axis of a box; beyond that, the closest split points are merged). With p + 1
+//! points across the lines only the volume and faces along the axes would be exact, and the
+//! matrices of the higher modes of a cell cut at an angle would not.
+//!
+//! **Curved faces need the octree.** The edges between the facets of a smooth curved face are
+//! not split at, or the points would grow with the square of the tessellation's fineness. The
+//! integral across the lines is then smooth but no polynomial, and what the rules miss falls
+//! with the size of the box. So a box in which the surface is curved (two of its triangles that
+//! meet in an edge that is no feature edge face different ways) is divided into eight, down to
+//! a depth limit (the octree of Düster et al. 2008, refined only where it is needed); a box of
+//! flat faces is not divided. A box the surface does not reach is wholly inside or outside by
+//! its centre and gets the Gauss rule of the cell's degree. Whether a triangle reaches a box is
+//! the separating axis test for a triangle and a box (T. Akenine-Möller, *Fast 3D triangle-box
+//! overlap testing*, J. Graphics Tools 6(1):29–33, 2001) in floating point, with the box grown
+//! slightly: it decides only where the octree refines, never which side a point is on. With too
+//! shallow an octree the matrices of a cell cut by a curved face are inexact, the more so the
+//! higher the degree, and the stress there moves erratically from degree to degree.
 
 use std::collections::BTreeSet;
 
@@ -347,8 +357,9 @@ pub fn feature_flags(surface: &BoundarySurface) -> Vec<[bool; 3]> {
 }
 
 /// The quadrature points of the cell at `lo` with size `h`: an octree of at most `depth` levels
-/// refined where the triangles `touching` (indices into the surface's) reach, with the Gauss
-/// `rule` in every leaf.
+/// refined where the surface of the triangles `touching` (indices into the surface's) is curved,
+/// with the Gauss `rule` in every leaf and along and across the lines of a leaf the surface
+/// reaches (which is exact for flat faces along the axes only: see [`visit_cut_quadrature`]).
 pub fn cut_quadrature(
     lo: [f64; 3],
     h: f64,
@@ -359,11 +370,33 @@ pub fn cut_quadrature(
     depth: usize,
     max_points: usize,
 ) -> Result<Vec<QuadPoint>> {
+    let mut points = Vec::new();
+    visit_cut_quadrature(lo, h, touching, surface, solid, [rule, rule, rule], depth, max_points, |point| points.push(point))?;
+    Ok(points)
+}
+
+/// [`cut_quadrature`] with a Gauss rule for each direction of a leaf, handing every point to
+/// `visit` instead of collecting them; the number of points is returned. `rules[0]` is the rule
+/// of a leaf the surface does not reach and of the lines through one it does; `rules[1]` and
+/// `rules[2]` are the rules across the lines, along the second and the third axis.
+#[allow(clippy::too_many_arguments)]
+pub fn visit_cut_quadrature(
+    lo: [f64; 3],
+    h: f64,
+    touching: &[u32],
+    surface: &Triangles,
+    solid: &Solid,
+    rules: [&[(f64, f64)]; 3],
+    depth: usize,
+    max_points: usize,
+    mut visit: impl FnMut(QuadPoint),
+) -> Result<usize> {
     let depth = depth.min(MAX_DEPTH);
     let triangles = surface.corners;
     let physical = |xi: [f64; 3]| [lo[0] + 0.5 * (xi[0] + 1.0) * h, lo[1] + 0.5 * (xi[1] + 1.0) * h, lo[2] + 0.5 * (xi[2] + 1.0) * h];
+    let [rule, second_rule, third_rule] = rules;
     let per_leaf = rule.len() * rule.len() * rule.len();
-    let mut points = Vec::new();
+    let mut count = 0usize;
     // Boxes still to do: the lowest corner in natural coordinates, the level and the triangles
     // that reach the parent. Children are pushed last to first, so they are done in order.
     let mut stack: Vec<([f64; 3], usize, Vec<u32>)> = vec![([-1.0; 3], 0, touching.to_vec())];
@@ -374,7 +407,7 @@ pub fn cut_quadrature(
         let reach = [0.5 * half * h * (1.0 + GROW); 3];
         let cut: Vec<u32> =
             candidates.into_iter().filter(|t| triangles.get(*t as usize).is_some_and(|triangle| overlaps(triangle, centre, reach))).collect();
-        if !cut.is_empty() && level < depth {
+        if level < depth && curved(&cut, surface) {
             for child in (0..8usize).rev() {
                 let shift = |bit: usize| if (child >> bit) & 1 == 1 { half } else { 0.0 };
                 stack.push(([corner[0] + shift(0), corner[1] + shift(1), corner[2] + shift(2)], level + 1, cut.clone()));
@@ -384,15 +417,16 @@ pub fn cut_quadrature(
         let full = || Error::Limit(format!("a cut cell needs more than {max_points} quadrature points (lower the octree depth or the degree)"));
         if cut.is_empty() {
             // The surface does not reach the leaf: one side, the Gauss rule of the box.
-            if points.len() + per_leaf > max_points {
+            if count + per_leaf > max_points {
                 return Err(full());
             }
+            count += per_leaf;
             let inside = solid.contains(centre)?;
             for (gz, wz) in rule {
                 for (gy, wy) in rule {
                     for (gx, wx) in rule {
                         let xi = [corner[0] + half * (gx + 1.0), corner[1] + half * (gy + 1.0), corner[2] + half * (gz + 1.0)];
-                        points.push(QuadPoint { xi, weight: wx * wy * wz * half * half * half, inside });
+                        visit(QuadPoint { xi, weight: wx * wy * wz * half * half * half, inside });
                     }
                 }
             }
@@ -460,10 +494,21 @@ pub fn cut_quadrature(
         // third axis at the edges' ends, then the second where an edge crosses.
         let mut third = vec![leaf_lo[c], leaf_hi[c]];
         third.extend(edges.iter().flatten().map(|end| end[1]).filter(|at| *at > leaf_lo[c] && *at < leaf_hi[c]));
+        // And where two of the edges cross: the order in which a line across meets them changes
+        // there.
+        if edges.len() <= MOST_CROSSING {
+            for (i, first) in edges.iter().enumerate() {
+                for second in edges.iter().skip(i + 1) {
+                    if let Some(at) = crossing(first, second).filter(|at| *at > leaf_lo[c] && *at < leaf_hi[c]) {
+                        third.push(at);
+                    }
+                }
+            }
+        }
         thin(&mut third, tiny);
         let (mut second, mut first): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
         for span_c in third.windows(2) {
-            for (gc, wc) in rule {
+            for (gc, wc) in third_rule {
                 let at_c = 0.5 * (span_c[0] + span_c[1]) + 0.5 * (span_c[1] - span_c[0]) * gc;
                 let weight_c = wc * (span_c[1] - span_c[0]) / h;
                 second.clear();
@@ -478,7 +523,7 @@ pub fn cut_quadrature(
                 }
                 thin(&mut second, tiny);
                 for span_b in second.windows(2) {
-                    for (gb, wb) in rule {
+                    for (gb, wb) in second_rule {
                         let at_b = 0.5 * (span_b[0] + span_b[1]) + 0.5 * (span_b[1] - span_b[0]) * gb;
                         let weight_b = wb * (span_b[1] - span_b[0]) / h;
                         // Along the line, split where it pierces a triangle.
@@ -493,7 +538,7 @@ pub fn cut_quadrature(
                             }
                         }
                         tidy(&mut first, tiny);
-                        if points.len() + first.len() * rule.len() > max_points {
+                        if count + first.len() * rule.len() > max_points {
                             return Err(full());
                         }
                         let mut x = [0.0; 3];
@@ -506,15 +551,58 @@ pub fn cut_quadrature(
                                 let mut at = x;
                                 at[axis] += 0.5 * (span[1] - span[0]) * g;
                                 let xi = [2.0 * (at[0] - lo[0]) / h - 1.0, 2.0 * (at[1] - lo[1]) / h - 1.0, 2.0 * (at[2] - lo[2]) / h - 1.0];
-                                points.push(QuadPoint { xi, weight: weight_b * weight_c * w * (span[1] - span[0]) / h, inside });
+                                visit(QuadPoint { xi, weight: weight_b * weight_c * w * (span[1] - span[0]) / h, inside });
                             }
+                            count += rule.len();
                         }
                     }
                 }
             }
         }
     }
-    Ok(points)
+    Ok(count)
+}
+
+/// Leaves with more edges than this are not searched for crossing edges (the search is
+/// quadratic): so many edges are the facets of a curved face seen edge-on, which [`thin`] merges.
+const MOST_CROSSING: usize = 64;
+
+/// Where two segments in the plane across the lines cross, strictly inside both: the second
+/// coordinate of the point.
+fn crossing(first: &[[f64; 2]; 2], second: &[[f64; 2]; 2]) -> Option<f64> {
+    let [p, q] = *first;
+    let [r, s] = *second;
+    let (d, e) = ([q[0] - p[0], q[1] - p[1]], [s[0] - r[0], s[1] - r[1]]);
+    let denominator = d[0] * e[1] - d[1] * e[0];
+    if denominator == 0.0 || !denominator.is_finite() {
+        return None;
+    }
+    let along_first = ((r[0] - p[0]) * e[1] - (r[1] - p[1]) * e[0]) / denominator;
+    let along_second = ((r[0] - p[0]) * d[1] - (r[1] - p[1]) * d[0]) / denominator;
+    (along_first > 0.0 && along_first < 1.0 && along_second > 0.0 && along_second < 1.0).then(|| p[1] + along_first * d[1])
+}
+
+/// Two triangles whose unit normals differ by less than this angle (its square, in radians)
+/// across a smooth edge are one flat face to the octree.
+const FLAT: f64 = 1e-12; // unit-factors: an angle squared
+
+/// Whether the surface is curved where these triangles are: two of them that meet in an edge
+/// that is not a feature edge face different ways. A leaf of flat faces only is integrated
+/// exactly without refining it; this decides only where the octree refines.
+fn curved(cut: &[u32], surface: &Triangles) -> bool {
+    cut.iter().any(|t| {
+        let index = *t as usize;
+        let (Some(normal), Some(across), Some(feature)) = (surface.normals.get(index), surface.across.get(index), surface.feature.get(index)) else {
+            return false;
+        };
+        (0..3).any(|edge| {
+            !feature[edge]
+                && surface.normals.get(across[edge] as usize).is_some_and(|other| {
+                    let turn = cross(*normal, *other);
+                    dot(turn, turn) > FLAT
+                })
+        })
+    })
 }
 
 /// Split points closer than this fraction of the leaf are one.
@@ -596,6 +684,111 @@ mod tests {
         assert!(matches!(Grid::over([0.0; 3], [1.0; 3], f64::NAN, [0.0; 3], 1000), Err(Error::Invalid(_))));
         assert!(matches!(Grid::over([0.0; 3], [1.0; 3], 0.5, [1.0, 0.0, 0.0], 1000), Err(Error::Invalid(_))));
         assert!(matches!(Grid::over([1e20; 3], [1e20; 3], 1.0, [0.0; 3], 1000), Err(Error::Invalid(_))));
+    }
+
+    /// The tetrahedron between the coordinate planes and the plane through `reach` on the axes,
+    /// as a surface with outward triangles.
+    fn corner(reach: [f64; 3]) -> BoundarySurface {
+        let points = [[0.0; 3], [reach[0], 0.0, 0.0], [0.0, reach[1], 0.0], [0.0, 0.0, reach[2]]];
+        let triangles = [[0, 3, 2], [0, 1, 3], [0, 2, 1], [1, 2, 3]];
+        BoundarySurface::new(&points, &triangles, &[0, 1, 2, 3], &fieldcraft_mesh::surface::SurfaceOptions::default()).unwrap()
+    }
+
+    /// ∫ xᵃ yᵇ zᶜ over the part of a cell inside `surface`, by the cut-cell quadrature for
+    /// degree `p` (or with the rule of p + 1 points in every direction), and the points used.
+    fn monomial(surface: &BoundarySurface, lo: [f64; 3], h: f64, p: usize, powers: [i32; 3], depth: usize, plain: bool) -> (f64, usize) {
+        let corners: Vec<[[f64; 3]; 3]> = surface.triangles().iter().map(|t| t.map(|v| surface.points()[v as usize])).collect();
+        let normals: Vec<[f64; 3]> = corners
+            .iter()
+            .map(|t| {
+                let n = cross(sub(t[1], t[0]), sub(t[2], t[0]));
+                let length = dot(n, n).sqrt();
+                n.map(|x| x / length)
+            })
+            .collect();
+        let feature = feature_flags(surface);
+        let triangles = Triangles { corners: &corners, normals: &normals, across: surface.neighbors(), feature: &feature };
+        let solid = Solid::new(surface).unwrap();
+        let touching: Vec<u32> = (0..corners.len() as u32).collect();
+        let rules = [crate::gauss::gauss_legendre(p + 1), crate::gauss::gauss_legendre(2 * p + 1), crate::gauss::gauss_legendre(3 * p + 2)];
+        let rules = if plain { [&rules[0][..], &rules[0][..], &rules[0][..]] } else { [&rules[0][..], &rules[1][..], &rules[2][..]] };
+        let mut sum = 0.0;
+        let count = visit_cut_quadrature(lo, h, &touching, &triangles, &solid, rules, depth, 10_000_000, |point| {
+            if point.inside {
+                let x = [0, 1, 2].map(|a| lo[a] + 0.5 * (point.xi[a] + 1.0) * h);
+                sum += point.weight * 0.125 * h * h * h * x[0].powi(powers[0]) * x[1].powi(powers[1]) * x[2].powi(powers[2]);
+            }
+        })
+        .unwrap();
+        (sum, count)
+    }
+
+    /// A cell cut by an inclined flat face: every monomial of degree 2p along each axis, which
+    /// is what a product of two shape functions holds, is integrated exactly, with no octree.
+    /// ∫ xᵃ yᵇ zᶜ over the tetrahedron is Xᵃ⁺¹ Yᵇ⁺¹ Zᶜ⁺¹ a! b! c! / (a + b + c + 3)!.
+    #[test]
+    fn a_cell_cut_by_an_inclined_flat_face_is_integrated_exactly() {
+        let reach = [0.7, 0.6, 0.5];
+        let surface = corner(reach);
+        let (lo, h) = ([-0.1, -0.2, -0.15], 1.0);
+        let factorial = |n: i32| (1..=n).map(f64::from).product::<f64>();
+        for p in [1, 2, 3] {
+            let top = 2 * p as i32;
+            for powers in [[0, 0, 0], [top, 0, 0], [0, top, 1], [1, 2, top], [top, top, top], [top - 1, top, top - 1]] {
+                let [a, b, c] = powers;
+                let exact = reach[0].powi(a + 1) * reach[1].powi(b + 1) * reach[2].powi(c + 1) * factorial(a) * factorial(b) * factorial(c)
+                    / factorial(a + b + c + 3);
+                let (sum, count) = monomial(&surface, lo, h, p, powers, 0, false);
+                assert!((sum - exact).abs() < 1e-12 * exact, "degree {p}, powers {powers:?}: {sum} vs {exact}");
+                // Flat faces: a deeper octree is not used.
+                assert_eq!(monomial(&surface, lo, h, p, powers, 3, false).1, count);
+            }
+            // The rule of p + 1 points across the lines gives the volume and no more.
+            let (volume, _) = monomial(&surface, lo, h, p, [0, 0, 0], 0, true);
+            assert!((volume - reach[0] * reach[1] * reach[2] / 6.0).abs() < 1e-14);
+            let exact = (reach[0] * reach[1] * reach[2]).powi(top + 1) * factorial(top).powi(3) / factorial(3 * top + 3);
+            let (plain, _) = monomial(&surface, lo, h, p, [top, top, top], 0, true);
+            assert!((plain - exact).abs() > 1e-6 * exact, "degree {p}: the plain rule is not exact, {plain} vs {exact}");
+        }
+    }
+
+    /// A curved face (a prism of many sides, its side one smooth face) refines the octree down
+    /// to the depth limit.
+    #[test]
+    fn the_octree_refines_where_the_surface_is_curved() {
+        const SIDES: usize = 48;
+        let (radius, height) = (0.8, 0.5);
+        let mut points = vec![[0.0, 0.0, 0.0], [0.0, 0.0, height]];
+        for i in 0..SIDES {
+            let angle = 2.0 * std::f64::consts::PI * i as f64 / SIDES as f64;
+            points.push([radius * angle.cos(), radius * angle.sin(), 0.0]);
+            points.push([radius * angle.cos(), radius * angle.sin(), height]);
+        }
+        let (mut triangles, mut tags) = (Vec::new(), Vec::new());
+        for i in 0..SIDES as u32 {
+            let (a, b) = (2 + 2 * i, 2 + 2 * ((i + 1) % SIDES as u32));
+            triangles.extend([[0, b, a], [1, a + 1, b + 1], [a, b, b + 1], [a, b + 1, a + 1]]);
+            tags.extend([0, 1, 2, 2]);
+        }
+        let surface = BoundarySurface::new(&points, &triangles, &tags, &fieldcraft_mesh::surface::SurfaceOptions::default()).unwrap();
+        // The regular polygon's x² over its area: A (R² / 12)(2 + cos(2π/n)), A its area.
+        let turn = 2.0 * std::f64::consts::PI / SIDES as f64;
+        let area = 0.5 * SIDES as f64 * radius * radius * turn.sin();
+        let exact = height * area * radius * radius / 12.0 * (2.0 + turn.cos());
+        let (lo, h) = ([-1.0, -1.1, -0.2], 2.0);
+        // The facets' edges are not split at, so the octree's answer is not the prism's own
+        // integral to rounding, but it is far closer to it than the prism is to the cylinder
+        // (whose area differs by a sixth of the facets' angle squared).
+        let tessellation = turn * turn / 6.0;
+        let mut points = 0usize;
+        for depth in [0, 1, 2, 3, 4] {
+            let (sum, count) = monomial(&surface, lo, h, 2, [2, 0, 0], depth, false);
+            let error = (sum - exact).abs() / exact;
+            println!("depth {depth}: {count} points, error {error:.2e}");
+            assert!(count > points, "depth {depth} refines: {count} points after {points}");
+            assert!(error < 0.1 * tessellation, "depth {depth}: error {error:.2e}");
+            points = count;
+        }
     }
 
     #[test]

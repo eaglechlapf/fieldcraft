@@ -14,14 +14,16 @@
 //!   standard set of problems to test finite element accuracy*, Finite Elem. Anal. Des. 1:3–20,
 //!   1985, Table 3): tip displacements under unit tip loads.
 //! - **MacNeal–Harder thick-walled cylinder** (the same paper): the radial displacement of the
-//!   bore as Poisson's ratio approaches one half, against Lamé's closed form.
+//!   bore as Poisson's ratio approaches one half, against Lamé's closed form. At ν = 0.4999 and
+//!   degrees 4 and 5 the default fictitious stiffness leaves the system singular to working
+//!   precision, and the solver raises it a hundred times.
 
 mod common;
 
 use std::time::Instant;
 
 use common::{AT_X0, AT_Y0, AT_Z0, AT_Z1, INNER, OUTER_A, OUTER_B, X_HI, X_LO, block, quarter_tube, strip};
-use fieldcraft_fcm::{Load, Material, Options, Solution, Support, solve};
+use fieldcraft_fcm::{Basis, Load, Material, Options, Solution, Support, solve};
 use fieldcraft_mesh::surface::BoundarySurface;
 use fieldcraft_solver::Limits;
 
@@ -78,7 +80,7 @@ fn turn(i: usize, segments: usize) -> (f64, f64) {
 }
 
 /// A quarter of a square plate of half width `half` with a hole of radius 1, pulled along x.
-fn kirsch(case: &str, half: f64, thin: bool, cases: &[(f64, usize)]) {
+fn kirsch(case: &str, half: f64, thin: bool, basis: Basis, cases: &[(f64, usize)]) {
     const SEGMENTS: usize = 128;
     let material = Material { young: 1000.0, poisson: 0.3, density: 0.0 };
     for &(cell, degree) in cases {
@@ -104,7 +106,7 @@ fn kirsch(case: &str, half: f64, thin: bool, cases: &[(f64, usize)]) {
         let supports = if thin { &supports[..3] } else { &supports[..] };
         let loads = [Load::Traction { face: OUTER_A, traction: [1.0, 0.0, 0.0] }];
         // One cell thick, its two faces on grid planes; the grid is off the part in x and y.
-        let options = Options { degree, offset: [0.37, 0.21, if thin { 0.43 } else { 0.0 }], ..Options::new(cell) };
+        let options = Options { degree, basis, offset: [0.37, 0.21, if thin { 0.43 } else { 0.0 }], ..Options::new(cell) };
         if let Some((solution, run)) = attempt(case, &surface, &material, supports, &loads, &options) {
             let top = solution.stress([0.0, 1.0, at]).unwrap()[0];
             let side = solution.stress([1.0, 0.0, at]).unwrap()[1];
@@ -116,7 +118,10 @@ fn kirsch(case: &str, half: f64, thin: bool, cases: &[(f64, usize)]) {
 #[test]
 #[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
 fn kirsch_plate_with_a_hole() {
-    kirsch("kirsch", 30.0, false, &[(2.0, 3), (2.0, 4), (1.0, 2), (1.0, 3), (0.5, 2)]);
+    kirsch("kirsch", 30.0, false, Basis::Tensor, &[(2.0, 3), (2.0, 4), (1.0, 2), (1.0, 3), (0.5, 2), (1.0, 4)]);
+    // Cells as large as the hole's radius resolve it from degree 5 on, which fits the limits of
+    // the system in the trunk space.
+    kirsch("kirsch, trunk space", 30.0, false, Basis::Trunk, &[(1.0, 5), (1.0, 6), (1.0, 7)]);
 }
 
 /// The same hole in a plate small enough for cells of half its radius at degree 4. The plate is
@@ -125,8 +130,8 @@ fn kirsch_plate_with_a_hole() {
 #[test]
 #[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
 fn kirsch_hole_in_a_small_plate_settles() {
-    kirsch("kirsch, half width 8", 8.0, false, &[(1.0, 3), (1.0, 4), (1.0, 5), (0.5, 3), (0.5, 4), (0.25, 3)]);
-    kirsch("kirsch, half width 8, thin", 8.0, true, &[(1.0, 3), (1.0, 4), (1.0, 5), (0.5, 3), (0.5, 4)]);
+    kirsch("kirsch, half width 8", 8.0, false, Basis::Tensor, &[(1.0, 3), (1.0, 4), (1.0, 5), (0.5, 3), (0.5, 4), (0.25, 3)]);
+    kirsch("kirsch, half width 8, thin", 8.0, true, Basis::Tensor, &[(1.0, 3), (1.0, 4), (1.0, 5), (0.5, 3), (0.5, 4)]);
 }
 
 #[test]
@@ -215,16 +220,19 @@ fn macneal_harder_thick_cylinder_near_incompressible() {
         let exact = (1.0 + poisson) / material.young * (a * a / (b * b - a * a)) * ((1.0 - 2.0 * poisson) * r + b * b / r);
         for degree in 2..=5 {
             let options = Options { degree, offset: OFF_GRID, ..Options::new(3.0) };
-            // Where the default fictitious stiffness leaves the system singular, a hundred times
-            // more of it.
-            let solved = attempt(&format!("thick cylinder, ν = {poisson}"), &surface, &material, &supports, &loads, &options).or_else(|| {
-                let stiffer = Options { fictitious: 100.0 * Options::FICTITIOUS, ..options };
-                attempt(&format!("thick cylinder, ν = {poisson}, fictitious stiffness × 100"), &surface, &material, &supports, &loads, &stiffer)
-            });
-            if let Some((solution, run)) = solved {
+            // Where the default fictitious stiffness leaves the system singular to working
+            // precision, the solver raises it (`Options::fictitious`) and says so in its stats.
+            if let Some((solution, run)) = attempt(&format!("thick cylinder, ν = {poisson}"), &surface, &material, &supports, &loads, &options) {
                 let q = std::f64::consts::FRAC_1_SQRT_2;
                 let u = solution.displacement([r * q, r * q, 0.5]).unwrap();
-                println!("{run}; radial displacement of the bore {}", percent((u[0] + u[1]) * q, exact));
+                let radial = (u[0] + u[1]) * q;
+                println!("{run}; fictitious stiffness {:.1e}; radial displacement of the bore {}", solution.stats.fictitious, percent(radial, exact));
+                assert!(solution.stats.fictitious >= Options::FICTITIOUS);
+                if degree >= 3 {
+                    assert!((radial - exact).abs() < 5e-3 * exact, "ν = {poisson}, degree {degree}: {radial} against {exact}");
+                }
+            } else {
+                panic!("ν = {poisson}, degree {degree} is not solved");
             }
         }
     }

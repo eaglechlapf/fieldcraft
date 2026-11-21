@@ -5,9 +5,11 @@
 //! For an isotropic material with Lamé constants λ and μ, the stiffness block of two modes a, b
 //! (components i, j) is
 //! K = λ G[i][j] + μ G[j][i] + μ δᵢⱼ tr G, with G[i][j] = ∫ ∂ᵢNₐ ∂ⱼN_b dV,
-//! so only the nine numbers G of a mode pair are summed over the quadrature points. Points
-//! outside the part are summed apart: the cell matrix is the stiffness of the part plus the
-//! fictitious stiffness of the rest of the cell.
+//! so only the nine numbers G of a mode pair are needed. They are not summed point by point:
+//! the quadrature points are summed into the Legendre moments of the cell's material, and G
+//! follows from the moments one axis at a time ([`crate::moments`]). Points outside the part
+//! are summed apart: the cell matrix is the stiffness of the part plus the fictitious stiffness
+//! of the rest of the cell.
 //!
 //! # Supports: Nitsche's method
 //! Shape functions do not vanish on the surface of the part, so a prescribed displacement cannot
@@ -36,18 +38,33 @@
 //! of the stiffness. V is singular on the six rigid motions of the cell, where H vanishes too;
 //! they are shifted away before V is factored, which does not change Λ.
 //!
+//! **The stress on a supported face** is evaluated like anywhere else, from the cell's
+//! polynomial. The traction the support exerts, tᵢ(u) − β (uᵢ − gᵢ) on the fixed components, is
+//! what [`reaction`] integrates, and it balances the loads exactly. Correcting the stress at a
+//! point of a supported face with it (adding d ⊗ n + n ⊗ d − (d · n) n ⊗ n for
+//! dᵢ = −β (uᵢ − gᵢ)) was measured on Lamé's cylinder, Kirsch's plate and NAFEMS LE1 and is not
+//! done: on coarse grids it turns errors of 3–18 % into 0.2–3.5 %, but where a supported face
+//! ends it leaves 1–2.5 % that do not fall as the grid or the degree is refined, while the
+//! stress of the polynomial converges (to 0.15 % on LE1). β is computed cell by cell and grows
+//! without bound in a cell that holds a sliver of the face (F. de Prenter, C. Lehrenfeld,
+//! A. Massing, *A note on the stability parameter in Nitsche's method for unfitted boundary
+//! value problems*, Comput. Math. Appl. 75(12):4322–4336, 2018), and β (u − g) with it.
+//!
 //! # Surface quadrature
 //! A piece is a flat triangle, integrated with a Gauss rule on the square collapsed onto it
 //! (M. G. Duffy, *Quadrature over a pyramid or cube of integrands with a singularity at a
 //! vertex*, SIAM J. Numer. Anal. 19(6):1260–1262, 1982): the point at (s, t) ∈ [0, 1]² is
-//! (1 − s) A + s ((1 − t) B + t C) with weight 2 · area · s.
+//! (1 − s) A + s ((1 − t) B + t C) with weight 2 · area · s. The points of the pieces of one
+//! face that share a normal are summed into Legendre moments like the volume's, and the support
+//! matrices follow from the integrals of Nₐ N_b, ∂_c Nₐ N_b and ∂_c Nₐ ∂_d N_b of each mode pair
+//! over them.
 
 use std::collections::BTreeMap;
 
 use crate::dense;
 use crate::grid::{Piece, QuadPoint, cross, dot, sub};
 use crate::legendre::shape;
-use crate::space::modes;
+use crate::moments::{self, Moments, SLOPE_SLOPE, SLOPE_VALUE, Scratch, Tables, VALUE_SLOPE, VALUE_VALUE};
 
 /// Lamé's constants.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -102,79 +119,115 @@ impl Surface<'_> {
     }
 }
 
-/// The values and physical gradients of a cell's modes at natural coordinates `xi`; `scale` is
-/// 2 / (cell size), the derivative of the natural coordinate.
-pub(crate) fn eval(p: usize, xi: [f64; 3], scale: f64, values: &mut [f64], gradients: &mut [[f64; 3]]) {
-    let q = p + 1;
-    let (sx, sy, sz) = (shape(p, xi[0]), shape(p, xi[1]), shape(p, xi[2]));
-    for c in 0..q {
-        for b in 0..q {
-            let (n, dy, dz) = (sy.n[b] * sz.n[c], sy.d[b] * sz.n[c], sy.n[b] * sz.d[c]);
-            for a in 0..q {
-                let mode = a + q * (b + q * c);
-                if let (Some(value), Some(gradient)) = (values.get_mut(mode), gradients.get_mut(mode)) {
-                    *value = sx.n[a] * n;
-                    *gradient = [scale * sx.d[a] * n, scale * sx.n[a] * dy, scale * sx.n[a] * dz];
-                }
-            }
+/// The shape functions of a cell: the modes it carries of the tensor product of degree `p`
+/// ([`crate::space::local_modes`]) and the tables of their products.
+#[derive(Debug, Clone)]
+pub(crate) struct Shapes {
+    pub p: usize,
+    /// The index along each axis of every mode.
+    pub modes: Vec<[u8; 3]>,
+    pub tables: Tables,
+    /// The modes of the cell's eight vertices, the vertex at the upper end of axis d having bit
+    /// d set.
+    vertices: [usize; 8],
+}
+
+impl Shapes {
+    /// `None` when `modes` lacks a vertex mode or names a function of a higher degree.
+    pub fn new(p: usize, modes: Vec<[u8; 3]>) -> Option<Shapes> {
+        if modes.iter().flatten().any(|index| usize::from(*index) > p) {
+            return None;
         }
+        let mut vertices = [0; 8];
+        for (corner, vertex) in vertices.iter_mut().enumerate() {
+            let bits = [(corner & 1) as u8, ((corner >> 1) & 1) as u8, ((corner >> 2) & 1) as u8];
+            *vertex = modes.iter().position(|mode| *mode == bits)?;
+        }
+        Some(Shapes { p, modes, tables: Tables::new(p), vertices })
+    }
+
+    /// Modes of a cell.
+    pub fn len(&self) -> usize {
+        self.modes.len()
+    }
+
+    /// The mode of a vertex of the cell (bit d of `corner`: the upper end of axis d).
+    pub fn vertex(&self, corner: usize) -> usize {
+        self.vertices[corner % 8]
     }
 }
 
-/// The volume integrals of a cell.
-pub(crate) struct Volume {
-    /// G of each mode pair a ≤ b over the points inside the part, at `(a m + b) 9 + 3 i + j`.
-    pub inside: Vec<f64>,
-    /// The same over the points outside it.
-    pub outside: Vec<f64>,
-    /// ∫ Nₐ dV over the part.
-    pub body: Vec<f64>,
-    /// The volume of the part in the cell.
-    pub volume: f64,
+/// The values and physical gradients of a cell's modes at natural coordinates `xi`; `scale` is
+/// 2 / (cell size), the derivative of the natural coordinate.
+pub(crate) fn eval(shapes: &Shapes, xi: [f64; 3], scale: f64, values: &mut [f64], gradients: &mut [[f64; 3]]) {
+    let p = shapes.p;
+    let (sx, sy, sz) = (shape(p, xi[0]), shape(p, xi[1]), shape(p, xi[2]));
+    for ((mode, value), gradient) in shapes.modes.iter().zip(values.iter_mut()).zip(gradients.iter_mut()) {
+        let [a, b, c] = mode.map(usize::from);
+        *value = sx.n[a] * sy.n[b] * sz.n[c];
+        *gradient = [scale * sx.d[a] * sy.n[b] * sz.n[c], scale * sx.n[a] * sy.d[b] * sz.n[c], scale * sx.n[a] * sy.n[b] * sz.d[c]];
+    }
 }
 
-/// Integrate over the quadrature points of a cell of size `h`.
-pub(crate) fn integrate(p: usize, h: f64, points: &[QuadPoint]) -> Volume {
-    let m = modes(p);
-    let (scale, jacobian) = (2.0 / h, 0.125 * h * h * h);
-    let (mut values, mut gradients) = (vec![0.0; m], vec![[0.0; 3]; m]);
-    let mut volume = Volume { inside: vec![0.0; m * m * 9], outside: vec![0.0; m * m * 9], body: vec![0.0; m], volume: 0.0 };
+/// The Legendre moments of a cell's quadrature points ([`crate::moments`]), in natural
+/// coordinates: those of the points inside the part and those of the points outside it.
+pub(crate) struct Volume {
+    pub inside: Moments,
+    pub outside: Moments,
+}
+
+impl Volume {
+    pub fn new(shapes: &Shapes) -> Volume {
+        Volume { inside: Moments::new(&shapes.tables), outside: Moments::new(&shapes.tables) }
+    }
+
+    /// Add a quadrature point.
+    pub fn add(&mut self, point: &QuadPoint) {
+        if point.inside { self.inside.add(point.xi, point.weight) } else { self.outside.add(point.xi, point.weight) }
+    }
+}
+
+/// Sum the quadrature points of a cell.
+pub(crate) fn integrate(shapes: &Shapes, points: &[QuadPoint]) -> Volume {
+    let mut volume = Volume::new(shapes);
     for point in points {
-        eval(p, point.xi, scale, &mut values, &mut gradients);
-        let w = point.weight * jacobian;
-        let g = if point.inside {
-            volume.volume += w;
-            for a in 0..m {
-                volume.body[a] += w * values[a];
-            }
-            &mut volume.inside
-        } else {
-            &mut volume.outside
-        };
-        for a in 0..m {
-            let ga = [w * gradients[a][0], w * gradients[a][1], w * gradients[a][2]];
-            for b in a..m {
-                let gb = gradients[b];
-                let at = (a * m + b) * 9;
-                for i in 0..3 {
-                    for j in 0..3 {
-                        g[at + 3 * i + j] += ga[i] * gb[j];
-                    }
-                }
-            }
-        }
+        volume.add(point);
     }
     volume
 }
 
-/// The stiffness matrix (3m × 3m, row-major, mode by mode with its three components) from the
-/// sums `g` of [`integrate`].
-pub(crate) fn stiffness(m: usize, g: &[f64], lame: &Lame) -> Vec<f64> {
-    let n = 3 * m;
-    let mut k = vec![0.0; n * n];
-    if g.len() != m * m * 9 {
-        return k;
+/// Which derivative the two factors carry along each axis, for ∂ᵢNₐ ∂ⱼN_b.
+fn gradient_kinds(i: usize, j: usize) -> [usize; 3] {
+    [0, 1, 2].map(|axis| match (i == axis, j == axis) {
+        (false, false) => VALUE_VALUE,
+        (false, true) => VALUE_SLOPE,
+        (true, false) => SLOPE_VALUE,
+        (true, true) => SLOPE_SLOPE,
+    })
+}
+
+/// G[i][j] = ∫ ∂ᵢNₐ ∂ⱼN_b of every mode pair a ≤ b over the points of `moments`, in natural
+/// coordinates, at `(a m + b) 9 + 3 i + j`.
+fn gradient_products(shapes: &Shapes, moments: &Moments, scratch: &mut Scratch) -> Vec<f64> {
+    let m = shapes.len();
+    let mut g = vec![0.0; m * m * 9];
+    for i in 0..3 {
+        for j in 0..3 {
+            moments::pairs(&shapes.tables, moments, &shapes.modes, gradient_kinds(i, j), true, &mut g, 9, 3 * i + j, scratch);
+        }
     }
+    g
+}
+
+/// The stiffness matrix (3m × 3m, row-major, mode by mode with its three components) of a cell
+/// of size `h` whose material has the `moments`.
+pub(crate) fn stiffness(shapes: &Shapes, h: f64, moments: &Moments, lame: &Lame, scratch: &mut Scratch) -> Vec<f64> {
+    let m = shapes.len();
+    let n = 3 * m;
+    let g = gradient_products(shapes, moments, scratch);
+    // The Jacobian h³/8 and two derivatives of the natural coordinates, 2/h each.
+    let (lambda, mu) = (0.5 * h * lame.lambda, 0.5 * h * lame.mu);
+    let mut k = vec![0.0; n * n];
     for a in 0..m {
         for b in a..m {
             let at = (a * m + b) * 9;
@@ -183,9 +236,9 @@ pub(crate) fn stiffness(m: usize, g: &[f64], lame: &Lame) -> Vec<f64> {
             let trace = entry(0, 0) + entry(1, 1) + entry(2, 2);
             for i in 0..3 {
                 for j in 0..3 {
-                    let mut value = lame.lambda * entry(i, j) + lame.mu * entry(j, i);
+                    let mut value = lambda * entry(i, j) + mu * entry(j, i);
                     if i == j {
-                        value += lame.mu * trace;
+                        value += mu * trace;
                     }
                     k[(3 * a + i) * n + 3 * b + j] = value;
                     k[(3 * b + j) * n + 3 * a + i] = value;
@@ -196,35 +249,52 @@ pub(crate) fn stiffness(m: usize, g: &[f64], lame: &Lame) -> Vec<f64> {
     k
 }
 
-/// Visit the quadrature points of the pieces that carry something: the piece's face tag, its
-/// face and normal, the point's natural coordinates in the cell at `lo` of size `h`, and its
-/// weight (an area).
-fn surface_points(
-    pieces: &[Piece],
-    surface: &Surface,
-    lo: [f64; 3],
-    h: f64,
-    rule: &[(f64, f64)],
-    mut visit: impl FnMut(u32, &Face, [f64; 3], [f64; 3], f64),
-) {
-    for piece in pieces {
-        let Some((tag, face, normal)) = surface.face(piece) else { continue };
-        let [a, b, c] = piece.corners;
-        let doubled = cross(sub(b, a), sub(c, a));
-        let doubled = dot(doubled, doubled).sqrt();
-        for (gs, ws) in rule {
-            let s = 0.5 * (gs + 1.0);
-            for (gt, wt) in rule {
-                let t = 0.5 * (gt + 1.0);
-                let mut xi = [0.0; 3];
-                for i in 0..3 {
-                    let x = (1.0 - s) * a[i] + s * ((1.0 - t) * b[i] + t * c[i]);
-                    xi[i] = 2.0 * (x - lo[i]) / h - 1.0;
-                }
-                visit(tag, face, normal, xi, 0.25 * ws * wt * doubled * s);
+/// ∫ Nₐ dV of every mode over the material of a cell of size `h`.
+pub(crate) fn body(shapes: &Shapes, h: f64, moments: &Moments, scratch: &mut Scratch) -> Vec<f64> {
+    let jacobian = 0.125 * h * h * h;
+    let mut integrals = moments::singles(&shapes.tables, moments, &shapes.modes, None, scratch);
+    integrals.iter_mut().for_each(|x| *x *= jacobian);
+    integrals
+}
+
+/// Visit the quadrature points of a flat piece: the point's natural coordinates in the cell at
+/// `lo` of size `h`, and its weight (an area).
+fn piece_points(piece: &Piece, lo: [f64; 3], h: f64, rule: &[(f64, f64)], mut visit: impl FnMut([f64; 3], f64)) {
+    let [a, b, c] = piece.corners;
+    let doubled = cross(sub(b, a), sub(c, a));
+    let doubled = dot(doubled, doubled).sqrt();
+    for (gs, ws) in rule {
+        let s = 0.5 * (gs + 1.0);
+        for (gt, wt) in rule {
+            let t = 0.5 * (gt + 1.0);
+            let mut xi = [0.0; 3];
+            for i in 0..3 {
+                let x = (1.0 - s) * a[i] + s * ((1.0 - t) * b[i] + t * c[i]);
+                xi[i] = 2.0 * (x - lo[i]) / h - 1.0;
             }
+            visit(xi, 0.25 * ws * wt * doubled * s);
         }
     }
+}
+
+/// The traction coefficients of a surface with normal `n`: component i of the traction of a
+/// displacement with the gradient ∂u_k/∂x_c is Σ C[i][k][c] ∂u_k/∂x_c, with
+/// C[i][k][c] = λ nᵢ δ_kc + μ n_k δᵢc + μ δᵢ_k n_c, zero where component i is not fixed.
+fn traction_coefficients(n: [f64; 3], fixed: [bool; 3], lame: &Lame) -> [[[f64; 3]; 3]; 3] {
+    let mut c = [[[0.0; 3]; 3]; 3];
+    for i in 0..3 {
+        if !fixed[i] {
+            continue;
+        }
+        for k in 0..3 {
+            c[i][k][k] += lame.lambda * n[i];
+            c[i][k][i] += lame.mu * n[k];
+        }
+        for along in 0..3 {
+            c[i][i][along] += lame.mu * n[along];
+        }
+    }
+    c
 }
 
 /// The traction components i of each displacement component k of a mode with gradient `d` on a
@@ -259,10 +329,48 @@ pub(crate) struct Boundary {
     pub traction: Vec<f64>,
 }
 
+/// The pieces of one face that share a normal: every surface integral over them has the same
+/// coefficients, so their quadrature points are summed into one set of moments.
+struct Flat {
+    tag: u32,
+    normal: [f64; 3],
+    face: Face,
+    moments: Moments,
+}
+
+/// The flat groups of the pieces that carry something, in the order the pieces name them.
+fn flats(shapes: &Shapes, lo: [f64; 3], h: f64, pieces: &[Piece], surface: &Surface, rule: &[(f64, f64)]) -> Vec<Flat> {
+    let mut groups: Vec<Flat> = Vec::new();
+    for piece in pieces {
+        let Some((tag, face, normal)) = surface.face(piece) else { continue };
+        let same = |group: &Flat| group.tag == tag && group.normal.map(f64::to_bits) == normal.map(f64::to_bits);
+        let at = match groups.iter().position(same) {
+            Some(at) => at,
+            None => {
+                groups.push(Flat { tag, normal, face: *face, moments: Moments::new(&shapes.tables) });
+                groups.len() - 1
+            }
+        };
+        if let Some(group) = groups.get_mut(at) {
+            piece_points(piece, lo, h, rule, |xi, w| group.moments.add(xi, w));
+        }
+    }
+    groups
+}
+
 /// Integrate the loads and supports of the pieces a cell owns. The support matrices are empty
 /// when none of the pieces is supported.
-pub(crate) fn boundary(p: usize, lo: [f64; 3], h: f64, pieces: &[Piece], surface: &Surface, lame: &Lame, rule: &[(f64, f64)]) -> Boundary {
-    let m = modes(p);
+pub(crate) fn boundary(
+    shapes: &Shapes,
+    lo: [f64; 3],
+    h: f64,
+    pieces: &[Piece],
+    surface: &Surface,
+    lame: &Lame,
+    rule: &[(f64, f64)],
+    scratch: &mut Scratch,
+) -> Boundary {
+    let m = shapes.len();
     let n = 3 * m;
     let size = if surface.supports(pieces) { n * n } else { 0 };
     let mut out = Boundary {
@@ -273,52 +381,127 @@ pub(crate) fn boundary(p: usize, lo: [f64; 3], h: f64, pieces: &[Piece], surface
         penalty_load: vec![0.0; n],
         traction: vec![0.0; size],
     };
-    let (mut values, mut gradients) = (vec![0.0; m], vec![[0.0; 3]; m]);
-    let mut t = vec![[[0.0; 3]; 3]; m];
-    surface_points(pieces, surface, lo, h, rule, |_, face, normal, xi, w| {
-        eval(p, xi, 2.0 / h, &mut values, &mut gradients);
+    let scale = 2.0 / h;
+    let tables = &shapes.tables;
+    // Of each mode pair: ∫ Nₐ N_b, ∫ ∂_c Nₐ N_b and ∫ ∂_c Nₐ ∂_d N_b over a group.
+    let (mut values, mut slopes, mut gradients) = (vec![0.0; size / 9], vec![0.0; size / 3], vec![0.0; size]);
+    for group in flats(shapes, lo, h, pieces, surface, rule) {
+        let (face, normal) = (&group.face, group.normal);
+        if group.moments.is_zero() {
+            continue;
+        }
+        let integrals = moments::singles(tables, &group.moments, &shapes.modes, None, scratch);
         if face.loaded() {
             for a in 0..m {
                 for k in 0..3 {
-                    out.load[3 * a + k] += w * values[a] * (face.traction[k] - face.pressure * normal[k]);
+                    out.load[3 * a + k] += integrals[a] * (face.traction[k] - face.pressure * normal[k]);
                 }
             }
         }
         if !face.supported() || size == 0 {
-            return;
+            continue;
         }
-        for a in 0..m {
-            t[a] = tractions(gradients[a], normal, face.fixed, lame);
-        }
+        let c = traction_coefficients(normal, face.fixed, lame);
         let g = face.value;
+        // The loads of the prescribed values: −∫ tᵢ(v) gᵢ and ∫ vᵢ gᵢ.
+        for along in 0..3 {
+            let slope = moments::singles(tables, &group.moments, &shapes.modes, Some(along), scratch);
+            for a in 0..m {
+                for k in 0..3 {
+                    out.consistency_load[3 * a + k] -= scale * slope[a] * (c[0][k][along] * g[0] + c[1][k][along] * g[1] + c[2][k][along] * g[2]);
+                }
+            }
+        }
         for a in 0..m {
             for k in 0..3 {
-                let row = 3 * a + k;
-                out.consistency_load[row] -= w * (t[a][0][k] * g[0] + t[a][1][k] * g[1] + t[a][2][k] * g[2]);
                 if face.fixed[k] {
-                    out.penalty_load[row] += w * values[a] * g[k];
+                    out.penalty_load[3 * a + k] += integrals[a] * g[k];
                 }
-                for b in 0..m {
+            }
+        }
+        // The matrices.
+        moments::pairs(tables, &group.moments, &shapes.modes, [VALUE_VALUE; 3], true, &mut values, 1, 0, scratch);
+        for along in 0..3 {
+            let mut kinds = [VALUE_VALUE; 3];
+            kinds[along] = SLOPE_VALUE;
+            moments::pairs(tables, &group.moments, &shapes.modes, kinds, false, &mut slopes, 3, along, scratch);
+            for other in 0..3 {
+                moments::pairs(
+                    tables,
+                    &group.moments,
+                    &shapes.modes,
+                    gradient_kinds(along, other),
+                    true,
+                    &mut gradients,
+                    9,
+                    3 * along + other,
+                    scratch,
+                );
+            }
+        }
+        // H of two displacement components k, l from the gradient products c, d:
+        // Σᵢ C[i][k][c] C[i][l][d].
+        let mut weights = [[[[0.0; 3]; 3]; 3]; 3];
+        for k in 0..3 {
+            for l in 0..3 {
+                for along in 0..3 {
+                    for other in 0..3 {
+                        weights[k][l][along][other] =
+                            scale * scale * (c[0][k][along] * c[0][l][other] + c[1][k][along] * c[1][l][other] + c[2][k][along] * c[2][l][other]);
+                    }
+                }
+            }
+        }
+        for a in 0..m {
+            for b in a..m {
+                let (ab, ba) = (a * m + b, b * m + a);
+                let mut products = [[0.0; 3]; 3];
+                for along in 0..3 {
+                    for other in 0..3 {
+                        // A mode with itself: symmetric but for rounding.
+                        products[along][other] = if a == b {
+                            0.5 * (gradients[ab * 9 + 3 * along + other] + gradients[ab * 9 + 3 * other + along])
+                        } else {
+                            gradients[ab * 9 + 3 * along + other]
+                        };
+                    }
+                }
+                for k in 0..3 {
                     for l in 0..3 {
-                        let at = row * n + 3 * b + l;
-                        out.traction[at] += w * (t[a][0][k] * t[b][0][l] + t[a][1][k] * t[b][1][l] + t[a][2][k] * t[b][2][l]);
-                        out.consistency[at] -= w * (t[a][l][k] * values[b] + t[b][k][l] * values[a]);
-                        if k == l && face.fixed[k] {
-                            out.penalty[at] += w * values[a] * values[b];
+                        let (upper, lower) = ((3 * a + k) * n + 3 * b + l, (3 * b + l) * n + 3 * a + k);
+                        let mut traction = 0.0;
+                        let mut consistency = 0.0;
+                        for along in 0..3 {
+                            for other in 0..3 {
+                                traction += weights[k][l][along][other] * products[along][other];
+                            }
+                            // t_l of mode a's component k against N_b, and t_k of mode b's
+                            // component l against Nₐ.
+                            consistency += c[l][k][along] * slopes[ab * 3 + along] + c[k][l][along] * slopes[ba * 3 + along];
+                        }
+                        let consistency = scale * consistency;
+                        let penalty = if k == l && face.fixed[k] { values[ab] } else { 0.0 };
+                        out.traction[upper] += traction;
+                        out.consistency[upper] -= consistency;
+                        out.penalty[upper] += penalty;
+                        if a != b {
+                            out.traction[lower] += traction;
+                            out.consistency[lower] -= consistency;
+                            out.penalty[lower] += penalty;
                         }
                     }
                 }
             }
         }
-    });
+    }
     out
 }
 
-/// The Nitsche parameter β = 2Λ of a cell of degree `p` with stiffness `k` and traction matrix
-/// `h` (both 3m × 3m). `None` when the stiffness is not positive definite on the cell's
-/// deformations (a fictitious stiffness too small for the cut).
-pub(crate) fn nitsche_parameter(p: usize, k: &[f64], h: &[f64]) -> Option<f64> {
-    let (q, n) = (p + 1, 3 * modes(p));
+/// The Nitsche parameter β = 2Λ of a cell with stiffness `k` and traction matrix `h` (both
+/// 3m × 3m). `None` when the stiffness is not positive definite on the cell's deformations (a
+/// fictitious stiffness too small for the cut).
+pub(crate) fn nitsche_parameter(shapes: &Shapes, k: &[f64], h: &[f64]) -> Option<f64> {
+    let n = 3 * shapes.len();
     if k.len() != n * n || h.len() != n * n {
         return None;
     }
@@ -331,7 +514,7 @@ pub(crate) fn nitsche_parameter(p: usize, k: &[f64], h: &[f64]) -> Option<f64> {
     let mut rigid = vec![[0.0; 6]; n];
     for corner in 0..8usize {
         let bits = [corner & 1, (corner >> 1) & 1, (corner >> 2) & 1];
-        let mode = bits[0] + q * (bits[1] + q * bits[2]);
+        let mode = shapes.vertex(corner);
         let x = [2.0 * bits[0] as f64 - 1.0, 2.0 * bits[1] as f64 - 1.0, 2.0 * bits[2] as f64 - 1.0];
         for axis in 0..3 {
             rigid[3 * mode + axis][axis] = 1.0 / 8f64.sqrt();
@@ -341,11 +524,16 @@ pub(crate) fn nitsche_parameter(p: usize, k: &[f64], h: &[f64]) -> Option<f64> {
             rigid[3 * mode + c][3 + axis] = x[b] / 4.0;
         }
     }
+    // Only the vertex modes take part in a rigid motion.
     let mut shifted = k.to_vec();
-    for i in 0..n {
-        for j in 0..n {
-            let overlap: f64 = (0..6).map(|r| rigid[i][r] * rigid[j][r]).sum();
-            shifted[i * n + j] += scale * overlap;
+    for first in 0..8 {
+        for second in 0..8 {
+            for i in 3 * shapes.vertex(first)..3 * shapes.vertex(first) + 3 {
+                for j in 3 * shapes.vertex(second)..3 * shapes.vertex(second) + 3 {
+                    let overlap: f64 = (0..6).map(|r| rigid[i][r] * rigid[j][r]).sum();
+                    shifted[i * n + j] += scale * overlap;
+                }
+            }
         }
     }
     if !dense::cholesky(&mut shifted, n) {
@@ -357,8 +545,9 @@ pub(crate) fn nitsche_parameter(p: usize, k: &[f64], h: &[f64]) -> Option<f64> {
 /// Add the force the supports of a cell exert on the part to `reactions`, by face:
 /// ∫ (tᵢ(u) − β (uᵢ − gᵢ)) dΓ over the fixed components, for the cell's unknowns `u` (three per
 /// mode).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn reaction(
-    p: usize,
+    shapes: &Shapes,
     lo: [f64; 3],
     h: f64,
     pieces: &[Piece],
@@ -369,40 +558,47 @@ pub(crate) fn reaction(
     u: &[f64],
     reactions: &mut BTreeMap<u32, [f64; 3]>,
 ) {
-    let m = modes(p);
+    let m = shapes.len();
     if u.len() != 3 * m {
         return;
     }
     let (mut values, mut gradients) = (vec![0.0; m], vec![[0.0; 3]; m]);
-    surface_points(pieces, surface, lo, h, rule, |tag, face, normal, xi, w| {
+    for piece in pieces {
+        let Some((tag, face, normal)) = surface.face(piece) else { continue };
         if !face.supported() {
-            return;
+            continue;
         }
-        eval(p, xi, 2.0 / h, &mut values, &mut gradients);
-        let (mut displacement, mut traction) = ([0.0; 3], [0.0; 3]);
-        for a in 0..m {
-            let t = tractions(gradients[a], normal, face.fixed, lame);
-            for k in 0..3 {
-                displacement[k] += values[a] * u[3 * a + k];
-                for i in 0..3 {
-                    traction[i] += t[i][k] * u[3 * a + k];
+        let mut sum = [0.0; 3];
+        piece_points(piece, lo, h, rule, |xi, w| {
+            eval(shapes, xi, 2.0 / h, &mut values, &mut gradients);
+            let (mut displacement, mut traction) = ([0.0; 3], [0.0; 3]);
+            for a in 0..m {
+                let t = tractions(gradients[a], normal, face.fixed, lame);
+                for k in 0..3 {
+                    displacement[k] += values[a] * u[3 * a + k];
+                    for i in 0..3 {
+                        traction[i] += t[i][k] * u[3 * a + k];
+                    }
                 }
             }
-        }
+            for i in 0..3 {
+                if face.fixed[i] {
+                    sum[i] += w * (traction[i] - beta * (displacement[i] - face.value[i]));
+                }
+            }
+        });
         let total = reactions.entry(tag).or_insert([0.0; 3]);
         for i in 0..3 {
-            if face.fixed[i] {
-                total[i] += w * (traction[i] - beta * (displacement[i] - face.value[i]));
-            }
+            total[i] += sum[i];
         }
-    });
+    }
 }
 
 /// The displacement gradient ∂uᵢ/∂xⱼ and the displacement of a cell's unknowns `u` at `xi`.
-pub(crate) fn field(p: usize, xi: [f64; 3], h: f64, u: &[f64]) -> ([f64; 3], [[f64; 3]; 3]) {
-    let m = modes(p);
+pub(crate) fn field(shapes: &Shapes, xi: [f64; 3], h: f64, u: &[f64]) -> ([f64; 3], [[f64; 3]; 3]) {
+    let m = shapes.len();
     let (mut values, mut gradients) = (vec![0.0; m], vec![[0.0; 3]; m]);
-    eval(p, xi, 2.0 / h, &mut values, &mut gradients);
+    eval(shapes, xi, 2.0 / h, &mut values, &mut gradients);
     let (mut displacement, mut gradient) = ([0.0; 3], [[0.0; 3]; 3]);
     for a in 0..m {
         for i in 0..3 {
@@ -420,6 +616,7 @@ pub(crate) fn field(p: usize, xi: [f64; 3], h: f64, u: &[f64]) -> ([f64; 3], [[f
 mod tests {
     use super::*;
     use crate::gauss::gauss_legendre;
+    use crate::space::local_modes;
 
     /// The Gauss points of a whole cell, all inside.
     fn whole(p: usize) -> Vec<QuadPoint> {
@@ -435,16 +632,24 @@ mod tests {
         points
     }
 
+    fn shapes(p: usize, trunk: bool) -> Shapes {
+        Shapes::new(p, local_modes(p, trunk)).unwrap()
+    }
+
     #[test]
     fn a_cell_matrix_is_symmetric_and_rigid_motions_cost_no_energy() {
         let lame = Lame { lambda: 1.2, mu: 0.8 };
-        for p in 1..=3 {
-            let (m, q, h) = (modes(p), p + 1, 0.5);
-            let volume = integrate(p, h, &whole(p));
-            assert!((volume.volume - h * h * h).abs() < 1e-14);
-            let vertices: f64 = (0..8usize).map(|corner| volume.body[(corner & 1) + q * (((corner >> 1) & 1) + q * ((corner >> 2) & 1))]).sum();
+        let mut scratch = Scratch::default();
+        for (p, trunk) in [(1, false), (2, false), (3, false), (3, true), (5, true)] {
+            let shapes = shapes(p, trunk);
+            let (m, h) = (shapes.len(), 0.5);
+            let volume = integrate(&shapes, &whole(p));
+            assert!((0.125 * h * h * h * volume.inside.total() - h * h * h).abs() < 1e-14);
+            assert!(volume.outside.is_zero());
+            let integrals = body(&shapes, h, &volume.inside, &mut scratch);
+            let vertices: f64 = (0..8).map(|corner| integrals[shapes.vertex(corner)]).sum();
             assert!((vertices - h * h * h).abs() < 1e-14, "the vertex modes sum to one");
-            let k = stiffness(m, &volume.inside, &lame);
+            let k = stiffness(&shapes, h, &volume.inside, &lame, &mut scratch);
             let n = 3 * m;
             for i in 0..n {
                 for j in 0..n {
@@ -455,7 +660,7 @@ mod tests {
             let (mut translation, mut rotation) = (vec![0.0; n], vec![0.0; n]);
             for corner in 0..8usize {
                 let bits = [corner & 1, (corner >> 1) & 1, (corner >> 2) & 1];
-                let mode = bits[0] + q * (bits[1] + q * bits[2]);
+                let mode = shapes.vertex(corner);
                 translation[3 * mode + 1] = 1.0;
                 rotation[3 * mode] = -(2.0 * bits[1] as f64 - 1.0);
                 rotation[3 * mode + 1] = 2.0 * bits[0] as f64 - 1.0;
@@ -469,14 +674,140 @@ mod tests {
             // Uniform strain ε_xx = 1 (u_x = x): the energy is ½ (λ + 2μ) V.
             let mut stretch = vec![0.0; n];
             for corner in 0..8usize {
-                let bits = [corner & 1, (corner >> 1) & 1, (corner >> 2) & 1];
-                stretch[3 * (bits[0] + q * (bits[1] + q * bits[2]))] = h * bits[0] as f64;
+                stretch[3 * shapes.vertex(corner)] = h * (corner & 1) as f64;
             }
             let energy: f64 = (0..n).map(|i| 0.5 * stretch[i] * (0..n).map(|j| k[i * n + j] * stretch[j]).sum::<f64>()).sum();
             assert!((energy - 0.5 * (lame.lambda + 2.0 * lame.mu) * h * h * h).abs() < 1e-13, "degree {p}: {energy}");
-            let (u, gradient) = field(p, [0.3, -0.2, 0.9], h, &stretch);
+            let (u, gradient) = field(&shapes, [0.3, -0.2, 0.9], h, &stretch);
             assert!((u[0] - 0.5 * 1.3 * h).abs() < 1e-14 && (gradient[0][0] - 1.0).abs() < 1e-13 && gradient[1][1].abs() < 1e-13);
         }
+    }
+
+    /// The stiffness from the moments is the sum over the quadrature points, mode pair by mode
+    /// pair, for points inside and outside the part.
+    #[test]
+    fn the_stiffness_from_moments_is_the_sum_over_the_points() {
+        let lame = Lame { lambda: 1.7, mu: 0.6 };
+        let (p, h) = (3, 0.8);
+        let shapes = shapes(p, false);
+        let (m, n) = (shapes.len(), 3 * shapes.len());
+        // The points of a cell cut by the plane x = 0.2 h.
+        let mut points = whole(p);
+        for point in &mut points {
+            point.inside = point.xi[0] < -0.6;
+        }
+        let volume = integrate(&shapes, &points);
+        let mut scratch = Scratch::default();
+        let fraction = 1e-3;
+        let softer = Lame { lambda: fraction * lame.lambda, mu: fraction * lame.mu };
+        let mut k = stiffness(&shapes, h, &volume.inside, &lame, &mut scratch);
+        for (total, outside) in k.iter_mut().zip(stiffness(&shapes, h, &volume.outside, &softer, &mut scratch)) {
+            *total += outside;
+        }
+        let (mut values, mut gradients) = (vec![0.0; m], vec![[0.0; 3]; m]);
+        let mut direct = vec![0.0; n * n];
+        for point in &points {
+            eval(&shapes, point.xi, 2.0 / h, &mut values, &mut gradients);
+            let w = point.weight * 0.125 * h * h * h * if point.inside { 1.0 } else { fraction };
+            for a in 0..m {
+                for b in 0..m {
+                    let (ga, gb) = (gradients[a], gradients[b]);
+                    for i in 0..3 {
+                        for j in 0..3 {
+                            let mut value = lame.lambda * ga[i] * gb[j] + lame.mu * ga[j] * gb[i];
+                            if i == j {
+                                value += lame.mu * dot(ga, gb);
+                            }
+                            direct[(3 * a + i) * n + 3 * b + j] += w * value;
+                        }
+                    }
+                }
+            }
+        }
+        let scale = direct.iter().fold(0.0f64, |largest, x| largest.max(x.abs()));
+        for (value, exact) in k.iter().zip(&direct) {
+            assert!((value - exact).abs() < 1e-12 * scale, "{value} vs {exact}");
+        }
+    }
+
+    /// The support matrices from the moments of a face are the sums over its quadrature points.
+    #[test]
+    fn the_support_matrices_are_the_sums_over_the_surface_points() {
+        let lame = Lame { lambda: 1.3, mu: 0.7 };
+        let (p, h, lo) = (2, 0.5, [0.1, -0.2, 0.3]);
+        let shapes = shapes(p, false);
+        let (m, n) = (shapes.len(), 3 * shapes.len());
+        // Two inclined triangles of two faces: one supported in x and z with a prescribed value
+        // and under pressure, one loaded only.
+        let faces = BTreeMap::from([
+            (3u32, Face { fixed: [true, false, true], value: [0.02, 0.0, -0.01], traction: [0.0; 3], pressure: 4.0 }),
+            (5u32, Face { traction: [1.0, -2.0, 0.5], ..Face::default() }),
+        ]);
+        let at = |x: f64, y: f64, z: f64| [lo[0] + x * h, lo[1] + y * h, lo[2] + z * h];
+        let pieces = [
+            Piece { corners: [at(0.1, 0.1, 0.2), at(0.9, 0.2, 0.3), at(0.3, 0.8, 0.9)], triangle: 0 },
+            Piece { corners: [at(0.9, 0.2, 0.3), at(0.8, 0.9, 0.7), at(0.3, 0.8, 0.9)], triangle: 1 },
+            Piece { corners: [at(0.0, 0.0, 0.5), at(1.0, 0.0, 0.5), at(0.0, 1.0, 0.6)], triangle: 2 },
+        ];
+        let unit = |piece: &Piece| {
+            let normal = cross(sub(piece.corners[1], piece.corners[0]), sub(piece.corners[2], piece.corners[0]));
+            let length = dot(normal, normal).sqrt();
+            normal.map(|x| x / length)
+        };
+        let normals = [unit(&pieces[0]), unit(&pieces[1]), unit(&pieces[2])];
+        let surface = Surface { normals: &normals, tags: &[3, 3, 5], faces: &faces };
+        let rule = gauss_legendre(2 * p + 1);
+        let mut scratch = Scratch::default();
+        let b = boundary(&shapes, lo, h, &pieces, &surface, &lame, &rule, &mut scratch);
+
+        let (mut values, mut gradients) = (vec![0.0; m], vec![[0.0; 3]; m]);
+        let (mut load, mut consistency_load, mut penalty_load) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
+        let (mut consistency, mut penalty, mut traction) = (vec![0.0; n * n], vec![0.0; n * n], vec![0.0; n * n]);
+        for piece in &pieces {
+            let (_, face, normal) = surface.face(piece).unwrap();
+            piece_points(piece, lo, h, &rule, |xi, w| {
+                eval(&shapes, xi, 2.0 / h, &mut values, &mut gradients);
+                let t: Vec<[[f64; 3]; 3]> = gradients.iter().map(|d| tractions(*d, normal, face.fixed, &lame)).collect();
+                let g = face.value;
+                for a in 0..m {
+                    for k in 0..3 {
+                        let row = 3 * a + k;
+                        load[row] += w * values[a] * (face.traction[k] - face.pressure * normal[k]);
+                        if !face.supported() {
+                            continue;
+                        }
+                        consistency_load[row] -= w * (t[a][0][k] * g[0] + t[a][1][k] * g[1] + t[a][2][k] * g[2]);
+                        if face.fixed[k] {
+                            penalty_load[row] += w * values[a] * g[k];
+                        }
+                        for b in 0..m {
+                            for l in 0..3 {
+                                let at = row * n + 3 * b + l;
+                                traction[at] += w * (t[a][0][k] * t[b][0][l] + t[a][1][k] * t[b][1][l] + t[a][2][k] * t[b][2][l]);
+                                consistency[at] -= w * (t[a][l][k] * values[b] + t[b][k][l] * values[a]);
+                                if k == l && face.fixed[k] {
+                                    penalty[at] += w * values[a] * values[b];
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        let close = |name: &str, got: &[f64], exact: &[f64]| {
+            assert_eq!(got.len(), exact.len(), "{name}");
+            let scale = exact.iter().fold(0.0f64, |largest, x| largest.max(x.abs()));
+            assert!(scale > 0.0, "{name} is not exercised");
+            for (value, exact) in got.iter().zip(exact) {
+                assert!((value - exact).abs() < 1e-12 * scale, "{name}: {value} vs {exact}");
+            }
+        };
+        close("load", &b.load, &load);
+        close("consistency load", &b.consistency_load, &consistency_load);
+        close("penalty load", &b.penalty_load, &penalty_load);
+        close("consistency", &b.consistency, &consistency);
+        close("penalty", &b.penalty, &penalty);
+        close("traction", &b.traction, &traction);
     }
 
     #[test]
@@ -484,6 +815,7 @@ mod tests {
         // A cell fixed on its whole lower x face: Λ is a property of the cell, proportional to
         // the modulus and inversely to the size.
         let parameter = |p: usize, h: f64, lame: Lame| -> f64 {
+            let shapes = shapes(p, false);
             let faces = BTreeMap::from([(7u32, Face { fixed: [true; 3], ..Face::default() })]);
             let surface = Surface { normals: &[[-1.0, 0.0, 0.0]], tags: &[7], faces: &faces };
             let corner = |y: f64, z: f64| [0.0, y * h, z * h];
@@ -491,15 +823,16 @@ mod tests {
                 Piece { corners: [corner(0.0, 0.0), corner(0.0, 1.0), corner(1.0, 1.0)], triangle: 0 },
                 Piece { corners: [corner(0.0, 0.0), corner(1.0, 1.0), corner(1.0, 0.0)], triangle: 0 },
             ];
-            let k = stiffness(modes(p), &integrate(p, h, &whole(p)).inside, &lame);
-            let b = boundary(p, [0.0; 3], h, &pieces, &surface, &lame, &gauss_legendre(2 * p + 1));
+            let mut scratch = Scratch::default();
+            let k = stiffness(&shapes, h, &integrate(&shapes, &whole(p)).inside, &lame, &mut scratch);
+            let b = boundary(&shapes, [0.0; 3], h, &pieces, &surface, &lame, &gauss_legendre(2 * p + 1), &mut scratch);
             // The vertex modes sum to one, so the x rows and columns of their penalty matrix
             // sum to the area of the face.
-            let (n, q) = (3 * modes(p), p + 1);
-            let vertex = |corner: usize| 3 * ((corner & 1) + q * (((corner >> 1) & 1) + q * ((corner >> 2) & 1)));
+            let n = 3 * shapes.len();
+            let vertex = |corner: usize| 3 * shapes.vertex(corner);
             let area: f64 = (0..8).map(|c| (0..8).map(|d| b.penalty[vertex(c) * n + vertex(d)]).sum::<f64>()).sum();
             assert!((area - h * h).abs() < 1e-13 * h * h, "degree {p}: {area}");
-            nitsche_parameter(p, &k, &b.traction).unwrap()
+            nitsche_parameter(&shapes, &k, &b.traction).unwrap()
         };
         let lame = Lame { lambda: 1.2, mu: 0.8 };
         for p in 1..=2 {

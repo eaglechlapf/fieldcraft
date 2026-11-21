@@ -15,10 +15,14 @@
 //!    triangle is cut into pieces, one cell each; a cell that owns a piece is *cut*, any other is
 //!    inside or outside by its centre ([`inside`]: the winding number with exact predicates).
 //! 2. **Basis** ([`legendre`]): the tensor product of integrated Legendre polynomials of degree
-//!    p on every cell. Modes on a shared vertex, edge or face of the grid are one unknown.
-//! 3. **Cut cells**: an octree of depth [`Options::depth`] under each cut cell; a leaf the
-//!    surface reaches is integrated one axis at a time, split where the surface and its edges
-//!    cross. Points outside the part are weighted with [`Options::fictitious`].
+//!    p on every cell, or its trunk space ([`Options::basis`]). Modes on a shared vertex, edge
+//!    or face of the grid are one unknown.
+//! 3. **Cut cells** ([`grid`]): a cell the surface cuts is integrated one axis at a time, split
+//!    where the surface and its edges cross, with Gauss rules that integrate a cell cut by flat
+//!    faces exactly; where the surface is curved, an octree of depth [`Options::depth`] divides
+//!    the cell first. Points outside the part are weighted with [`Options::fictitious`]. The
+//!    points are not summed mode pair by mode pair: they are summed into the Legendre moments of
+//!    the cell's material, from which every cell matrix follows by sum factorisation.
 //! 4. **Supports**: prescribed displacement components of a face, imposed weakly by Nitsche's
 //!    method on the face's own triangles, with the stabilisation parameter of each cell from that
 //!    cell's eigenvalue problem (no penalty number to choose).
@@ -29,11 +33,15 @@
 //!    the part from the cell's polynomial.
 //!
 //! This is a first version: one body, linear elastic, isotropic, static. Its accuracy is
-//! bounded by the tessellation of curved faces and by the fictitious stiffness, which shows in
-//! the stress of a cell that holds very little material. Every cell carries the full tensor
-//! product space, cell matrices are summed mode pair by mode pair and the system is factored
-//! directly, so time and memory grow quickly with the degree: the caps in [`solve()`] refuse a
-//! model that would not fit.
+//! bounded by the tessellation of curved faces, by the fictitious stiffness, which shows in the
+//! stress of a cell that holds very little material, and by the grid, which is uniform: there is
+//! no local refinement, so a feature needs cells of its own size everywhere (on cells as large
+//! as a hole's radius the stress at the hole is within a few per cent only from degree 5 on,
+//! `tests/benchmarks.rs`). The stress is the derivative of the cell's polynomial and is least
+//! accurate on the boundary of the part, most of all where a supported face ends. The system is
+//! factored directly, so memory grows quickly with the degree: the caps in [`solve()`] refuse a
+//! model that would not fit. [`Solution::change_from`] compares two solutions as an indicator of
+//! convergence.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 // Matrix kernels read as the textbook formulas with index loops.
@@ -45,10 +53,11 @@ pub mod gauss;
 pub mod grid;
 pub mod inside;
 pub mod legendre;
+mod moments;
 mod solve;
 mod space;
 
-pub use solve::{Load, Material, Options, Reaction, Solution, Stats, Support, solve};
+pub use solve::{Basis, Change, Load, Material, Options, Reaction, Solution, Stats, Support, solve};
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum Error {

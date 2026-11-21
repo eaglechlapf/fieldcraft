@@ -93,6 +93,39 @@ fn a_coarse_grid_is_within_a_few_per_cent() {
     assert!(stress < 0.25, "stress error {stress:.3e}");
 }
 
+/// The change between two degrees on the same cells is the convergence indicator: it falls as
+/// the degree rises, and its energy part tracks the error to the closed form.
+#[test]
+fn the_change_between_degrees_falls_as_the_solution_converges() {
+    let solve_at = |degree: usize| tube(&Options { degree, ..Options::new(0.1) });
+    let solutions = [solve_at(1), solve_at(2), solve_at(3), solve_at(4)];
+    // Points through the wall, off the supports.
+    let mut points = Vec::new();
+    for fraction in [0.02, 0.25, 0.5, 0.75, 0.98] {
+        for degrees in [5.0f64, 30.0, 45.0, 70.0, 85.0] {
+            let r = INNER_RADIUS + fraction * (OUTER_RADIUS - INNER_RADIUS);
+            points.push([r * degrees.to_radians().cos(), r * degrees.to_radians().sin(), 0.4 * LENGTH]);
+        }
+    }
+    let same = solutions[2].change_from(&solutions[2], &points);
+    assert_eq!((same.strain_energy, same.peak_von_mises, same.von_mises, same.points), (0.0, 0.0, 0.0, points.len()));
+    // A point outside the part counts for nothing.
+    assert_eq!(solutions[2].change_from(&solutions[1], &[[10.0, 10.0, 10.0]]).points, 0);
+    let mut previous = (f64::INFINITY, f64::INFINITY);
+    for pair in solutions.windows(2) {
+        let change = pair[1].change_from(&pair[0], &points);
+        let (_, stress) = errors(&pair[1]);
+        println!(
+            "change to the next degree: strain energy {:+.2e}, peak von Mises {:+.2e}, von Mises anywhere {:.2e}; stress error to Lamé {stress:.2e}",
+            change.strain_energy, change.peak_von_mises, change.von_mises
+        );
+        assert_eq!(change.points, points.len());
+        assert!(change.strain_energy.abs() < previous.0 && change.von_mises < previous.1, "{change:?} after {previous:?}");
+        previous = (change.strain_energy.abs(), change.von_mises);
+    }
+    assert!(previous.0 < 5e-3 && previous.1 < 0.05, "degree 3 to 4: {previous:?}");
+}
+
 /// Raising the degree on the same four cells: the error falls by about a decade from degree 1
 /// to 2 and from 2 to 3, to a few tenths of a per cent at degree 4.
 #[test]
@@ -107,6 +140,27 @@ fn the_error_falls_with_the_degree() {
         if degree == 4 {
             assert!(displacement < 0.005, "displacement error {displacement:.3e}");
             assert!(stress < 0.02, "stress error {stress:.3e}");
+        }
+    }
+}
+
+/// The trunk space on the same four cells: degree for degree it has fewer unknowns and a larger
+/// error than the tensor product, and reaches the tensor product's accuracy at degree 4 with
+/// two more degrees and fewer unknowns.
+#[test]
+#[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
+fn the_trunk_space_converges_with_fewer_unknowns() {
+    let tensor = tube(&Options { degree: 4, depth: 1, ..Options::new(0.1) });
+    let (tensor_displacement, tensor_stress) = report("tensor product, degree 4", &tensor);
+    let mut previous = f64::INFINITY;
+    for degree in 2..=6 {
+        let solution = tube(&Options { degree, depth: 1, basis: fieldcraft_fcm::Basis::Trunk, ..Options::new(0.1) });
+        let (displacement, stress) = report(&format!("trunk, degree {degree}"), &solution);
+        assert!(displacement < previous, "degree {degree}: displacement error {displacement:.3e} after {previous:.3e}");
+        previous = displacement;
+        if degree == 6 {
+            assert!(solution.stats.unknowns < tensor.stats.unknowns);
+            assert!(displacement < 2.0 * tensor_displacement && stress < 2.0 * tensor_stress, "{displacement:.3e}, {stress:.3e}");
         }
     }
 }

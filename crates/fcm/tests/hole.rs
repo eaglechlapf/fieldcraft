@@ -1,10 +1,22 @@
 //! Where the stress at a hole goes wrong: diagnostics for Kirsch's plate (`benchmarks.rs`).
 //!
-//! In a quarter model, the top and the side of the hole lie on the symmetry planes, whose
-//! supports are imposed weakly (Nitsche). The stress normal to such a plane, evaluated on the
-//! plane, is the least accurate value there: `quarter_field` prints the field against Kirsch's
-//! closed form on the plane, just off it and round the hole. `whole_plate` solves the whole
-//! plate, where no support touches the hole, and the same stresses behave.
+//! `quarter_field` prints the field of a quarter model against Kirsch's closed form on a
+//! symmetry plane, just off it and round the hole; `whole_plate` solves the whole plate, where
+//! no support touches the hole.
+//!
+//! What these showed:
+//! - The values that went up and down from one degree to the next were the cut-cell quadrature
+//!   of the curved face, which an octree of depth 1 left inexact (`depth_of_the_octree`;
+//!   `fieldcraft_fcm::Options::DEPTH`).
+//! - What is left is resolution, not the weakly imposed supports. The stress at a hole falls to
+//!   a third within one radius; a cell as large as the radius carries that peak in one
+//!   polynomial, and the value at the hole then depends on where the cell's faces fall, in the
+//!   whole plate as much as in the quarter model. `where_the_grid_sits` measures the spread
+//!   over six grid positions: ± 10 %, 6.5 % and 3 % at degrees 3, 4 and 5 with one cell a
+//!   radius, ± 4 % and 0.7 % at degrees 3 and 4 with two, ± 0.8 % at degree 3 with four. A grid
+//!   that is the same everywhere needs two cells a radius of the smallest stressed feature at
+//!   degree 4; refining only there is what the solver lacks.
+
 mod common;
 
 use common::{AT_X0, AT_Y0, AT_Z0, AT_Z1, OUTER_A, OUTER_B, ring, strip};
@@ -78,6 +90,62 @@ fn quarter_field() {
     }
 }
 
+/// The octree's depth is the accuracy of the matrices of a cell a curved face cuts. A quarter
+/// plate of half width 8 on cells as large as the hole's radius: the stress at the top of the
+/// hole settles with the depth (to 0.1 % from depth 2 to 3), and at the default depth it falls
+/// steadily with the degree to the value a finer grid gives. With an octree of depth 1 it went
+/// up and down from degree to degree instead.
+#[test]
+#[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
+fn depth_of_the_octree() {
+    const N: usize = 128;
+    let half = 8.0;
+    let material = Material { young: 1000.0, poisson: 0.3, density: 0.0 };
+    let top = |cell: f64, degree: usize, depth: usize| -> f64 {
+        let surface = strip(
+            N,
+            cell,
+            |i| {
+                let t = std::f64::consts::FRAC_PI_2 * i as f64 / N as f64;
+                let (c, s) = if i == 0 {
+                    (1.0, 0.0)
+                } else if i == N {
+                    (0.0, 1.0)
+                } else {
+                    (t.cos(), t.sin())
+                };
+                let outer = if i < N / 2 {
+                    [half, half * s / c]
+                } else if i == N / 2 {
+                    [half, half]
+                } else {
+                    [half * c / s, half]
+                };
+                ([c, s], outer)
+            },
+            |i| if i < N / 2 { OUTER_A } else { OUTER_B },
+        );
+        let supports = [slide(AT_X0, 0), slide(AT_Y0, 1), slide(AT_Z0, 2), slide(AT_Z1, 2)];
+        let loads = [Load::Traction { face: OUTER_A, traction: [1.0, 0.0, 0.0] }];
+        let options = Options { degree, depth, offset: [0.37, 0.21, 0.0], ..Options::new(cell) };
+        solve(&surface, &material, &supports, &loads, &options, &Limits::default()).unwrap().stress([0.0, 1.0, 0.5 * cell]).unwrap()[0]
+    };
+    let mut settled = Vec::new();
+    for degree in [3, 4, 5] {
+        let by_depth: Vec<f64> = (1..=4).map(|depth| top(1.0, degree, depth)).collect();
+        println!("cell 1, degree {degree}: σ_xx at the top of the hole at depths 1 to 4: {by_depth:.4?}");
+        let deepest = by_depth[3];
+        assert!((by_depth[1] - deepest).abs() < 2e-3 * deepest, "degree {degree}, depth 2: {by_depth:?}");
+        assert!((by_depth[2] - deepest).abs() < 5e-4 * deepest, "degree {degree}, depth 3: {by_depth:?}");
+        assert_eq!(Options::DEPTH, 3);
+        settled.push(by_depth[2]);
+    }
+    let finer = top(0.5, 4, Options::DEPTH);
+    println!("cell 0.5, degree 4: {finer:.4}");
+    assert!(settled[0] > settled[1] && settled[1] > settled[2], "the stress falls with the degree: {settled:?}");
+    assert!((settled[2] - finer).abs() < 0.01 * finer, "degree 5 on cells of the hole's radius: {} against {finer}", settled[2]);
+}
+
 /// A whole plate of half width 8 with the whole hole: no support touches the hole.
 #[test]
 #[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
@@ -126,4 +194,63 @@ fn whole_plate() {
             Err(e) => println!("whole plate cell {cell} p{degree}: {e}"),
         }
     }
+}
+
+/// Where the grid sits. The stress at a hole falls to a third within one radius, so a cell as
+/// large as the radius has to carry the whole peak in one polynomial, and how well it does
+/// depends on where its faces fall. The same whole plate (no support near the hole) on grids
+/// that differ only in their start: the spread of σ_xx over the top and the bottom of the hole
+/// is printed for each cell size and degree. It is the honest accuracy of a stress peak at that
+/// resolution, and it narrows with the degree and faster with the cell size.
+#[test]
+#[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
+fn where_the_grid_sits() {
+    const N: usize = 512;
+    let half = 8.0;
+    let (left, bottom) = (8u32, 9u32);
+    let material = Material { young: 1000.0, poisson: 0.3, density: 0.0 };
+    let mut spreads = Vec::new();
+    for (cell, degree) in [(1.0, 3), (1.0, 4), (1.0, 5), (0.5, 3), (0.5, 4), (0.25, 3)] {
+        let surface = ring(
+            N,
+            cell,
+            |i| {
+                let t = 2.0 * std::f64::consts::PI * i as f64 / N as f64;
+                let (c, s) = (t.cos(), t.sin());
+                let m = c.abs().max(s.abs());
+                ([c, s], [half * (c / m), half * (s / m)])
+            },
+            |a, b| {
+                if a[0] == half && b[0] == half {
+                    OUTER_A
+                } else if a[0] == -half && b[0] == -half {
+                    left
+                } else if a[1] == -half && b[1] == -half {
+                    bottom
+                } else {
+                    OUTER_B
+                }
+            },
+        );
+        let supports = [slide(left, 0), slide(bottom, 1), slide(AT_Z0, 2), slide(AT_Z1, 2)];
+        let loads = [Load::Traction { face: OUTER_A, traction: [1.0, 0.0, 0.0] }];
+        let (mut lowest, mut highest) = (f64::INFINITY, 0.0f64);
+        for offset in [[0.0, 0.0, 0.0], [0.0, 0.21, 0.0], [0.37, 0.21, 0.0], [0.37, 0.9, 0.0], [0.9, 0.1, 0.0], [0.9, 0.5, 0.0]] {
+            let options = Options { degree, offset, ..Options::new(cell) };
+            let s = solve(&surface, &material, &supports, &loads, &options, &Limits::default()).unwrap();
+            for y in [1.0, -1.0] {
+                let stress = s.stress([0.0, y, 0.5 * cell]).unwrap()[0];
+                (lowest, highest) = (lowest.min(stress), highest.max(stress));
+            }
+        }
+        let spread = (highest - lowest) / (highest + lowest);
+        println!(
+            "cell {cell}, degree {degree}: σ_xx at the hole from {lowest:.3} to {highest:.3} over six grid positions (± {:.1} %)",
+            100.0 * spread
+        );
+        spreads.push(spread);
+    }
+    // One cell a radius at degree 3 is not enough for a peak; four cells a radius are.
+    assert!(spreads[0] > 0.05, "{spreads:?}");
+    assert!(spreads[5] < 0.03, "{spreads:?}");
 }
