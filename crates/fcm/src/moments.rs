@@ -160,6 +160,23 @@ impl Moments {
     pub fn is_zero(&self) -> bool {
         self.total() == 0.0
     }
+
+    /// Where the points are: the mean of each natural coordinate and its standard deviation, by
+    /// the weights, from the moments of P₁ = ξ and P₂ = (3ξ² − 1)/2. `None` without weight.
+    pub fn spread(&self) -> Option<([f64; 3], [f64; 3])> {
+        let (k, total) = (self.k, self.total());
+        if !(total > 0.0) || k < 3 {
+            return None;
+        }
+        let (mut mean, mut deviation) = ([0.0; 3], [0.0; 3]);
+        for (axis, stride) in [1, k, k * k].into_iter().enumerate() {
+            let (first, second) = (self.m.get(stride).copied()?, self.m.get(2 * stride).copied()?);
+            mean[axis] = first / total;
+            let square = (2.0 * second / total + 1.0) / 3.0;
+            deviation[axis] = (square - mean[axis] * mean[axis]).max(0.0).sqrt();
+        }
+        Some((mean, deviation))
+    }
 }
 
 /// Scratch arrays of the contractions of one cell.

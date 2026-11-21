@@ -269,14 +269,16 @@ fn a_part_that_is_not_held_is_singular() {
 }
 
 /// Hostile cuts: a cell that holds a sliver of material a millionth of its size thick, with a
-/// support on it, and a part far smaller than one cell. Both solve the tension; the stress in
-/// the sliver's cell is the least accurate.
+/// support on it, and a part far smaller than one cell. Both solve the tension. The stress in
+/// the sliver's cell is read with the cells beside it (`Solution::stress`), which hold
+/// nothing fictitious, so it is the stress to rounding; from the sliver's own polynomial it
+/// was off by a per cent.
 #[test]
 fn slivers_and_parts_smaller_than_a_cell() {
     let sliver = Options { degree: 2, depth: 3, offset: [1.0 - 1e-6, 0.0, 0.0], ..Options::new(0.25) };
     let solution = tension(&sliver).unwrap();
     assert!((solution.stats.smallest_fraction - 1e-6).abs() < 1e-9, "{}", solution.stats.smallest_fraction);
-    check("sliver", &solution, 3e-2);
+    check("sliver", &solution, 1e-6);
     let coarse = Options { degree: 2, depth: 5, offset: [0.4, 0.3, 0.2], ..Options::new(4.0) };
     let solution = tension(&coarse).unwrap();
     assert_eq!(solution.stats.cells, [1, 1, 1]);

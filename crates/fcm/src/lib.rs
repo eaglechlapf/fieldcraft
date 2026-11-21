@@ -52,8 +52,14 @@
 //! refinement follows the curvature of the surface and nothing else: it does not look at the
 //! solution, so a stress that peaks at a sharp re-entrant edge or where a support ends is not
 //! refined towards, and it divides a cell along all three axes, also where a plate or an
-//! extrusion would need it along two. The stress is the derivative of the cell's polynomial and is least
-//! accurate on the boundary of the part, most of all where a supported face ends. The system is
+//! extrusion would need it along two. The stress is the derivative of the cell's polynomial and
+//! is least accurate on the boundary of the part, most of all where a supported face ends. In a
+//! cell that holds little material that polynomial is fitted to very little, and its stress is
+//! noisy; in a cell that holds less than a tenth of its volume the stress at a point is
+//! therefore read as the mean of the polynomials of the cells around the point, each weighted
+//! by its estimated error ([`Solution::stress`]).
+//! The solution itself is not changed by that: the unknowns of such a cell are still determined
+//! by little material, which costs conditioning and not accuracy elsewhere. The system is
 //! factored directly, so memory grows quickly with the degree: the caps in [`solve()`] refuse a
 //! model that would not fit. [`Solution::change_from`] compares two solutions as an indicator of
 //! convergence.

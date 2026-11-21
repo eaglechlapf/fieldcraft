@@ -188,6 +188,23 @@ impl Tree {
         Some(node)
     }
 
+    /// The leaf that covers the place of cell `at` of `level`, or of the leaves under that cell
+    /// the one nearest to the point `t` (in cells of the grid from its origin).
+    pub fn leaf_near(&self, level: usize, at: [i64; 3], t: [f64; 3]) -> Option<usize> {
+        let mut node = self.covering(level, at)?;
+        for _ in 0..=MAX_REFINE {
+            let cell = self.nodes.get(node)?;
+            if cell.is_leaf() {
+                return Some(node);
+            }
+            // The half of the cell the point is in or beside, along each axis.
+            let steps = (2u64 << cell.level) as f64;
+            let octant = (0..3).map(|axis| usize::from(t[axis] * steps >= (2 * cell.ijk[axis] + 1) as f64) << axis).sum::<usize>();
+            node = cell.children as usize + octant;
+        }
+        None
+    }
+
     /// The cell `at` of `level`, when there is one.
     pub fn find(&self, level: usize, at: [i64; 3]) -> Option<usize> {
         let node = self.covering(level, at)?;

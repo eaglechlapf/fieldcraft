@@ -13,15 +13,16 @@
 //! What the peak of one solution is worth shows over several positions of the grid
 //! (`the_fillet_stress_over_grid_positions`, the fillet read every half millimetre, a chordal
 //! tolerance of 0.05 mm, degree 3): on 8 mm cells it lies anywhere from 184 to 243 MPa, on 4 mm
-//! cells from 206 to 221. With local refinement (`Options::refine`) the 8 mm cells are divided
+//! cells from 201 to 219. With local refinement (`Options::refine`) the 8 mm cells are divided
 //! at the fillet and the holes: once, they are 4 mm there and the peak lies from 202 to 219 MPa
-//! with two thirds of the unknowns of the 4 mm grid; twice, from 212 to 248. The largest of
-//! these are not the fillet's peak: read that densely, the peak is the largest stress anywhere
-//! on the fillet, and it is found in cells that hold a few per cent of material or less, whose
-//! stress is noisy (17 % above the reference in a cell 7 % full, a quarter off in one that is
-//! 1 % full). Read at the corners and the middles of the tessellation's triangles only, the
-//! same solutions gave 201 to 220 and 212 to 221 MPa. The bracket is small against its fillet
-//! and holes, so more than half of its cells are divided and the saving is modest.
+//! with two thirds of the unknowns of the 4 mm grid; twice, from 211 to 221; at degree 4 once,
+//! from 210 to 219. The bracket is small against its fillet and holes, so more than half of its
+//! cells are divided and the saving is modest.
+//!
+//! Read that densely, the peak is the largest stress anywhere on the fillet, and before the
+//! stress of a cell that holds little material was read with its neighbours'
+//! (`Solution::stress`) it was the noise of such cells: up to 248 MPa on the cells divided
+//! twice, 17 % above the reference, in cells 0.3 to 7 % full.
 
 use std::time::Instant;
 
@@ -166,6 +167,7 @@ fn the_fillet_stress_over_grid_positions() {
         println!("tessellation at {tolerance} mm: {} triangles, the fillet read at {} points", surface.triangles().len(), on_fillet.len());
         let supports = [Support { face: foot, fixed: [true; 3], value: [0.0; 3] }];
         let loads = [Load::Force { face: top, force: [FORCE, 0.0, 0.0] }];
+        let mut spreads = Vec::new();
         for (cell, degree, refine) in [(8.0, 3, 0), (4.0, 3, 0), (8.0, 3, 1), (8.0, 3, 2), (8.0, 4, 0), (8.0, 4, 1)] {
             let (mut lowest, mut highest, mut at) = (f64::INFINITY, 0.0f64, [0.0; 3]);
             let (mut fewest, mut most, mut seconds) = (usize::MAX, 0usize, 0.0f64);
@@ -205,6 +207,15 @@ fn the_fillet_stress_over_grid_positions() {
                 at[1],
                 at[2]
             );
+            spreads.push((lowest / REFERENCE - 1.0, highest / REFERENCE - 1.0));
         }
+        // Divided at the fillet, the 8 mm cells put the peak within a few per cent of the
+        // reference wherever the grid sits: at degree 3 once and twice, and at degree 4 once.
+        // Alone they are up to 15 % off.
+        for (case, low, high) in [(2, -0.07, 0.05), (3, -0.03, 0.08), (5, -0.03, 0.05)] {
+            let (lowest, highest) = spreads[case];
+            assert!(lowest > low && highest < high, "tolerance {tolerance}, case {case}: {lowest:+.3} to {highest:+.3}");
+        }
+        assert!(spreads[0].0 < -0.1 || spreads[0].1 > 0.1, "tolerance {tolerance}: {:?}", spreads[0]);
     }
 }

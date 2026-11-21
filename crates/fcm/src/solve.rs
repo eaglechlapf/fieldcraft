@@ -39,6 +39,13 @@ const GRAIN: usize = 4096;
 /// A point this close to a grid plane, as a fraction of the cell size, may be evaluated in the
 /// cell on either side.
 const NEAR: f64 = 1e-6; // unit-factors: relative to the cell size
+/// A cut cell that holds less than this fraction of its volume in material is a sliver: its
+/// stress is read with its neighbours' ([`Solution::stress`], where the measurement is).
+const SLIVER: f64 = 0.1; // unit-factors: a fraction of a cell's volume
+/// A polynomial whose weight in the stress at a point is below this fraction of the largest is
+/// left out of the mean ([`Solution::stress`]): it could move the result by no more than this
+/// fraction of the difference between it and the others.
+const LEAST_WEIGHT: f64 = 1e-3; // unit-factors: a ratio of weights
 /// A cell whose surface turns by the limit ([`Options::TURN`]) to within this fraction resolves
 /// it: whether a fillet of exactly two cells to the radius is divided is not left to rounding.
 const AT_LIMIT: f64 = 1e-6; // unit-factors: relative to the limit
@@ -316,6 +323,11 @@ pub struct Solution {
     lame: Lame,
     tree: Tree,
     space: Space,
+    /// The fraction of each element's cell that holds material.
+    fractions: Vec<f64>,
+    /// Where the material of each element's cell is, in the cell's natural coordinates: its
+    /// middle and its half extent along each axis ([`Solution::stress`]).
+    material: Vec<([f64; 3], [f64; 3])>,
     /// Three displacement coefficients per mode.
     u: Vec<f64>,
     pub stats: Stats,
@@ -395,11 +407,83 @@ impl Solution {
         None
     }
 
-    /// The displacement and its gradient ∂uᵢ/∂xⱼ at `x`.
+    /// The displacement and its gradient ∂uᵢ/∂xⱼ at `x`: the displacement of the cell that holds
+    /// the point, and the gradient of that cell's polynomial or, in a cell that holds little
+    /// material, the weighted mean of the gradients of the polynomials around the point
+    /// ([`Solution::stress`]).
     fn field(&self, x: [f64; 3]) -> Option<([f64; 3], [[f64; 3]; 3])> {
         let (element, xi, size) = self.locate(x)?;
-        let local = self.space.local(element, &self.u);
-        Some(cell::field(&self.shapes, xi, size, &local))
+        let (u, own) = cell::field(&self.shapes, xi, size, &self.space.local(element, &self.u));
+        let readers = self.readers(element, x);
+        let least = readers.iter().map(|reader| reader.estimate).fold(f64::INFINITY, f64::min);
+        let (mut sum, mut total, mut count) = ([[0.0; 3]; 3], 0.0, 0);
+        for reader in &readers {
+            // The weight of an estimate with this error among independent ones, over the largest.
+            let weight = (least / reader.estimate) * (least / reader.estimate);
+            if !(weight >= LEAST_WEIGHT) {
+                continue;
+            }
+            let gradient = if reader.element == element {
+                own
+            } else {
+                cell::field(&self.shapes, reader.xi, reader.size, &self.space.local(reader.element, &self.u)).1
+            };
+            for i in 0..3 {
+                for j in 0..3 {
+                    sum[i][j] += weight * gradient[i][j];
+                }
+            }
+            total += weight;
+            count += 1;
+        }
+        // One estimate is itself, to the last bit.
+        Some((u, if count > 1 { sum.map(|row| row.map(|value| value / total)) } else { own }))
+    }
+
+    /// The polynomials that give the gradient at `x`, a point of `element`, when the element is a
+    /// sliver ([`SLIVER`]): its own first, then those of the leaves around it, each with its
+    /// estimated error ([`Solution::stress`]). None for any other element, whose own is used.
+    fn readers(&self, element: usize, x: [f64; 3]) -> Vec<Reader> {
+        let mut readers = Vec::new();
+        if self.fractions.get(element).copied().unwrap_or(1.0) >= SLIVER {
+            return readers;
+        }
+        let Some((node, cell)) = self.space.elements.get(element).and_then(|node| Some((*node as usize, self.tree.nodes.get(*node as usize)?)))
+        else {
+            return readers;
+        };
+        let t = [0, 1, 2].map(|a| (x[a] - self.grid.origin[a]) / self.grid.spacing);
+        let reader = |node: usize| -> Option<Reader> {
+            let other = self.tree.nodes.get(node)?;
+            let element = self.space.element_of.get(node).copied().filter(|element| *element != NONE)? as usize;
+            let fraction = self.fractions.get(element).copied().filter(|fraction| *fraction > 0.0)?;
+            let (middle, half) = self.material.get(element).copied()?;
+            let steps = (1u64 << other.level) as f64;
+            let xi = [0, 1, 2].map(|a| 2.0 * (t[a] * steps - other.ijk[a] as f64) - 1.0);
+            // How far a polynomial bounded on the cell's material can grow to the point, over
+            // the root of the fraction of the cell that holds that material.
+            let growth: f64 = (0..3).map(|a| chebyshev(self.shapes.p, ((xi[a] - middle[a]).abs() / half[a]).max(1.0))).product();
+            Some(Reader { estimate: growth / fraction.sqrt(), element, xi, size: self.grid.step(usize::from(other.level)) })
+        };
+        readers.extend(reader(node));
+        let (level, at) = (usize::from(cell.level), cell.ijk.map(i64::from));
+        for around in 0..27i64 {
+            let beside = [at[0] + around % 3 - 1, at[1] + (around / 3) % 3 - 1, at[2] + around / 9 - 1];
+            if let Some(found) = self.tree.leaf_near(level, beside, t).and_then(reader)
+                && readers.iter().all(|reader| reader.element != found.element)
+            {
+                readers.push(found);
+            }
+        }
+        readers
+    }
+
+    /// The fraction of its volume that the cell that holds a point of the part holds in material
+    /// (with refinement, the cell that is not divided): 1 for a cell wholly inside the part.
+    /// The polynomial of a cell that holds little is the least accurate ([`Solution::stress`]).
+    pub fn material_fraction(&self, x: [f64; 3]) -> Option<f64> {
+        let (element, _, _) = self.locate(x)?;
+        self.fractions.get(element).copied()
     }
 
     /// The displacement at a point of the part; `None` outside the cells that hold material
@@ -410,6 +494,47 @@ impl Solution {
     }
 
     /// The stress at a point of the part, in the order xx, yy, zz, xy, xz, yz.
+    ///
+    /// **In a cell that holds little material.** The stress is the derivative of a cell's
+    /// polynomial, and the polynomial of a cut cell is fitted to the material the cell holds. A
+    /// cell that holds the fraction η of its volume takes its share of the solution's error on
+    /// that much material, so its stress is off by about 1/√η times what a full cell's is (the
+    /// same energy of the error on η of the volume), and it has to meet its neighbours'
+    /// polynomials on faces that lie almost wholly outside the part. The stress in such a cell
+    /// is noisy: on the bracket of `tests/bracket.rs` it is up to a quarter off in a cell that
+    /// is one per cent full, between neighbours that are within a few per cent.
+    ///
+    /// The polynomials of the cells around know the stress there too. Continued beyond the
+    /// material it is fitted to, a polynomial of degree p that is within a bound on an interval
+    /// is within Tₚ(d) times the bound at d half lengths of the interval from its middle, Tₚ
+    /// being Chebyshev's polynomial, which grows fastest of all (T. J. Rivlin, *The Chebyshev
+    /// Polynomials*, Wiley 1974). So in a cell that holds less than a tenth of its volume in
+    /// material the stress at a point is not read from the cell's polynomial alone: every cell
+    /// around the point gives an estimate, with an error of about Π Tₚ(dₐ) / √η of its own (dₐ
+    /// along each axis, from the middle of the cell's material in half extents of it, at least
+    /// 1), and the stress is the mean of the estimates, each weighted by one over the square of
+    /// that error, as independent estimates are. The displacement is the cell's own, and so is
+    /// the stress in every cell that holds more. Nothing of this enters the solution: it is how
+    /// the stress is read from it.
+    ///
+    /// The tenth is measured. With the limit at 0, 0.02, 0.05, 0.1, 0.2, 0.4 and 1:
+    /// - on the bracket (8 mm cells divided twice at degree 3, the fillet read every half
+    ///   millimetre at a chordal tolerance of 0.0877 mm, six grid positions) the largest stress
+    ///   on the fillet is 17 % above the reference up to 0.05, read in a cell 7 % full, and
+    ///   6.7 % above it from 0.1 on, in a cell half full; divided once at degree 4 it is 7.6 %
+    ///   above at 0 and 3.6 % from 0.02 on;
+    /// - on the tube of `tests/lame.rs` (the largest stress error over 25 points, twenty grids
+    ///   and degrees) the error is the same or lower up to 0.05 but for one grid (0.64 % to
+    ///   0.79 %), rises on one more at 0.1 (0.14 % to 0.25 %), and from 0.2 on the coarsest
+    ///   grids, whose cells are 11 % full and more, are read far worse (0.65 % to 7.7 %);
+    /// - a block in tension cut to slivers a millionth of a cell thick (`tests/patch.rs`) has
+    ///   its stress to 2e-8 at any limit above that, and to 1e-2 without.
+    ///
+    /// So cells up to 7 % full were seen to be noisy, and cells of 11 % read better alone.
+    /// Where the cells resolve the stress, a sliver's own polynomial is as good as its
+    /// neighbours' and the mean costs a little: on Kirsch's quarter plate with divided cells
+    /// (`tests/benchmarks.rs`) the stresses at the two ends of the hole, which lie in slivers
+    /// on the planes of symmetry, move from within 0.6 % of the exact values to within 1.7 %.
     pub fn stress(&self, x: [f64; 3]) -> Option<[f64; 6]> {
         let (_, g) = self.field(x)?;
         let (lambda, mu) = (self.lame.lambda, self.lame.mu);
@@ -536,6 +661,27 @@ fn conditions(supports: &[Support], loads: &[Load], areas: &BTreeMap<u32, f64>, 
         return Err(Error::Invalid("the part has no support: prescribe the displacement of at least one face".into()));
     }
     Ok((faces, body))
+}
+
+/// A cell's polynomial as an estimate of the gradient at a point ([`Solution::stress`]).
+struct Reader {
+    /// How large its error is estimated to be, against a cell wholly inside the part at a
+    /// point of its own.
+    estimate: f64,
+    element: usize,
+    /// The point in the cell's natural coordinates: outside [−1, 1] for a neighbour's.
+    xi: [f64; 3],
+    /// The size of the cell.
+    size: f64,
+}
+
+/// Chebyshev's polynomial Tₚ at `x` ≥ 1, by its recurrence Tₖ₊₁ = 2x Tₖ − Tₖ₋₁.
+fn chebyshev(p: usize, x: f64) -> f64 {
+    let (mut before, mut value) = (1.0, x);
+    for _ in 1..p {
+        (before, value) = (value, 2.0 * x * value - before);
+    }
+    value
 }
 
 fn factor_error(e: FactorError) -> Error {
@@ -987,6 +1133,8 @@ fn solve_at(
         levels: [0; MAX_REFINE + 1],
     };
     let mut nitsche = vec![0.0; elements];
+    let mut fractions = vec![1.0; elements];
+    let mut material = vec![([0.0; 3], [1.0; 3]); elements];
     let mut inside: Vec<Option<Moments>> = vec![None; elements];
     for block in fieldcraft_parallel::blocks(elements, block_size) {
         let first = block.start;
@@ -1016,6 +1164,14 @@ fn solve_at(
                     stats.quadrature_points += cut.points;
                     stats.volume += cut.volume;
                     stats.smallest_fraction = stats.smallest_fraction.min(cut.volume / (size * size * size));
+                    if let Some(fraction) = fractions.get_mut(element) {
+                        *fraction = cut.volume / (size * size * size);
+                    }
+                    // A uniform box with the material's middle and spread: its half extent is
+                    // √3 standard deviations.
+                    if let (Some(place), Some((mean, deviation))) = (material.get_mut(element), cut.inside.spread()) {
+                        *place = (mean, deviation.map(|sigma| 3f64.sqrt() * sigma));
+                    }
                     stats.largest_nitsche = stats.largest_nitsche.max(cut.nitsche);
                     if let Some(parameter) = nitsche.get_mut(element) {
                         *parameter = cut.nitsche;
@@ -1104,7 +1260,7 @@ fn solve_at(
 
     // The positions of the modes were for the ordering only.
     space.xyz = Vec::new();
-    Ok(Solution { grid, shapes, lame, tree, space, u, stats, strain_energy, reactions })
+    Ok(Solution { grid, shapes, lame, tree, space, fractions, material, u, stats, strain_energy, reactions })
 }
 
 #[cfg(test)]
@@ -1309,6 +1465,28 @@ mod tests {
         // Cut cells divided: to the fictitious stiffness.
         hanging(&Options { degree: 2, refine: 2, offset: [0.31, 0.62, 0.13], ..Options::new(0.25) }, &scattered, 5e-3);
         hanging(&Options { degree: 3, refine: 2, offset: [0.31, 0.62, 0.13], ..Options::new(0.25) }, &scattered, 5e-3);
+    }
+
+    /// The stress in a cell that holds a sliver of material is the mean of what the cells around
+    /// the point say, each by its estimated error ([`Solution::stress`]): in a block in tension
+    /// whose first cells hold a millionth of their volume, it is the stress to the fictitious
+    /// stiffness of the cells beside them and no longer to that of the slivers.
+    #[test]
+    fn the_stress_in_a_sliver_is_read_from_the_cells_around_it() {
+        let options = Options { degree: 2, offset: [1.0 - 1e-6, 0.0, 0.0], ..Options::new(0.25) };
+        let (_, _, solution) = tension(&options, &scattered);
+        assert_eq!(solution.stats.levels[0], solution.stats.cut_cells);
+        for x in [[1e-7, 0.2, 0.1], [0.0, 0.0, 0.0], [2e-7, 0.5, 0.25]] {
+            let fraction = solution.material_fraction(x).unwrap();
+            assert!((fraction - 1e-6).abs() < 1e-9, "{x:?}: {fraction}");
+            let stress = solution.stress(x).unwrap();
+            assert!((stress[0] - STRESS).abs() < 1e-6 * STRESS && stress[1..].iter().all(|s| s.abs() < 1e-6 * STRESS), "{x:?}: {stress:?}");
+        }
+        // The cells beside them are full, and a point outside the cells has no fraction.
+        assert!((solution.material_fraction([0.1, 0.2, 0.1]).unwrap() - 1.0).abs() < 1e-12);
+        assert!(solution.material_fraction([5.0, 0.2, 0.1]).is_none());
+        // Chebyshev's polynomials: T₁ = x, T₃ = 4x³ − 3x.
+        assert_eq!((chebyshev(1, 1.5), chebyshev(3, 1.0), chebyshev(3, 2.0)), (1.5, 1.0, 26.0));
     }
 
     /// A point on the plane between a divided cell and its neighbour, or between two cells of a
