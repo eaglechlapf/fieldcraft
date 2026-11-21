@@ -146,7 +146,7 @@ fn clear(p: [f64; 3], q: [f64; 3], reach: &[u32], surface: &Triangles) -> bool {
 /// The square of the distance from `p` to a triangle (C. Ericson, *Real-Time Collision
 /// Detection*, Morgan Kaufmann 2005, section 5.1.5: the closest point by the Voronoi region of
 /// the triangle the point is in).
-fn distance_squared(p: [f64; 3], triangle: &[[f64; 3]; 3]) -> f64 {
+pub(crate) fn distance_squared(p: [f64; 3], triangle: &[[f64; 3]; 3]) -> f64 {
     let [a, b, c] = *triangle;
     let (ab, ac, ap) = (sub(b, a), sub(c, a), sub(p, a));
     let away = |x: [f64; 3]| {
@@ -213,11 +213,10 @@ pub(crate) fn island_at(pieces: &[Piece], of_piece: &[u16], x: [f64; 3]) -> usiz
     nearest(pieces, x).and_then(|piece| of_piece.get(piece)).map_or(0, |island| usize::from(*island))
 }
 
-/// The sheets of surface in the cell at `lo` of size `h`: the triangles that have a piece in it,
+/// The sheets of surface in the cell from `lo` to `hi`: the triangles that have a piece in it,
 /// in increasing order, their sets by the edges they share inside the cell (the module's first
 /// step), and the number of those sets.
-fn sheets(lo: [f64; 3], h: f64, pieces: &[Piece], surface: &Triangles) -> (Vec<u32>, Sets, usize) {
-    let hi = [lo[0] + h, lo[1] + h, lo[2] + h];
+pub(crate) fn sheets(lo: [f64; 3], hi: [f64; 3], pieces: &[Piece], surface: &Triangles) -> (Vec<u32>, Sets, usize) {
     let mut owned: Vec<u32> = pieces.iter().map(|piece| piece.triangle).collect();
     owned.sort_unstable();
     owned.dedup();
@@ -251,6 +250,9 @@ pub(crate) struct CutLeaf {
     /// The island of each piece of surface the cell owns, in their order; empty when the cell
     /// has one island.
     pub of_piece: Vec<u16>,
+    /// Whether the moments are exact, from the triangles in the cell ([`crate::exact`]), and
+    /// not a quadrature's.
+    pub exact: bool,
 }
 
 impl CutLeaf {
@@ -294,13 +296,16 @@ impl Groups {
     }
 }
 
-/// Integrate the cut cell at `lo` of size `h` ([`grid::visit_spans`]) and sort its material into
-/// islands (the module's three steps). With `separate` off the cell is one island whatever it
-/// holds.
+/// Integrate the cut cell from `lo` to `hi`, of size `h`, and sort its material into islands.
+/// With `exact` the moments come from the triangles in the cell ([`crate::exact`]) wherever
+/// that decides them; otherwise, and in the cells it leaves, from the quadrature
+/// ([`grid::visit_spans`]) and the module's three steps. With `separate` off the cell is one
+/// island whatever it holds.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn integrate(
     tables: &Tables,
     lo: [f64; 3],
+    hi: [f64; 3],
     h: f64,
     reach: &[u32],
     pieces: &[Piece],
@@ -310,16 +315,20 @@ pub(crate) fn integrate(
     depth: usize,
     max_points: usize,
     separate: bool,
+    exact: bool,
 ) -> Result<CutLeaf> {
+    if exact && let Some(leaf) = crate::exact::integrate(tables, lo, hi, reach, pieces, surface, solid, [rules[1], rules[2]], separate)? {
+        return Ok(leaf);
+    }
     // The triangles that have a piece here, and their groups by the edges they share here.
-    let (owned, sets, groups) = if separate { sheets(lo, h, pieces, surface) } else { (Vec::new(), Sets::new(0), 1) };
+    let (owned, sets, groups) = if separate { sheets(lo, hi, pieces, surface) } else { (Vec::new(), Sets::new(0), 1) };
     let slot = |t: u32| if t == NO_TRIANGLE { None } else { owned.binary_search(&t).ok() };
     if !separate || groups <= 1 {
         let (mut inside, mut outside) = (Moments::new(tables), Moments::new(tables));
         let points = grid::visit_cut_quadrature(lo, h, reach, surface, solid, rules, depth, max_points, |point| {
             if point.inside { inside.add(point.xi, point.weight) } else { outside.add(point.xi, point.weight) }
         })?;
-        return Ok(CutLeaf { inside: vec![inside], outside, points, of_piece: Vec::new() });
+        return Ok(CutLeaf { inside: vec![inside], outside, points, of_piece: Vec::new(), exact: false });
     }
 
     // Several sheets of surface: the material behind each, joined where a line through the
@@ -406,7 +415,7 @@ pub(crate) fn integrate(
         inside.push(found.inside.get_mut(*root).and_then(Option::take).unwrap_or_else(|| Moments::new(tables)));
     }
     if islands.len() <= 1 {
-        return Ok(CutLeaf { inside, outside, points, of_piece: Vec::new() });
+        return Ok(CutLeaf { inside, outside, points, of_piece: Vec::new(), exact: false });
     }
     if islands.len() > usize::from(u16::MAX) {
         return Err(Error::Limit(format!("a cell holds {} separate pieces of material (use a smaller cell size)", islands.len())));
@@ -418,7 +427,7 @@ pub(crate) fn integrate(
             root.and_then(|root| islands.binary_search(&root).ok()).unwrap_or(0) as u16
         })
         .collect();
-    Ok(CutLeaf { inside, outside, points, of_piece })
+    Ok(CutLeaf { inside, outside, points, of_piece, exact: false })
 }
 
 /// A cell that holds material, as [`links`] reads it: its box, the pieces of surface it owns and

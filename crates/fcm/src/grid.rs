@@ -16,6 +16,12 @@
 //! surface reaches at most its boundary), which its centre decides ([`crate::inside`]).
 //!
 //! # Quadrature of a cut cell
+//! Most cut cells are integrated exactly from their triangles and need no point inside them
+//! ([`crate::exact`]). This quadrature integrates the ones that leaves (a cell whose highest
+//! corner lies on the surface, or whose pieces of material it cannot tell apart with
+//! certainty), every cell when it is turned off, and it is what the exact moments are tested
+//! against.
+//!
 //! The integrand of a cut cell jumps at the surface, which Gauss quadrature over the whole cell
 //! would integrate badly. A box the surface reaches is integrated one axis at a time instead
 //! (Fubini's theorem), each axis split where the integrand is not smooth:
@@ -262,7 +268,7 @@ const CUT: u8 = 3;
 /// The part of a triangle inside the box `lo`–`hi`: a convex polygon (empty when they do not
 /// overlap), each corner with where the edge that leaves it comes from. A corner made by a cut
 /// has the cut plane's coordinate exactly.
-fn clip(triangle: &[[f64; 3]; 3], lo: [f64; 3], hi: [f64; 3]) -> Vec<([f64; 3], u8)> {
+pub(crate) fn clip(triangle: &[[f64; 3]; 3], lo: [f64; 3], hi: [f64; 3]) -> Vec<([f64; 3], u8)> {
     let mut polygon: Vec<([f64; 3], u8)> = vec![(triangle[0], 0), (triangle[1], 1), (triangle[2], 2)];
     for a in 0..3 {
         for (side, (bound, below)) in [(lo[a], false), (hi[a], true)].into_iter().enumerate() {
@@ -817,7 +823,7 @@ const ON_EDGE: f64 = 1e-9; // unit-factors: barycentric, relative to the triangl
 /// Where the line along `axis` through the other two coordinates `(ub, uc)` (those of the next
 /// two axes in cyclic order) pierces a triangle: the coordinate along `axis`. `None` when the
 /// line misses the triangle or runs in its plane.
-fn pierce(triangle: &[[f64; 3]; 3], axis: usize, ub: f64, uc: f64) -> Option<f64> {
+pub(crate) fn pierce(triangle: &[[f64; 3]; 3], axis: usize, ub: f64, uc: f64) -> Option<f64> {
     let (b, c) = ((axis + 1) % 3, (axis + 2) % 3);
     let [p, q, r] = triangle;
     let (qb, qc, rb, rc) = (q[b] - p[b], q[c] - p[c], r[b] - p[b], r[c] - p[c]);

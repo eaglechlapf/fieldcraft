@@ -36,12 +36,16 @@
 //! 3. **Basis** ([`legendre`]): the tensor product of integrated Legendre polynomials of degree
 //!    p on every cell, or its trunk space ([`Options::basis`]). Modes on a shared vertex, edge
 //!    or face of the grid are one unknown.
-//! 4. **Cut cells** ([`grid`]): a cell the surface cuts is integrated one axis at a time, split
-//!    where the surface and its edges cross, with Gauss rules that integrate a cell cut by flat
-//!    faces exactly; where the surface is curved, an octree of depth [`Options::depth`] divides
-//!    the cell first. Points outside the part are weighted with [`Options::fictitious`]. The
-//!    points are not summed mode pair by mode pair: they are summed into the Legendre moments of
-//!    the cell's material, from which every cell matrix follows by sum factorisation.
+//! 4. **Cut cells**: what a cell the surface cuts needs are the Legendre moments of its
+//!    material, from which every cell matrix follows by sum factorisation. The
+//!    surface is a triangulation, so they are integrals of polynomials over a polyhedron, and
+//!    the divergence theorem gives them exactly from the triangles in the cell and one inside
+//!    test ([`exact`], [`Options::exact`]). A cell in a position that does not decide with
+//!    certainty (its highest corner on the surface) is integrated by quadrature instead
+//!    ([`grid`]): one axis at a time, split where the surface and its edges cross, with Gauss
+//!    rules that integrate a cell cut by flat faces exactly, on an octree of depth
+//!    [`Options::depth`] where the surface is curved. The volume outside the part is weighted
+//!    with [`Options::fictitious`].
 //! 5. **Islands** ([`Options::separate`], [`islands`]): a cell that holds material in separate
 //!    pieces (the two flanges at the open corner of a sheet metal part, the two sides of a slit)
 //!    carries shape functions of its own for each piece, and two cells share the functions of
@@ -92,6 +96,7 @@
 
 mod cell;
 mod dense;
+pub mod exact;
 pub mod gauss;
 pub mod grid;
 pub mod inside;

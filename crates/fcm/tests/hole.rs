@@ -93,11 +93,13 @@ fn quarter_field() {
     }
 }
 
-/// The octree's depth is the accuracy of the matrices of a cell a curved face cuts. A quarter
-/// plate of half width 8 on cells as large as the hole's radius: the stress at the top of the
-/// hole settles with the depth (to 0.1 % from depth 2 to 3), and at the default depth it falls
-/// steadily with the degree to the value a finer grid gives. With an octree of depth 1 it went
-/// up and down from degree to degree instead.
+/// Where the cut cells are integrated by quadrature ([`Options::exact`] off, as here, or a cell
+/// whose highest corner lies on the surface, as most of this plate's would be: its faces are
+/// in the grid's planes), the octree's depth is the accuracy of the matrices of a cell a curved
+/// face cuts. A quarter plate of half width 8 on cells as large as the hole's radius: the
+/// stress at the top of the hole settles with the depth (to 0.1 % from depth 2 to 3), and at
+/// the default depth it falls steadily with the degree to the value a finer grid gives. With
+/// an octree of depth 1 it went up and down from degree to degree instead.
 #[test]
 #[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
 fn depth_of_the_octree() {
@@ -130,7 +132,7 @@ fn depth_of_the_octree() {
         );
         let supports = [slide(AT_X0, 0), slide(AT_Y0, 1), slide(AT_Z0, 2), slide(AT_Z1, 2)];
         let loads = [Load::Traction { face: OUTER_A, traction: [1.0, 0.0, 0.0] }];
-        let options = Options { degree, depth, offset: [0.37, 0.21, 0.0], ..Options::new(cell) };
+        let options = Options { degree, depth, exact: false, offset: [0.37, 0.21, 0.0], ..Options::new(cell) };
         solve(&surface, &material, &supports, &loads, &options, &Limits::default()).unwrap().stress([0.0, 1.0, 0.5 * cell]).unwrap()[0]
     };
     let mut settled = Vec::new();

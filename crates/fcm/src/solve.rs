@@ -154,7 +154,8 @@ pub struct Options {
     /// The polynomial degree of the shape functions, 1..=[`MAX_DEGREE`].
     pub degree: usize,
     /// The depth of the octree under a cut cell where the surface in it is curved,
-    /// 0..=[`MAX_DEPTH`].
+    /// 0..=[`MAX_DEPTH`]: for the cells the quadrature integrates, which are few unless
+    /// [`Options::exact`] is off.
     pub depth: usize,
     /// The stiffness of the cell volume outside the part, as a fraction of the material's.
     ///
@@ -274,6 +275,12 @@ pub struct Options {
     /// same to the bit either way; integrating a cut cell is the most work a cell takes, and a
     /// round leaves most cells as they were.
     pub reuse: bool,
+    /// Whether the cut cells are integrated exactly, from the triangles of the surface in them
+    /// ([`crate::exact`]: the divergence theorem, at a cost that grows with the number of
+    /// triangles in a cell), where that decides a cell with certainty; the others, and all of
+    /// them without it, are integrated by the quadrature on an octree of [`Options::depth`]
+    /// levels ([`crate::grid`]). [`Stats::exact_cells`] counts them.
+    pub exact: bool,
 }
 
 impl Options {
@@ -335,6 +342,7 @@ impl Options {
             adapt: 0,
             settle: 0.0,
             reuse: true,
+            exact: true,
         }
     }
 
@@ -388,6 +396,9 @@ pub struct Stats {
     pub unknowns: usize,
     /// Quadrature points of the cut cells.
     pub quadrature_points: usize,
+    /// The cut cells that were integrated exactly ([`Options::exact`]); the others were left to
+    /// the quadrature on the octree.
+    pub exact_cells: usize,
     /// Entries of the stiffness, as the factorization counts them.
     pub stiffness_entries: usize,
     /// Entries of the Cholesky factor.
@@ -1349,6 +1360,7 @@ fn solve_at(
             islands::integrate(
                 &shapes.tables,
                 grid.fine_lo(level, cell.position()),
+                grid.fine_hi(level, cell.position()),
                 grid.step(level),
                 touching.get(node).map(Vec::as_slice).unwrap_or_default(),
                 pieces.get(node).map(Vec::as_slice).unwrap_or_default(),
@@ -1359,6 +1371,7 @@ fn solve_at(
                 options.depth.saturating_sub(level),
                 MAX_CELL_POINTS,
                 options.separate,
+                options.exact,
             )
         });
         for (node, leaf) in todo.iter().zip(integrated) {
@@ -1588,6 +1601,7 @@ fn solve_at(
         cut_cells: 0,
         unknowns,
         quadrature_points: 0,
+        exact_cells: 0,
         stiffness_entries,
         factor_entries: 0,
         volume: 0.0,
@@ -1637,6 +1651,7 @@ fn solve_at(
                 Some(cut) => {
                     stats.cut_cells += usize::from(island == 0);
                     stats.quadrature_points += cut.points;
+                    stats.exact_cells += usize::from(island == 0 && cut_of(node).is_some_and(|leaf| leaf.exact));
                     stats.volume += cut.volume;
                     stats.smallest_fraction = stats.smallest_fraction.min(cut.volume / (size * size * size));
                     if let Some(fraction) = fractions.get_mut(element) {

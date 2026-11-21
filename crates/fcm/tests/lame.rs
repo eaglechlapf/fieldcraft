@@ -73,10 +73,11 @@ fn report(name: &str, solution: &Solution) -> (f64, f64) {
     let force = PRESSURE * INNER_RADIUS * LENGTH;
     let reaction = |face: u32, i: usize| solution.reactions.iter().find(|r| r.face == face).unwrap().force[i];
     println!(
-        "{name}: cells {:?} ({} inside, {} cut), {} unknowns, {} points, volume error {:.2e}, smallest fraction {:.2e}, displacement error {displacement:.2e}, stress error {stress:.2e}, reactions {:.4} {:.4} of p a L",
+        "{name}: cells {:?} ({} inside, {} cut, {} exact), {} unknowns, {} points, volume error {:.2e}, smallest fraction {:.2e}, displacement error {displacement:.2e}, stress error {stress:.2e}, reactions {:.4} {:.4} of p a L",
         stats.cells,
         stats.inside_cells,
         stats.cut_cells,
+        stats.exact_cells,
         stats.unknowns,
         stats.quadrature_points,
         (stats.volume - volume).abs() / volume,
@@ -319,4 +320,29 @@ fn the_rounds_do_not_depend_on_the_threads() {
     assert_eq!(one, run(2));
     assert_eq!(one, run(7));
     assert_eq!(one, run_with(3, false));
+}
+
+/// The cut cells integrated exactly from their triangles ([`Options::exact`]) against the
+/// quadrature on the octree. With the grid off the tube's faces every cut cell is integrated
+/// exactly: the volume is the triangulated tube's own to rounding, whatever the octree's depth
+/// would be, and the solution is the one the quadrature comes close to with a deeper octree.
+#[test]
+fn exact_cells_against_the_octree() {
+    let run = |exact: bool, depth: usize| tube(&Options { degree: 3, depth, exact, offset: [0.37, 0.21, 0.43], ..Options::new(0.1) });
+    let exact = run(true, 1);
+    assert!(exact.stats.cut_cells > 0);
+    assert_eq!(exact.stats.exact_cells, exact.stats.cut_cells);
+    let volume = |solution: &Solution| (solution.stats.volume - solution.stats.surface_volume).abs() / solution.stats.surface_volume;
+    assert!(volume(&exact) < 1e-13, "volume error {:.2e}", volume(&exact));
+    // The octree's depth is of no account.
+    assert_eq!(exact.strain_energy.to_bits(), run(true, 4).strain_energy.to_bits());
+    let mut apart = Vec::new();
+    for depth in [1, 4] {
+        let octree = run(false, depth);
+        assert_eq!(octree.stats.exact_cells, 0);
+        apart.push((octree.strain_energy - exact.strain_energy).abs() / exact.strain_energy);
+        println!("depth {depth}: volume error {:.2e}, strain energy {:.2e} from the exact cells'", volume(&octree), apart[apart.len() - 1]);
+        assert!(volume(&octree) > 1e-9, "the quadrature of a curved cell is not exact");
+    }
+    assert!(apart[1] < 0.1 * apart[0] && apart[1] < 5e-6, "{apart:?}");
 }
