@@ -296,12 +296,15 @@ fn the_rounds_end_once_the_solution_has_settled() {
     }
 }
 
-/// The same bits on one thread and on several, with rounds that follow the solution.
+/// The same bits on one thread and on several, with rounds that follow the solution, and the
+/// same whether a round takes the integrals of the cut cells it leaves as they are from the
+/// round before or integrates them again ([`Options::reuse`]).
 #[test]
 fn the_rounds_do_not_depend_on_the_threads() {
-    let run = |threads: usize| {
+    let run_with = |threads: usize, reuse: bool| {
         fieldcraft_parallel::with_threads(threads, || {
-            let solution = tube(&Options { degree: 2, depth: 1, adapt: 2, offset: [0.37, 0.21, 0.43], ..Options::new(0.1) });
+            let solution = tube(&Options { degree: 2, depth: 2, adapt: 2, reuse, offset: [0.37, 0.21, 0.43], ..Options::new(0.1) });
+            assert_eq!(solution.stats.rounds, 2);
             let mut bits = vec![solution.strain_energy.to_bits(), solution.stats.unknowns as u64, solution.stats.settled.to_bits()];
             bits.extend(solution.stats.levels.iter().map(|cells| *cells as u64));
             for x in [[0.1, 0.0, 0.025], [0.0, 0.2, 0.05], [0.11, 0.1, 0.02]] {
@@ -311,7 +314,9 @@ fn the_rounds_do_not_depend_on_the_threads() {
             bits
         })
     };
+    let run = |threads: usize| run_with(threads, true);
     let one = run(1);
     assert_eq!(one, run(2));
     assert_eq!(one, run(7));
+    assert_eq!(one, run_with(3, false));
 }

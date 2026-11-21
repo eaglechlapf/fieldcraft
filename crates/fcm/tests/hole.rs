@@ -23,7 +23,7 @@
 mod common;
 
 use common::{AT_X0, AT_Y0, AT_Z0, AT_Z1, OUTER_A, OUTER_B, ring, strip};
-use fieldcraft_fcm::{Load, Material, Options, Support, solve};
+use fieldcraft_fcm::{Basis, Load, Material, Options, Support, solve};
 use fieldcraft_solver::Limits;
 
 fn slide(face: u32, axis: usize) -> Support {
@@ -276,22 +276,25 @@ fn where_the_refined_grid_sits() {
     let material = Material { young: 1000.0, poisson: 0.3, density: 0.0 };
     let mut spreads = Vec::new();
     let cases = [
-        (1.0, 3, 0, 0),
-        (1.0, 3, 1, 0),
-        (1.0, 3, 2, 0),
-        (0.5, 3, 0, 0),
-        (0.25, 3, 0, 0),
-        (1.0, 4, 0, 0),
-        (1.0, 4, 1, 0),
-        (1.0, 4, 2, 0),
-        (0.5, 4, 0, 0),
-        (2.0, 4, 2, 0),
-        (2.0, 3, 3, 0),
+        (1.0, 3, 0, 0, Basis::Tensor),
+        (1.0, 3, 1, 0, Basis::Tensor),
+        (1.0, 3, 2, 0, Basis::Tensor),
+        (0.5, 3, 0, 0, Basis::Tensor),
+        (0.25, 3, 0, 0, Basis::Tensor),
+        (1.0, 4, 0, 0, Basis::Tensor),
+        (1.0, 4, 1, 0, Basis::Tensor),
+        (1.0, 4, 2, 0, Basis::Tensor),
+        (0.5, 4, 0, 0, Basis::Tensor),
+        (2.0, 4, 2, 0, Basis::Tensor),
+        (2.0, 3, 3, 0, Basis::Tensor),
         // Rounds that follow the solution in place of the levels at the hole.
-        (1.0, 3, 0, 2),
-        (1.0, 3, 0, 3),
+        (1.0, 3, 0, 2, Basis::Tensor),
+        (1.0, 3, 0, 3, Basis::Tensor),
+        // The trunk space on the cells divided at the hole.
+        (1.0, 3, 2, 0, Basis::Trunk),
+        (1.0, 4, 2, 0, Basis::Trunk),
     ];
-    for (cell, degree, refine, adapt) in cases {
+    for (cell, degree, refine, adapt, basis) in cases {
         // One cell of the grid thick, whatever the cells at the hole.
         let surface = ring(
             N,
@@ -328,7 +331,7 @@ fn where_the_refined_grid_sits() {
         let (mut fewest, mut most, mut seconds) = (usize::MAX, 0usize, 0.0f64);
         let mut levels = [0usize; 5];
         for offset in [[0.0, 0.0, 0.0], [0.0, 0.21, 0.0], [0.37, 0.21, 0.0], [0.37, 0.9, 0.0], [0.9, 0.1, 0.0], [0.9, 0.5, 0.0]] {
-            let options = Options { degree, offset, refine, adapt, ..Options::new(cell) };
+            let options = Options { degree, offset, refine, adapt, basis, ..Options::new(cell) };
             let started = std::time::Instant::now();
             let s = solve(&surface, &material, &supports, &loads, &options, &Limits::default()).unwrap();
             seconds += started.elapsed().as_secs_f64() / 6.0;
@@ -350,7 +353,7 @@ fn where_the_refined_grid_sits() {
         }
         let spread = (highest - lowest) / (highest + lowest);
         println!(
-            "cell {cell}, degree {degree}, {refine} levels, {adapt} rounds: σ_xx at the hole from {lowest:.3} to {highest:.3} over six grid positions (± {:.1} %); {fewest} to {most} unknowns, at most {levels:?} cells by level, {seconds:.1} s a solve",
+            "cell {cell}, degree {degree} ({basis:?}), {refine} levels, {adapt} rounds: σ_xx at the hole from {lowest:.3} to {highest:.3} over six grid positions (± {:.1} %); {fewest} to {most} unknowns, at most {levels:?} cells by level, {seconds:.1} s a solve",
             100.0 * spread
         );
         spreads.push((spread, most));
@@ -363,4 +366,9 @@ fn where_the_refined_grid_sits() {
     // stress peak holds little: two of them leave the stress at the hole within ± 7 % where two
     // levels at the hole leave it within ± 0.7 %, and a third comes to ± 1.6 %.
     assert!(spreads[11].0 > 2.0 * spreads[2].0 && spreads[12].0 < spreads[11].0 && spreads[12].0 < 0.03, "{spreads:?}");
+    // On cells divided at the hole the trunk space does with a third of the unknowns at degree
+    // 3 (± 1.1 % where the tensor product has ± 0.7 %) and with a little over half at degree 4
+    // (± 0.5 %): what it lacks of the tensor product, the smaller cells make up for.
+    assert!(spreads[13].0 < 0.02 && 3 * spreads[13].1 < spreads[2].1 + spreads[2].1 / 10, "{spreads:?}");
+    assert!(spreads[14].0 < 0.01 && spreads[14].0 < spreads[2].0 && 5 * spreads[14].1 < 3 * spreads[2].1, "{spreads:?}");
 }

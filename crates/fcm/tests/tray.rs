@@ -32,7 +32,7 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-use fieldcraft_fcm::{Load, Material, Options, Support, solve};
+use fieldcraft_fcm::{Basis, Load, Material, Options, Support, solve};
 use fieldcraft_geometry::{open_design, script_design};
 use fieldcraft_mesh::surface::{BoundarySurface, SurfaceOptions};
 use fieldcraft_solver::Limits;
@@ -191,6 +191,13 @@ fn a_sheet_metal_tray_with_open_corners() {
     println!("hung, two rounds from the grid's own cells: {followed:.4} mm of {HUNG} ({account})");
     assert!((followed / HUNG - 1.0).abs() < 0.08 && (followed / HUNG - 1.0).abs() < (divided / HUNG - 1.0).abs(), "{followed}");
 
+    // The trunk space, half the unknowns a cell: the same two rounds leave the tray as close
+    // with fewer than half the unknowns.
+    let trunk = Options { basis: Basis::Trunk, ..rounds };
+    let (reduced, account) = sag(&tray, true, &trunk);
+    println!("hung, two rounds in the trunk space: {reduced:.4} mm of {HUNG} ({account})");
+    assert!((reduced / HUNG - 1.0).abs() < 0.055, "{reduced}");
+
     // Bolted. The corners carry little.
     for (separate, gaps, tolerance) in [(false, 0, 0.02), (true, 4, 0.012)] {
         let (bolted, account) = sag(&tray, false, &grid(separate, gaps));
@@ -199,5 +206,8 @@ fn a_sheet_metal_tray_with_open_corners() {
     }
     let (bolted, account) = sag(&tray, false, &rounds);
     println!("bolted, two rounds that follow the solution: {bolted:.5} mm of {BOLTED} ({account})");
+    assert!((bolted / BOLTED - 1.0).abs() < 0.005, "{bolted}");
+    let (bolted, account) = sag(&tray, false, &trunk);
+    println!("bolted, two rounds in the trunk space: {bolted:.5} mm of {BOLTED} ({account})");
     assert!((bolted / BOLTED - 1.0).abs() < 0.005, "{bolted}");
 }

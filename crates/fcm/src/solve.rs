@@ -2,7 +2,9 @@
 //! loads to the displacement and stress anywhere in the part.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use fieldcraft_fem::{DofLayout, DofSet};
 use fieldcraft_mesh::surface::BoundarySurface;
@@ -129,9 +131,18 @@ pub enum Basis {
     /// of total degree p with far fewer modes: 8 + 12 (p − 1) a cell up to degree 3, plus
     /// 3 (p − 2)(p − 3) from degree 4 and (p − 3)(p − 4)(p − 5)/6 from degree 6 on (74 instead
     /// of 216 at degree 5). Degree for degree it is less accurate than the tensor product. On
-    /// the benchmarks of `tests/benchmarks.rs` (NAFEMS LE1, a plate with a hole) it reaches the
-    /// tensor product's accuracy about two degrees higher, with half to three quarters of the
-    /// unknowns and half the factor's entries, in no less time: it saves memory, not time.
+    /// cells that are the same everywhere (`tests/benchmarks.rs`: NAFEMS LE1, a plate with a
+    /// hole) it reaches the tensor product's accuracy about two degrees higher, with half to
+    /// three quarters of the unknowns and half the factor's entries, in no less time: there it
+    /// saves memory, not time.
+    ///
+    /// On cells that are divided where the part needs it, it saves both: smaller cells make up
+    /// for what it lacks. At a hole with the cells divided twice (`tests/hole.rs`,
+    /// `where_the_refined_grid_sits`) the stress is within ± 1.1 % at degree 3 with a third of
+    /// the tensor product's unknowns, which has ± 0.7 %, and within ± 0.5 % at degree 4 with
+    /// a little over half of them. On a sheet metal tray hung by one wall (`tests/tray.rs`),
+    /// with two rounds of [`Options::adapt`], the sag is 4.4 % low with 143 000 unknowns where
+    /// the tensor product is 3.9 % low with 322 000 and takes twice as long.
     Trunk,
 }
 
@@ -258,6 +269,11 @@ pub struct Options {
     /// this, in the energy norm and relative to the solution: √|ΔU / U| with the strain
     /// energies of the two solutions ([`Solution::change_from`]). 0 runs every round asked for.
     pub settle: f64,
+    /// Whether a round of [`Options::adapt`] takes the integrals of the cut cells it leaves as
+    /// they were from the round before, in place of integrating them again. The result is the
+    /// same to the bit either way; integrating a cut cell is the most work a cell takes, and a
+    /// round leaves most cells as they were.
+    pub reuse: bool,
 }
 
 impl Options {
@@ -318,6 +334,7 @@ impl Options {
             gaps: 0,
             adapt: 0,
             settle: 0.0,
+            reuse: true,
         }
     }
 
@@ -980,6 +997,10 @@ struct Round {
     asked: BTreeSet<(u8, [u32; 3])>,
     /// The entries of the stiffness and of its factor in the solve before, when there was one.
     before: Option<(usize, usize)>,
+    /// The cut cells of the solve before that were not divided, by level and place, each with
+    /// its integrals ([`Options::reuse`]), and whether their pieces of material were told apart
+    /// ([`Options::separate`]).
+    cuts: RefCell<(bool, BTreeMap<(u8, [u32; 3]), Arc<CutLeaf>>)>,
 }
 
 /// One solve of [`solve`] with exactly these options: dividing the cells `marker` names (up to
@@ -1230,10 +1251,10 @@ fn solve_at(
     }
     let grid = Grid::over(lo, hi, options.cell_size, options.offset, MAX_CELLS)?;
     let mut triangles = Vec::with_capacity(surface.triangles().len());
-    // The finest cells there can be: divided for the surface's curvature or because a round
-    // asked for it, then where gaps end.
-    let deepest_asked = asked.iter().map(|(level, _)| usize::from(*level) + 1).max().unwrap_or(0);
-    let finest = (options.refine.max(deepest_asked) + if options.separate { options.gaps } else { 0 }).min(MAX_REFINE);
+    // The finest cells there can be: divided for the surface's curvature, then by the rounds
+    // that follow the solution (each a level at most), then where gaps end. The same in every
+    // round, so a cell is the same cell in each.
+    let finest = (options.refine + options.adapt + if options.separate { options.gaps } else { 0 }).min(MAX_REFINE);
     for t in surface.triangles() {
         // On the planes of the finest cells there may be: a face of the part that lies on one
         // lies on it exactly.
@@ -1295,7 +1316,11 @@ fn solve_at(
     let rule = gauss_legendre(p + 1);
     let surface_rule = gauss_legendre(2 * p + 1);
     let (second_rule, third_rule) = (gauss_legendre(2 * p + 1), gauss_legendre(3 * p + 2));
-    let mut cuts: Vec<Option<CutLeaf>> = Vec::new();
+    let mut cuts: Vec<Option<Arc<CutLeaf>>> = Vec::new();
+    // The cut cells of the round before ([`Options::reuse`]), when they were integrated as
+    // this round's are.
+    let before = round.cuts.take();
+    let reused = (options.reuse && before.0 == options.separate).then_some(&before.1);
     let mut links: Vec<[u32; 4]> = Vec::new();
     // What the ends of gaps may cost: as many cells again as hold material, or [`GAP_CELLS`]
     // where that is more.
@@ -1307,11 +1332,14 @@ fn solve_at(
     let rounds = if options.gaps == 0 { 0 } else { (options.gaps + tree.deepest()).min(2 * MAX_REFINE) };
     for round in 0..=rounds {
         cuts.resize(tree.nodes.len(), None);
-        let todo: Vec<usize> = (0..tree.nodes.len())
-            .filter(|node| {
-                tree.nodes.get(*node).is_some_and(|cell| cell.is_leaf() && cell.kind == Kind::Cut) && cuts.get(*node).is_some_and(Option::is_none)
-            })
-            .collect();
+        let mut todo = Vec::new();
+        for (node, cell) in tree.nodes.iter().enumerate() {
+            let Some(slot) = cuts.get_mut(node).filter(|slot| slot.is_none() && cell.is_leaf() && cell.kind == Kind::Cut) else { continue };
+            match reused.and_then(|cells| cells.get(&(cell.level, cell.ijk))) {
+                Some(leaf) => *slot = Some(Arc::clone(leaf)),
+                None => todo.push(node),
+            }
+        }
         let integrated = fieldcraft_parallel::map(todo.len(), |index| -> Result<CutLeaf> {
             let broken = || Error::Internal("a cut cell is missing".into());
             let node = *todo.get(index).ok_or_else(broken)?;
@@ -1335,7 +1363,7 @@ fn solve_at(
         });
         for (node, leaf) in todo.iter().zip(integrated) {
             if let Some(slot) = cuts.get_mut(*node) {
-                *slot = Some(leaf?);
+                *slot = Some(Arc::new(leaf?));
             }
         }
         if !options.separate {
@@ -1348,12 +1376,12 @@ fn solve_at(
                 lo: grid.fine_lo(level, cell.position()),
                 hi: grid.fine_hi(level, cell.position()),
                 pieces: pieces.get(node).map(Vec::as_slice).unwrap_or_default(),
-                of_piece: cuts.get(node).and_then(Option::as_ref).map(|leaf| leaf.of_piece.as_slice()).unwrap_or_default(),
+                of_piece: cuts.get(node).and_then(|slot| slot.as_deref()).map(|leaf| leaf.of_piece.as_slice()).unwrap_or_default(),
             })
         };
         links = islands::links(&tree, &solid, &held)?;
         let sides = islands::sides(&tree, &links, &held);
-        let islands_of = |node: u32| cuts.get(node as usize).and_then(Option::as_ref).map_or(1, CutLeaf::islands);
+        let islands_of = |node: u32| cuts.get(node as usize).and_then(|slot| slot.as_deref()).map_or(1, CutLeaf::islands);
         let divided = crate::space::holding(&tree, &islands_of, &links, &sides, Options::GAP, &|level| grid.step(level));
         if divided.is_empty() {
             break;
@@ -1375,7 +1403,13 @@ fn solve_at(
         }
     }
     cuts.resize(tree.nodes.len(), None);
-    let cut_of = |node: usize| cuts.get(node).and_then(Option::as_ref);
+    drop(before);
+    // For the round after this one.
+    if options.reuse && options.adapt > 0 {
+        let kept = (tree.nodes.iter().zip(&cuts)).filter_map(|(cell, leaf)| Some(((cell.level, cell.ijk), Arc::clone(leaf.as_ref()?)))).collect();
+        round.cuts.replace((options.separate, kept));
+    }
+    let cut_of = |node: usize| cuts.get(node).and_then(|slot| slot.as_deref());
     // The pieces of surface an island of a cell owns: all of the cell's where it has one island.
     let pieces_of = |node: usize, island: usize| -> Cow<[Piece]> {
         let all = pieces.get(node).map(Vec::as_slice).unwrap_or_default();

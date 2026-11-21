@@ -134,6 +134,30 @@ fn the_result_with_islands_does_not_depend_on_the_threads() {
     assert_eq!(one, run(7));
 }
 
+/// Rounds that follow the solution ([`Options::adapt`]) on a part with a gap: the prong that is
+/// not pulled stays free, and a round that takes the integrals of the cut cells it leaves as
+/// they are from the round before gives the bits of one that integrates them again.
+#[test]
+#[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
+fn rounds_keep_the_pieces_apart_and_reuse_their_cells() {
+    let run = |reuse: bool| {
+        let solution = pulled(&Options { adapt: 2, reuse, ..options(1) });
+        assert!(solution.stats.rounds >= 1 && solution.stats.separated > 0 && !solution.stats.joined, "{:?}", solution.stats);
+        let [pulled, free] = shares(&solution, 0.8);
+        assert!((pulled - 1.0).abs() < 1e-3 && free.abs() < 1e-3, "{pulled} and {free}");
+        let mut bits = vec![solution.strain_energy.to_bits(), solution.stats.unknowns as u64, solution.stats.rounds as u64];
+        bits.extend(solution.stats.levels.iter().map(|cells| *cells as u64));
+        for along in [0.05, 0.3, 0.9] {
+            for x in middles(along) {
+                bits.extend(solution.displacement(x).unwrap().map(f64::to_bits));
+                bits.extend(solution.stress(x).unwrap().map(f64::to_bits));
+            }
+        }
+        bits
+    };
+    assert_eq!(run(true), run(false));
+}
+
 /// Where no cell holds a gap, telling pieces apart changes nothing: the same unknowns and the
 /// same bits, on cells of several levels too.
 #[test]
