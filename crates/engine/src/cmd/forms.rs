@@ -2782,6 +2782,9 @@ pub const SOLVE_STATIC_GRID: &[Field] = &[
     int("degree", "Degree", 1, super::static_grid::MAX_DEGREE)
         .help("The polynomial degree of the shape functions on every cell. With one cell per radius of a hole or fillet the stress peak is good to about 10 % at degree 3, 6.5 % at degree 4 and 3 % at degree 5.")
         .def("3"),
+    int("refine", "Refinement levels", 0, super::static_grid::MAX_REFINE)
+        .help("Divides the cells across which the surface is curved more tightly than they resolve (a fillet or hole with fewer than two cells to its radius at degree 4, four at degree 3) into eight, this many times at most. A coarse grid then resolves a small feature without fine cells everywhere. 0 keeps the grid the same everywhere.")
+        .def("0"),
     flag("check_convergence", "Check convergence")
         .help("Also solves one degree lower on the same grid and reports how much the peak von Mises stress and the strain energy changed: an indicator of convergence, not a bound of the error."),
     positive("tolerance", "Chordal tolerance", D::Length)

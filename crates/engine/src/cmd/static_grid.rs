@@ -32,7 +32,7 @@ use crate::{CommandKind, CommandSpec, EngineError, Result, Session, StepResult};
 pub const STATIC_GRID: CommandSpec = CommandSpec {
     id: "solve.static.grid",
     label: "Solve Static Step on a Grid",
-    params: r#"{"step": "Load", "body": "Bracket", "cell_size": 4.0, "degree": 3, "check_convergence": false, "tolerance": 0.05, "sample_size": 1.0, "max_dofs": 6000000, "max_factor_entries": 400000000, "threads": 8} — solves a linear static step (the only one when `step` is left out) for one body of the open design (the only one when `body` is left out) with no volume mesh, by the finite cell method: the body's surface, triangulated within `tolerance` (a length; default 1e-3 of the body's bounding-box diagonal), is embedded in a grid of cubic cells of `cell_size` (a length; default 1/20 of the diagonal) carrying shape functions of polynomial `degree` (1 to 8, default 3). The body takes the isotropic elastic material of its solid section (a section on a set that names the body); the step's boundary conditions fix displacement components of whole faces (fixed, displacement, symmetry about a global plane) and its loads act on whole faces (force as a total, traction, pressure) or on the body (gravity): each must act on a set of geometry faces of this body. Refused, changing nothing: another kind of boundary condition or load, a set of nodes, elements, edges or vertices, a reference point, an orthotropic material, a cell of a partitioned body, and a model with contacts, ties, couplings, point masses or springs. Keeps the result in the session, sampled at the vertices of the body's surface refined to `sample_size` (a length; default `cell_size`/`degree`), where results.contour, results.deformed and solve.probe read it (its points are labelled above every mesh label); it is not written to model files. Returns the `unknowns`, the `cells` that hold material (under `grid` the grid's `cells` along x, y and z, those `inside` the part and those its surface `cut`s), the run time in `seconds`, the largest von Mises stress and displacement with where they are (`at`, and the `face`), the reaction of every supported face, the applied and reaction totals, the `volume` the solver integrated against the surface's (`surface_volume`), the strain energy and `warnings`. With `check_convergence` (degree 2 or more) the step is also solved one degree lower on the same grid, and `convergence` gives how far the two solutions are apart, each a fraction: `peak_von_mises` (the change of the largest von Mises stress over the sampled points), `von_mises` (the largest change at any one point, of the peak) and `strain_energy`; an indicator of convergence, not a bound of the error. `max_dofs` caps the unknowns and may only be lowered; `max_factor_entries` and `threads` as for solve.static. The grid is the same everywhere: a stress peak at a hole or a fillet is within about 1 % with two cells per radius of the smallest stressed feature at degree 4, or four at degree 3; displacements and reactions need far less (docs/grid-static.md)"#,
+    params: r#"{"step": "Load", "body": "Bracket", "cell_size": 4.0, "degree": 3, "refine": 0, "check_convergence": false, "tolerance": 0.05, "sample_size": 1.0, "max_dofs": 6000000, "max_factor_entries": 400000000, "threads": 8} — solves a linear static step (the only one when `step` is left out) for one body of the open design (the only one when `body` is left out) with no volume mesh, by the finite cell method: the body's surface, triangulated within `tolerance` (a length; default 1e-3 of the body's bounding-box diagonal), is embedded in a grid of cubic cells of `cell_size` (a length; default 1/20 of the diagonal) carrying shape functions of polynomial `degree` (1 to 8, default 3). With `refine` (0 to 6 levels, default 0) a cell across which the surface is curved more tightly than it resolves (fewer than two cells to the radius of a fillet or hole at degree 4, four at degree 3) is divided into eight, level by level, so a coarse grid resolves a small feature without fine cells everywhere; `levels` in the reply counts the cells of each level. The body takes the isotropic elastic material of its solid section (a section on a set that names the body); the step's boundary conditions fix displacement components of whole faces (fixed, displacement, symmetry about a global plane) and its loads act on whole faces (force as a total, traction, pressure) or on the body (gravity): each must act on a set of geometry faces of this body. Refused, changing nothing: another kind of boundary condition or load, a set of nodes, elements, edges or vertices, a reference point, an orthotropic material, a cell of a partitioned body, and a model with contacts, ties, couplings, point masses or springs. Keeps the result in the session, sampled at the vertices of the body's surface refined to `sample_size` (a length; default `cell_size`/`degree`), where results.contour, results.deformed and solve.probe read it (its points are labelled above every mesh label); it is not written to model files. Returns the `unknowns`, the `cells` that hold material (under `grid` the grid's `cells` along x, y and z, those `inside` the part and those its surface `cut`s), the run time in `seconds`, the largest von Mises stress and displacement with where they are (`at`, and the `face`), the reaction of every supported face, the applied and reaction totals, the `volume` the solver integrated against the surface's (`surface_volume`), the strain energy and `warnings`. With `check_convergence` (degree 2 or more) the step is also solved one degree lower on the same grid, and `convergence` gives how far the two solutions are apart, each a fraction: `peak_von_mises` (the change of the largest von Mises stress over the sampled points), `von_mises` (the largest change at any one point, of the peak) and `strain_energy`; an indicator of convergence, not a bound of the error. `max_dofs` caps the unknowns and may only be lowered; `max_factor_entries` and `threads` as for solve.static. The grid is the same everywhere: a stress peak at a hole or a fillet is within about 1 % with two cells per radius of the smallest stressed feature at degree 4, or four at degree 3; displacements and reactions need far less (docs/grid-static.md)"#,
     form: Some(super::forms::SOLVE_STATIC_GRID),
     kind: CommandKind::Model,
     requires: &[Requirement::Design, Requirement::Material, Requirement::Section, Requirement::Step],
@@ -41,6 +41,8 @@ pub const STATIC_GRID: CommandSpec = CommandSpec {
 
 /// The highest polynomial degree the solver takes (`fieldcraft_fcm::Options::degree`).
 pub(super) const MAX_DEGREE: i64 = 8;
+/// The most levels of local refinement the solver takes (`fieldcraft_fcm::Options::refine`).
+pub(super) const MAX_REFINE: i64 = fieldcraft_fcm::grid::MAX_REFINE as i64;
 /// The default cell size and chordal tolerance, relative to the body's bounding-box diagonal:
 /// the meshers' defaults (an element a twentieth of the part, the tessellation a thousandth).
 const DEFAULT_RELATIVE_CELL: f64 = 1.0 / 20.0;
@@ -578,6 +580,7 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
     // The solver's default degree, read off its default options.
     let default_degree = Options::new(1.0).degree;
     let degree = super::mesh::optional_count(p, "degree", default_degree as u64, 1..=MAX_DEGREE as u64)?;
+    let levels = super::mesh::optional_count(p, "refine", 0, 0..=MAX_REFINE as u64)?;
     let check_convergence = opt::<bool>(p, "check_convergence")?.unwrap_or(false);
     if check_convergence && degree < 2 {
         return Err(EngineError::invalid("check_convergence", "compares with the solution one degree lower: it needs a degree of 2 or more"));
@@ -648,7 +651,7 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
 
     fieldcraft_model::progress::stage(&format!("{}: grid solve", shape.name), None, "");
     fieldcraft_model::progress::check()?;
-    let grid = Options { degree, offset: OFFSET, ..Options::new(cell_size) };
+    let grid = Options { degree, refine: levels, offset: OFFSET, ..Options::new(cell_size) };
     let (solution, sampled, values, change) = with_threads(threads, || -> Result<_> {
         let solution = fieldcraft_fcm::solve(&surface, &material, &supports, &loads, &grid, &limits).map_err(grid_error)?;
         fieldcraft_model::progress::stage(&format!("{}: results", shape.name), None, "");
@@ -748,6 +751,9 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
         "material": material_name,
         "cell_size": cell_size,
         "degree": degree,
+        "refine": levels,
+        // The cells that are not divided, by level: the grid's own first.
+        "levels": stats.levels.iter().take(levels + 1).collect::<Vec<_>>(),
         "tolerance": tolerance,
         "sample_size": sample_size,
         "unknowns": stats.unknowns,
