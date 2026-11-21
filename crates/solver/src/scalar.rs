@@ -8,10 +8,14 @@
 //! one, a modulus for the pivot tests, and finiteness. It has no order and no sign, so the real
 //! inertia (Sylvester's law, [`crate::ldlt::Inertia`]) is defined for `f64` alone.
 
+use std::cell::RefCell;
 use std::iter::Sum;
 use std::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 
 use num_complex::Complex64;
+
+/// Rows packed together for the micro-tiles of the dense kernels ([`Scalar::with_packed`]).
+pub const PACKED_ROWS: usize = 8;
 
 /// An element of a sparse symmetric matrix and of the vectors it acts on.
 pub trait Scalar:
@@ -39,6 +43,11 @@ pub trait Scalar:
 
     /// Both parts finite (every part of a complex value).
     fn is_finite(self) -> bool;
+
+    /// Run `f` on a buffer of packed rows that the calling thread keeps from one call to the
+    /// next, so a dense kernel's tiles take no memory of their own for them; on a new one while
+    /// the thread's is in use. What is in the buffer when `f` gets it is of no meaning.
+    fn with_packed<R>(f: impl FnOnce(&mut Vec<[Self; PACKED_ROWS]>) -> R) -> R;
 }
 
 impl Scalar for f64 {
@@ -54,6 +63,16 @@ impl Scalar for f64 {
     fn is_finite(self) -> bool {
         f64::is_finite(self)
     }
+
+    fn with_packed<R>(f: impl FnOnce(&mut Vec<[f64; PACKED_ROWS]>) -> R) -> R {
+        thread_local! {
+            static PACKED: RefCell<Vec<[f64; PACKED_ROWS]>> = const { RefCell::new(Vec::new()) };
+        }
+        PACKED.with(|kept| match kept.try_borrow_mut() {
+            Ok(mut rows) => f(&mut rows),
+            Err(_) => f(&mut Vec::new()),
+        })
+    }
 }
 
 impl Scalar for Complex64 {
@@ -68,5 +87,15 @@ impl Scalar for Complex64 {
     #[inline]
     fn is_finite(self) -> bool {
         Complex64::is_finite(self)
+    }
+
+    fn with_packed<R>(f: impl FnOnce(&mut Vec<[Complex64; PACKED_ROWS]>) -> R) -> R {
+        thread_local! {
+            static PACKED: RefCell<Vec<[Complex64; PACKED_ROWS]>> = const { RefCell::new(Vec::new()) };
+        }
+        PACKED.with(|kept| match kept.try_borrow_mut() {
+            Ok(mut rows) => f(&mut rows),
+            Err(_) => f(&mut Vec::new()),
+        })
     }
 }

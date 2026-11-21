@@ -51,9 +51,10 @@ pub const TILE: usize = 64;
 pub const PANEL: usize = 64;
 
 /// Rows of a micro-tile of [`products`] (a multiple dividing [`TILE`]).
-const MR: usize = 8;
+const MR: usize = crate::scalar::PACKED_ROWS;
 
-/// Columns of a micro-tile of [`products`]: MR × NR sums stay in registers.
+/// Columns of a micro-tile of [`products`], an even number: they are summed two at a time, so
+/// 2 MR sums stay in the sixteen registers every processor has.
 const NR: usize = 4;
 
 /// Entries of the products of a supernode's updates that are computed and held at once
@@ -406,40 +407,57 @@ pub(crate) fn products<T: Scalar>(
     let tile = |t: usize| -> Vec<T> {
         let i0 = t * TILE;
         let h = TILE.min(mu - i0);
-        // The tile's rows of every column by blocks of MR rows, k-major, padded to TILE rows.
-        let mut xp = vec![[T::ZERO; MR]; TILE / MR * kw];
-        for k in 0..kw {
-            for (i, x) in l.column(k0 + k, p + i0, h).iter().enumerate() {
-                if let Some(slot) = xp.get_mut((i / MR) * kw + k).and_then(|b| b.get_mut(i % MR)) {
-                    *slot = *x;
-                }
-            }
-        }
         let cols = wu.min(i0 + h);
         let mut out = vec![T::ZERO; cols * TILE];
-        // Micro-tiles of MR rows and NR columns: each S(i, c) is summed in a register over k in
-        // order from 0, the same operations as one column at a time, with each X and Y value
-        // loaded once per micro-tile.
-        for (b, ys) in yp.chunks(kw.max(1)).enumerate().take(cols.div_ceil(NR)) {
-            for (r, xs) in xp.chunks(kw.max(1)).enumerate() {
-                let mut acc = [[T::ZERO; MR]; NR];
-                for (x, y) in xs.iter().zip(ys) {
-                    for (a, yj) in acc.iter_mut().zip(y) {
-                        for (ai, xi) in a.iter_mut().zip(x) {
-                            *ai += *xi * *yj;
+        let mut fill = |xp: &mut Vec<[T; MR]>| {
+            // The tile's rows of every column by blocks of MR rows, k-major, padded to TILE
+            // rows.
+            let blocks = TILE / MR;
+            if xp.len() < blocks * kw {
+                xp.resize(blocks * kw, [T::ZERO; MR]);
+            }
+            let Some(xp) = xp.get_mut(..blocks * kw) else { return };
+            if h < TILE {
+                xp.fill([T::ZERO; MR]);
+            }
+            for k in 0..kw {
+                for (r, rows) in l.column(k0 + k, p + i0, h).chunks(MR).enumerate() {
+                    if let Some(slot) = xp.get_mut(r * kw + k).and_then(|block| block.get_mut(..rows.len())) {
+                        slot.copy_from_slice(rows);
+                    }
+                }
+            }
+            // Micro-tiles of MR rows and NR columns, two columns a pass (their 2 MR sums stay
+            // in registers): each S(i, c) is summed over k in order from 0, the same operations
+            // as one column at a time.
+            for (b, ys) in yp.chunks(kw.max(1)).enumerate().take(cols.div_ceil(NR)) {
+                for (r, xs) in xp.chunks(kw.max(1)).enumerate() {
+                    for pair in 0..NR / 2 {
+                        let (mut first, mut second) = ([T::ZERO; MR], [T::ZERO; MR]);
+                        for (x, y) in xs.iter().zip(ys) {
+                            let (x, y0, y1) = (*x, y[2 * pair], y[2 * pair + 1]);
+                            for i in 0..MR {
+                                first[i] += x[i] * y0;
+                            }
+                            for i in 0..MR {
+                                second[i] += x[i] * y1;
+                            }
+                        }
+                        for (j, a) in [first, second].iter().enumerate() {
+                            let c = b * NR + 2 * pair + j;
+                            if c < cols
+                                && let Some(dst) = out.get_mut(c * TILE + r * MR..c * TILE + (r + 1) * MR)
+                            {
+                                dst.copy_from_slice(a);
+                            }
                         }
                     }
                 }
-                for (j, a) in acc.iter().enumerate() {
-                    let c = b * NR + j;
-                    if c < cols
-                        && let Some(dst) = out.get_mut(c * TILE + r * MR..c * TILE + (r + 1) * MR)
-                    {
-                        dst.copy_from_slice(a);
-                    }
-                }
             }
-        }
+        };
+        // In the buffer the thread keeps ([`Scalar::with_packed`]): a tile takes no memory of
+        // its own for its rows, which is as much again as it reads.
+        T::with_packed(|xp| fill(xp));
         out
     };
     if mu.saturating_mul(wu).saturating_mul(kw) >= PARALLEL_WORK { parallel::map(tiles, tile) } else { (0..tiles).map(tile).collect() }
