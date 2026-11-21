@@ -68,6 +68,9 @@ pub const SNAP: f64 = 1e-9; // unit-factors: relative to the cell size
 const GROW: f64 = 1e-9; // unit-factors: relative to the box
 /// The deepest octree under a cut cell.
 pub const MAX_DEPTH: usize = 8;
+/// The most levels of refinement under a cell of the grid (`Options::refine`): the finest cells
+/// are a 64th of the grid's.
+pub const MAX_REFINE: usize = 6;
 
 pub(crate) fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
@@ -168,12 +171,42 @@ impl Grid {
 
     /// `p` with every coordinate within [`SNAP`] cells of a grid plane moved onto that plane.
     pub fn snap(&self, p: [f64; 3]) -> [f64; 3] {
+        self.snap_to(p, 0)
+    }
+
+    /// The cells of level 0 are the grid's; a cell of level l + 1 is an eighth of one of level
+    /// l. This is the size of a cell of `level`.
+    pub fn step(&self, level: usize) -> f64 {
+        self.spacing / (1u64 << level.min(MAX_REFINE)) as f64
+    }
+
+    /// The coordinate of plane `i` of the cells of `level` along `axis`. The steps are halves,
+    /// so a plane that several levels share has the same coordinate on each of them, bit for
+    /// bit, and plane `i` of level 0 is the grid's.
+    pub fn fine_plane(&self, axis: usize, level: usize, i: usize) -> f64 {
+        self.origin[axis] + i as f64 / (1u64 << level.min(MAX_REFINE)) as f64 * self.spacing
+    }
+
+    /// The lowest corner of cell `(i, j, k)` of `level`.
+    pub fn fine_lo(&self, level: usize, [i, j, k]: [usize; 3]) -> [f64; 3] {
+        [self.fine_plane(0, level, i), self.fine_plane(1, level, j), self.fine_plane(2, level, k)]
+    }
+
+    /// The highest corner of cell `(i, j, k)` of `level`.
+    pub fn fine_hi(&self, level: usize, [i, j, k]: [usize; 3]) -> [f64; 3] {
+        [self.fine_plane(0, level, i + 1), self.fine_plane(1, level, j + 1), self.fine_plane(2, level, k + 1)]
+    }
+
+    /// `p` with every coordinate within [`SNAP`] cells of `level` of a plane of that level moved
+    /// onto the plane ([`Grid::snap`] for the cells that are refined so far).
+    pub fn snap_to(&self, p: [f64; 3], level: usize) -> [f64; 3] {
+        let steps = (1u64 << level.min(MAX_REFINE)) as f64;
         let mut q = p;
         for a in 0..3 {
-            let t = (p[a] - self.origin[a]) / self.spacing;
+            let t = (p[a] - self.origin[a]) / self.spacing * steps;
             let r = t.round();
-            if (t - r).abs() < SNAP && r >= 0.0 && r <= self.cells[a] as f64 {
-                q[a] = self.plane(a, r as usize);
+            if (t - r).abs() < SNAP && r >= 0.0 && r <= self.cells[a] as f64 * steps {
+                q[a] = self.origin[a] + r / steps * self.spacing;
             }
         }
         q
@@ -301,28 +334,99 @@ pub fn sort_surface(grid: &Grid, triangles: &[[[f64; 3]; 3]]) -> Sorted {
                     if let Some(list) = sorted.touching.get_mut(cell) {
                         list.push(t as u32);
                     }
-                    let polygon: Vec<[f64; 3]> = clip(triangle, lo, hi).into_iter().map(|(corner, _)| corner).collect();
-                    // A polygon in the plane between two cells belongs to the one the material
-                    // is in: the one the normal points away from.
-                    let foreign = (0..3).any(|a| {
-                        (polygon.iter().all(|p| p[a] == lo[a]) && !(normal[a] < 0.0)) || (polygon.iter().all(|p| p[a] == hi[a]) && !(normal[a] > 0.0))
-                    });
-                    if polygon.len() < 3 || foreign {
-                        continue;
-                    }
-                    let Some(pieces) = sorted.pieces.get_mut(cell) else { continue };
-                    for pair in polygon.get(1..).unwrap_or_default().windows(2) {
-                        let corners = [polygon[0], pair[0], pair[1]];
-                        let area = cross(sub(corners[1], corners[0]), sub(corners[2], corners[0]));
-                        if dot(area, area) > 0.0 {
-                            pieces.push(Piece { corners, triangle: t as u32 });
-                        }
+                    if let Some(pieces) = sorted.pieces.get_mut(cell) {
+                        own_pieces(triangle, t as u32, normal, lo, hi, pieces);
                     }
                 }
             }
         }
     }
     sorted
+}
+
+/// Add the pieces of a triangle (with the normal `normal`, of any length) that the box `lo`–`hi`
+/// owns to `pieces`.
+fn own_pieces(triangle: &[[f64; 3]; 3], t: u32, normal: [f64; 3], lo: [f64; 3], hi: [f64; 3], pieces: &mut Vec<Piece>) {
+    let polygon: Vec<[f64; 3]> = clip(triangle, lo, hi).into_iter().map(|(corner, _)| corner).collect();
+    // A polygon in the plane between two cells belongs to the one the material is in: the one
+    // the normal points away from.
+    let foreign = (0..3)
+        .any(|a| (polygon.iter().all(|p| p[a] == lo[a]) && !(normal[a] < 0.0)) || (polygon.iter().all(|p| p[a] == hi[a]) && !(normal[a] > 0.0)));
+    if polygon.len() < 3 || foreign {
+        return;
+    }
+    for pair in polygon.get(1..).unwrap_or_default().windows(2) {
+        let corners = [polygon[0], pair[0], pair[1]];
+        let area = cross(sub(corners[1], corners[0]), sub(corners[2], corners[0]));
+        if dot(area, area) > 0.0 {
+            pieces.push(Piece { corners, triangle: t });
+        }
+    }
+}
+
+/// Sort the triangles `candidates` (indices into `triangles`, in increasing order) into the cube
+/// from `lo` to `hi` of size `size`, a cell of a refined level: the ones that reach it and the
+/// pieces it owns, as [`sort_surface`] does for the cells of the grid.
+pub fn sort_into_box(triangles: &[[[f64; 3]; 3]], candidates: &[u32], lo: [f64; 3], hi: [f64; 3], size: f64) -> (Vec<u32>, Vec<Piece>) {
+    let half = [0.5 * size * (1.0 + GROW); 3];
+    let centre = [0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1]), 0.5 * (lo[2] + hi[2])];
+    let (mut touching, mut pieces) = (Vec::new(), Vec::new());
+    for &t in candidates {
+        let Some(triangle) = triangles.get(t as usize) else { continue };
+        if !overlaps(triangle, centre, half) {
+            continue;
+        }
+        touching.push(t);
+        let normal = cross(sub(triangle[1], triangle[0]), sub(triangle[2], triangle[0]));
+        own_pieces(triangle, t, normal, lo, hi, &mut pieces);
+    }
+    (touching, pieces)
+}
+
+/// The curvature of the surface at each of its triangles, one over a length: the largest over
+/// the triangle's smooth edges (the ones that are no feature edges, so a sharp crease is no
+/// curvature). Two triangles that meet in a smooth edge are two flat facets of one curved face,
+/// and the normal turns from the one's to the other's from the middle of the one to the middle
+/// of the other, half the sum of their heights over the edge apart. Facets whose corners lie on
+/// a circle of radius r and whose normals differ by the vector d are |d| r wide, so the
+/// curvature across the edge is 2 |n₁ − n₂| / (h₁ + h₂). That is exact for the strips that a
+/// cylinder, a fillet or any face tessellated on a grid of its parameters is made of, whichever
+/// way a strip's quads are split; on an irregular triangulation of a doubly curved face it is
+/// up to a third low. Triangles that are one flat face to the octree have none.
+pub fn curvatures(surface: &Triangles) -> Vec<f64> {
+    let doubled_area = |t: &[[f64; 3]; 3]| {
+        let area = cross(sub(t[1], t[0]), sub(t[2], t[0]));
+        dot(area, area).sqrt()
+    };
+    let mut curvature = vec![0.0; surface.corners.len()];
+    for (index, (triangle, value)) in surface.corners.iter().zip(&mut curvature).enumerate() {
+        let (Some(normal), Some(across), Some(feature)) = (surface.normals.get(index), surface.across.get(index), surface.feature.get(index)) else {
+            continue;
+        };
+        let own = doubled_area(triangle);
+        for edge in 0..3 {
+            let (Some(other), Some(other_normal)) = (surface.corners.get(across[edge] as usize), surface.normals.get(across[edge] as usize)) else {
+                continue;
+            };
+            if feature[edge] {
+                continue;
+            }
+            let turn = cross(*normal, *other_normal);
+            let (sine, cosine) = (dot(turn, turn).sqrt(), dot(*normal, *other_normal));
+            let along = sub(triangle[(edge + 1) % 3], triangle[edge]);
+            // The two heights over the edge, times the edge's length.
+            let heights = own + doubled_area(other);
+            if (sine * sine <= FLAT && cosine > 0.0) || !(heights > 0.0) {
+                continue;
+            }
+            let apart = sub(*normal, *other_normal);
+            let found = 2.0 * dot(apart, apart).sqrt() * dot(along, along).sqrt() / heights;
+            if found.is_finite() && found > *value {
+                *value = found;
+            }
+        }
+    }
+    curvature
 }
 
 /// A quadrature point of a cell: natural coordinates in [−1, 1]³, its weight there (the weights
@@ -758,19 +862,7 @@ mod tests {
     fn the_octree_refines_where_the_surface_is_curved() {
         const SIDES: usize = 48;
         let (radius, height) = (0.8, 0.5);
-        let mut points = vec![[0.0, 0.0, 0.0], [0.0, 0.0, height]];
-        for i in 0..SIDES {
-            let angle = 2.0 * std::f64::consts::PI * i as f64 / SIDES as f64;
-            points.push([radius * angle.cos(), radius * angle.sin(), 0.0]);
-            points.push([radius * angle.cos(), radius * angle.sin(), height]);
-        }
-        let (mut triangles, mut tags) = (Vec::new(), Vec::new());
-        for i in 0..SIDES as u32 {
-            let (a, b) = (2 + 2 * i, 2 + 2 * ((i + 1) % SIDES as u32));
-            triangles.extend([[0, b, a], [1, a + 1, b + 1], [a, b, b + 1], [a, b + 1, a + 1]]);
-            tags.extend([0, 1, 2, 2]);
-        }
-        let surface = BoundarySurface::new(&points, &triangles, &tags, &fieldcraft_mesh::surface::SurfaceOptions::default()).unwrap();
+        let surface = prism(SIDES, radius, height);
         // The regular polygon's x² over its area: A (R² / 12)(2 + cos(2π/n)), A its area.
         let turn = 2.0 * std::f64::consts::PI / SIDES as f64;
         let area = 0.5 * SIDES as f64 * radius * radius * turn.sin();
@@ -823,5 +915,107 @@ mod tests {
         let owned: Vec<f64> = sort_surface(&grid, &[turned]).pieces.iter().map(|p| area(p)).collect();
         assert!((owned.iter().sum::<f64>() - 1.0).abs() < 1e-14, "{owned:?}");
         assert_eq!(owned[grid.index([0, 0, 0])], 0.0);
+    }
+
+    /// A prism of `sides` sides about the z axis, its side one smooth face (tag 2) between two
+    /// caps.
+    fn prism(sides: usize, radius: f64, height: f64) -> BoundarySurface {
+        let mut points = vec![[0.0, 0.0, 0.0], [0.0, 0.0, height]];
+        for i in 0..sides {
+            let angle = 2.0 * std::f64::consts::PI * i as f64 / sides as f64;
+            points.push([radius * angle.cos(), radius * angle.sin(), 0.0]);
+            points.push([radius * angle.cos(), radius * angle.sin(), height]);
+        }
+        let (mut triangles, mut tags) = (Vec::new(), Vec::new());
+        for i in 0..sides as u32 {
+            let (a, b) = (2 + 2 * i, 2 + 2 * ((i + 1) % sides as u32));
+            triangles.extend([[0, b, a], [1, a + 1, b + 1], [a, b, b + 1], [a, b + 1, a + 1]]);
+            tags.extend([0, 1, 2, 2]);
+        }
+        BoundarySurface::new(&points, &triangles, &tags, &fieldcraft_mesh::surface::SurfaceOptions::default()).unwrap()
+    }
+
+    /// The corners and unit normals of a surface's triangles.
+    fn facets(surface: &BoundarySurface) -> (Vec<[[f64; 3]; 3]>, Vec<[f64; 3]>) {
+        let corners: Vec<[[f64; 3]; 3]> = surface.triangles().iter().map(|t| t.map(|v| surface.points()[v as usize])).collect();
+        let normals = corners
+            .iter()
+            .map(|t| {
+                let n = cross(sub(t[1], t[0]), sub(t[2], t[0]));
+                let length = dot(n, n).sqrt();
+                n.map(|x| x / length)
+            })
+            .collect();
+        (corners, normals)
+    }
+
+    /// The facets of a cylinder have its curvature, one over its radius, however finely it is
+    /// tessellated; its flat caps and a block, all of whose edges are sharp, have none.
+    #[test]
+    fn the_curvature_of_a_tessellated_cylinder_is_one_over_its_radius() {
+        for (sides, radius) in [(12, 0.8), (48, 0.8), (512, 3.0)] {
+            let surface = prism(sides, radius, 0.5);
+            let (corners, normals) = facets(&surface);
+            let feature = feature_flags(&surface);
+            let curvature = curvatures(&Triangles { corners: &corners, normals: &normals, across: surface.neighbors(), feature: &feature });
+            assert_eq!(curvature.len(), corners.len());
+            for (found, tag) in curvature.iter().zip(surface.tri_face()) {
+                let exact = if *tag == 2 { 1.0 / radius } else { 0.0 };
+                assert!((found - exact).abs() < 1e-9 * (1.0 / radius), "{sides} sides, face {tag}: {found} against {exact}");
+            }
+        }
+        let surface = corner([0.7, 0.6, 0.5]);
+        let (corners, normals) = facets(&surface);
+        let feature = feature_flags(&surface);
+        let curvature = curvatures(&Triangles { corners: &corners, normals: &normals, across: surface.neighbors(), feature: &feature });
+        assert!(curvature.iter().all(|c| *c == 0.0), "{curvature:?}");
+    }
+
+    /// The cells of a refined level: their planes are the grid's where they coincide, a vertex
+    /// near one is moved onto it, and the eight parts of a cell own the pieces the cell owns.
+    #[test]
+    fn the_parts_of_a_cell_own_its_pieces() {
+        let grid = Grid::over([0.0; 3], [2.0, 2.0, 1.0], 1.0, [0.0; 3], 100).unwrap();
+        assert_eq!((grid.step(0), grid.step(2)), (1.0, 0.25));
+        for i in 0..=2 {
+            assert_eq!(grid.fine_plane(0, 0, i).to_bits(), grid.plane(0, i).to_bits());
+            assert_eq!(grid.fine_plane(1, 3, 8 * i).to_bits(), grid.plane(1, i).to_bits());
+        }
+        assert_eq!((grid.fine_lo(1, [1, 2, 0]), grid.fine_hi(1, [1, 2, 0])), ([0.5, 1.0, 0.0], [1.0, 1.5, 0.5]));
+        // Onto a plane of the level, and not onto one of a finer level.
+        assert_eq!(grid.snap_to([0.5 + 1e-11, 0.25 + 1e-11, 1.0], 1), [0.5, 0.25 + 1e-11, 1.0]);
+        assert_eq!(grid.snap_to([0.5 + 1e-11, 0.3, 2.5], 0), grid.snap([0.5 + 1e-11, 0.3, 2.5]));
+
+        let area = |pieces: &[Piece]| -> f64 {
+            pieces
+                .iter()
+                .map(|p| 0.5 * dot(cross(sub(p.corners[1], p.corners[0]), sub(p.corners[2], p.corners[0])), [1.0, 1.0, 1.0]).abs() / 3f64.sqrt())
+                .sum()
+        };
+        // An inclined triangle through the first cell, and one in the plane x = 0.5 between its
+        // parts, with the material at lower x.
+        let triangles = [[[0.9, 0.0, 0.0], [0.0, 0.9, 0.0], [0.0, 0.0, 0.9]], [[0.5, 0.0, 0.0], [0.5, 1.0, 0.0], [0.5, 0.0, 1.0]]];
+        let sorted = sort_surface(&grid, &triangles);
+        let cell = grid.index([0, 0, 0]);
+        // As a box, a cell of the grid owns what the grid gives it.
+        let (touching, pieces) = sort_into_box(&triangles, &[0, 1], grid.lo([0, 0, 0]), grid.hi([0, 0, 0]), 1.0);
+        assert_eq!((touching, pieces), (sorted.touching[cell].clone(), sorted.pieces[cell].clone()));
+        let (mut inclined, mut between) = (0.0, [0.0; 2]);
+        for child in 0..8usize {
+            let at = [child & 1, (child >> 1) & 1, (child >> 2) & 1];
+            let (touching, pieces) = sort_into_box(&triangles, &sorted.touching[cell], grid.fine_lo(1, at), grid.fine_hi(1, at), 0.5);
+            assert!(pieces.iter().all(|piece| touching.contains(&piece.triangle)));
+            inclined += area(&pieces.iter().filter(|piece| piece.triangle == 0).copied().collect::<Vec<_>>());
+            // The triangle in the plane: the doubled areas of its pieces along x.
+            between[at[0]] += pieces
+                .iter()
+                .filter(|p| p.triangle == 1)
+                .map(|p| cross(sub(p.corners[1], p.corners[0]), sub(p.corners[2], p.corners[0]))[0].abs())
+                .sum::<f64>();
+        }
+        let whole = area(&sorted.pieces[cell].iter().filter(|piece| piece.triangle == 0).copied().collect::<Vec<_>>());
+        assert!((inclined - whole).abs() < 1e-14 && whole > 0.5, "{inclined} of {whole}");
+        // The parts at lower x own all of it: its normal points along +x.
+        assert!((between[0] - 1.0).abs() < 1e-14 && between[1] == 0.0, "{between:?}");
     }
 }

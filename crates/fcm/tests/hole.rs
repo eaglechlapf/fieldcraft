@@ -15,7 +15,10 @@
 //!   over six grid positions: ± 10 %, 6.5 % and 3 % at degrees 3, 4 and 5 with one cell a
 //!   radius, ± 4 % and 0.7 % at degrees 3 and 4 with two, ± 0.8 % at degree 3 with four. A grid
 //!   that is the same everywhere needs two cells a radius of the smallest stressed feature at
-//!   degree 4; refining only there is what the solver lacks.
+//!   degree 4, and four at degree 3.
+//! - Refining only there does as well (`fieldcraft_fcm::Options::refine`,
+//!   `where_the_refined_grid_sits`): cells of the hole's radius divided at the hole, twice at
+//!   degree 3 and once at degree 4, have the spread of the uniform grid of the finest cells.
 
 mod common;
 
@@ -253,4 +256,104 @@ fn where_the_grid_sits() {
     // One cell a radius at degree 3 is not enough for a peak; four cells a radius are.
     assert!(spreads[0] > 0.05, "{spreads:?}");
     assert!(spreads[5] < 0.03, "{spreads:?}");
+}
+
+/// Where the grid sits, with local refinement (`Options::refine`): the whole plate of
+/// `where_the_grid_sits` on cells as large as the hole's radius, divided once and twice at the
+/// hole, against uniform grids. The spread of σ_xx at the top and the bottom of the hole over
+/// the same six grid positions is printed with the unknowns and the time of a solve. A grid of
+/// one cell a radius, divided at the hole only, reaches the spread of the uniform grid of the
+/// same finest cells with a fraction of its unknowns. At degree 4 the second level changes
+/// nothing: cells of half the radius resolve the hole, and no cell is divided again. The plate
+/// is one cell of the grid thick, so the uniform grids have one layer of cells where the divided
+/// ones have two or four: a part that is not a plate gains more.
+#[test]
+#[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
+fn where_the_refined_grid_sits() {
+    const N: usize = 512;
+    let half = 8.0;
+    let (left, bottom) = (8u32, 9u32);
+    let material = Material { young: 1000.0, poisson: 0.3, density: 0.0 };
+    let mut spreads = Vec::new();
+    let cases = [
+        (1.0, 3, 0),
+        (1.0, 3, 1),
+        (1.0, 3, 2),
+        (0.5, 3, 0),
+        (0.25, 3, 0),
+        (1.0, 4, 0),
+        (1.0, 4, 1),
+        (1.0, 4, 2),
+        (0.5, 4, 0),
+        (2.0, 4, 2),
+        (2.0, 3, 3),
+    ];
+    for (cell, degree, refine) in cases {
+        // One cell of the grid thick, whatever the cells at the hole.
+        let surface = ring(
+            N,
+            cell,
+            |i| {
+                let t = 2.0 * std::f64::consts::PI * i as f64 / N as f64;
+                let (c, s) = (t.cos(), t.sin());
+                let m = c.abs().max(s.abs());
+                ([c, s], [half * (c / m), half * (s / m)])
+            },
+            |a, b| {
+                if a[0] == half && b[0] == half {
+                    OUTER_A
+                } else if a[0] == -half && b[0] == -half {
+                    left
+                } else if a[1] == -half && b[1] == -half {
+                    bottom
+                } else {
+                    OUTER_B
+                }
+            },
+        );
+        let supports = [slide(left, 0), slide(bottom, 1), slide(AT_Z0, 2), slide(AT_Z1, 2)];
+        let loads = [Load::Traction { face: OUTER_A, traction: [1.0, 0.0, 0.0] }];
+        let pull: f64 = (surface.triangles().iter().zip(surface.tri_face()))
+            .filter(|(_, tag)| **tag == OUTER_A)
+            .map(|(triangle, _)| {
+                let [a, b, c] = triangle.map(|v| surface.points()[v as usize]);
+                // The loaded face is in a plane x = const: half the cross product's x.
+                0.5 * ((b[1] - a[1]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[1] - a[1])).abs()
+            })
+            .sum();
+        let (mut lowest, mut highest) = (f64::INFINITY, 0.0f64);
+        let (mut fewest, mut most, mut seconds) = (usize::MAX, 0usize, 0.0f64);
+        let mut levels = [0usize; 4];
+        for offset in [[0.0, 0.0, 0.0], [0.0, 0.21, 0.0], [0.37, 0.21, 0.0], [0.37, 0.9, 0.0], [0.9, 0.1, 0.0], [0.9, 0.5, 0.0]] {
+            let options = Options { degree, offset, refine, ..Options::new(cell) };
+            let started = std::time::Instant::now();
+            let s = solve(&surface, &material, &supports, &loads, &options, &Limits::default()).unwrap();
+            seconds += started.elapsed().as_secs_f64() / 6.0;
+            (fewest, most) = (fewest.min(s.stats.unknowns), most.max(s.stats.unknowns));
+            // The left face carries the pull on the loaded one (the right side less the segment
+            // at a corner that rounding tags otherwise), and the quadrature of the divided cells
+            // gives the plate's volume to the tessellation of the hole.
+            let reaction = s.reactions.iter().find(|r| r.face == left).unwrap().force[0];
+            assert!((reaction + pull).abs() < 1e-6 * pull, "cell {cell}, degree {degree}, {refine} levels: reaction {reaction} against {pull}");
+            assert!((s.stats.volume - s.stats.surface_volume).abs() < 1e-4 * s.stats.surface_volume, "volume {}", s.stats.volume);
+            assert_eq!(s.stats.levels.iter().sum::<usize>(), s.stats.inside_cells + s.stats.cut_cells);
+            for (total, count) in levels.iter_mut().zip(&s.stats.levels) {
+                *total = (*total).max(*count);
+            }
+            for y in [1.0, -1.0] {
+                let stress = s.stress([0.0, y, 0.5 * cell]).unwrap()[0];
+                (lowest, highest) = (lowest.min(stress), highest.max(stress));
+            }
+        }
+        let spread = (highest - lowest) / (highest + lowest);
+        println!(
+            "cell {cell}, degree {degree}, {refine} levels: σ_xx at the hole from {lowest:.3} to {highest:.3} over six grid positions (± {:.1} %); {fewest} to {most} unknowns, at most {levels:?} cells by level, {seconds:.1} s a solve",
+            100.0 * spread
+        );
+        spreads.push((spread, most));
+    }
+    // Divided twice at the hole, cells of the radius are as good as a uniform grid of four cells
+    // a radius at degree 3 and of two at degree 4, with fewer unknowns.
+    assert!(spreads[2].0 < 0.03 && spreads[2].1 < spreads[4].1 / 4, "{spreads:?}");
+    assert!(spreads[7].0 < 0.02 && spreads[7].1 < spreads[8].1, "{spreads:?}");
 }

@@ -14,30 +14,45 @@
 //! 1. **Grid** ([`grid`]): a Cartesian grid over the surface's bounding box. Each surface
 //!    triangle is cut into pieces, one cell each; a cell that owns a piece is *cut*, any other is
 //!    inside or outside by its centre ([`inside`]: the winding number with exact predicates).
-//! 2. **Basis** ([`legendre`]): the tensor product of integrated Legendre polynomials of degree
+//! 2. **Refinement** ([`Options::refine`], off by default): a cut cell across which the surface
+//!    turns more than its degree resolves (a fillet or a hole with fewer than two cells to the
+//!    radius at degree 4, four at degree 3) is divided into eight, with the cells across its
+//!    faces, level by level. The cells of all levels carry one conforming basis by the
+//!    multi-level hp method: a divided cell stays and its children are laid over it, the finer
+//!    functions vanish on the boundary of the cells that are divided, and a function a divided
+//!    cell's children can represent is handed down to them, so there are no hanging nodes to
+//!    constrain (N. Zander, T. Bog, S. Kollmannsberger, D. Schillinger, E. Rank, *Multi-level
+//!    hp-adaptivity: high-order mesh adaptivity without the difficulties of constraining hanging
+//!    nodes*, Comput. Mech. 55(3):499–517, 2015). Every cell that is not divided is integrated
+//!    like a cell of the grid, in its own shape functions; the functions of the cells above it
+//!    are combinations of those.
+//! 3. **Basis** ([`legendre`]): the tensor product of integrated Legendre polynomials of degree
 //!    p on every cell, or its trunk space ([`Options::basis`]). Modes on a shared vertex, edge
 //!    or face of the grid are one unknown.
-//! 3. **Cut cells** ([`grid`]): a cell the surface cuts is integrated one axis at a time, split
+//! 4. **Cut cells** ([`grid`]): a cell the surface cuts is integrated one axis at a time, split
 //!    where the surface and its edges cross, with Gauss rules that integrate a cell cut by flat
 //!    faces exactly; where the surface is curved, an octree of depth [`Options::depth`] divides
 //!    the cell first. Points outside the part are weighted with [`Options::fictitious`]. The
 //!    points are not summed mode pair by mode pair: they are summed into the Legendre moments of
 //!    the cell's material, from which every cell matrix follows by sum factorisation.
-//! 4. **Supports**: prescribed displacement components of a face, imposed weakly by Nitsche's
+//! 5. **Supports**: prescribed displacement components of a face, imposed weakly by Nitsche's
 //!    method on the face's own triangles, with the stabilisation parameter of each cell from that
 //!    cell's eigenvalue problem (no penalty number to choose).
-//! 5. **Loads**: pressures, tractions and forces integrated over the face's triangles, gravity
+//! 6. **Loads**: pressures, tractions and forces integrated over the face's triangles, gravity
 //!    over the part's quadrature points.
-//! 6. **Solution**: assembled into [`fieldcraft_solver`]'s sparse matrix, ordered by its nested
+//! 7. **Solution**: assembled into [`fieldcraft_solver`]'s sparse matrix, ordered by its nested
 //!    dissection and factored by its Cholesky. Displacement and stress are evaluated anywhere in
 //!    the part from the cell's polynomial.
 //!
 //! This is a first version: one body, linear elastic, isotropic, static. Its accuracy is
 //! bounded by the tessellation of curved faces, by the fictitious stiffness, which shows in the
-//! stress of a cell that holds very little material, and by the grid, which is uniform: there is
-//! no local refinement, so a feature needs cells of its own size everywhere (on cells as large
-//! as a hole's radius the stress at the hole is within a few per cent only from degree 5 on,
-//! `tests/benchmarks.rs`). The stress is the derivative of the cell's polynomial and is least
+//! stress of a cell that holds very little material, and by the grid: on cells as large as a
+//! hole's radius the stress at the hole is within a few per cent only from degree 5 on
+//! (`tests/benchmarks.rs`), unless the cells are refined there ([`Options::refine`]). The
+//! refinement follows the curvature of the surface and nothing else: it does not look at the
+//! solution, so a stress that peaks at a sharp re-entrant edge or where a support ends is not
+//! refined towards, and it divides a cell along all three axes, also where a plate or an
+//! extrusion would need it along two. The stress is the derivative of the cell's polynomial and is least
 //! accurate on the boundary of the part, most of all where a supported face ends. The system is
 //! factored directly, so memory grows quickly with the degree: the caps in [`solve()`] refuse a
 //! model that would not fit. [`Solution::change_from`] compares two solutions as an indicator of
@@ -54,6 +69,7 @@ pub mod grid;
 pub mod inside;
 pub mod legendre;
 mod moments;
+mod refine;
 mod solve;
 mod space;
 

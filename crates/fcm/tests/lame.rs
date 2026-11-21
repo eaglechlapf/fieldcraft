@@ -174,3 +174,44 @@ fn a_finer_grid_at_degree_three() {
     assert!(displacement < 0.005, "displacement error {displacement:.3e}");
     assert!(stress < 0.03, "stress error {stress:.3e}");
 }
+
+/// Local refinement on the tube: the bore has the radius of one cell, so its cells and those
+/// around them are divided, and the coarse grid's error falls.
+#[test]
+fn refinement_at_the_bore_lowers_the_error() {
+    let coarse = report("degree 2, no refinement", &tube(&Options { degree: 2, depth: 1, ..Options::new(0.1) }));
+    let solution = tube(&Options { degree: 2, depth: 1, refine: 1, ..Options::new(0.1) });
+    let refined = report("degree 2, one level", &solution);
+    assert!(solution.stats.levels[1] > 0, "{:?}", solution.stats.levels);
+    assert_eq!(solution.stats.levels.iter().sum::<usize>(), solution.stats.inside_cells + solution.stats.cut_cells);
+    assert!(refined.0 < 0.25 * coarse.0 && refined.1 < 0.6 * coarse.1, "{refined:?} after {coarse:?}");
+    // The cuts still carry the pressure on the bore: p a L along each of x and y.
+    let force = PRESSURE * INNER_RADIUS * LENGTH;
+    for (face, axis) in [(AT_X0, 0), (AT_Y0, 1)] {
+        let reaction = solution.reactions.iter().find(|r| r.face == face).unwrap().force[axis];
+        assert!((reaction + force).abs() < 2e-3 * force, "face {face}: {reaction} against {force}");
+    }
+}
+
+/// The tube with one and two levels of refinement against the uniform grids, at degrees 3 and 4:
+/// errors, unknowns and time.
+#[test]
+#[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
+fn refinement_against_uniform_grids() {
+    let mut errors = Vec::new();
+    for (cell, degree, refine) in
+        [(0.1, 3, 0), (0.1, 3, 1), (0.1, 3, 2), (0.05, 3, 0), (0.025, 3, 0), (0.1, 4, 0), (0.1, 4, 1), (0.1, 4, 2), (0.05, 4, 0), (0.2, 4, 2)]
+    {
+        let started = std::time::Instant::now();
+        let solution = tube(&Options { degree, refine, offset: [0.37, 0.21, 0.43], ..Options::new(cell) });
+        let seconds = started.elapsed().as_secs_f64();
+        let found = report(
+            &format!("cell {cell}, degree {degree}, {refine} levels, {seconds:.1} s, cells by level {:?}", &solution.stats.levels[..=refine]),
+            &solution,
+        );
+        errors.push(found);
+    }
+    // Refinement is no worse than the grid it starts from.
+    assert!(errors[1].1 < errors[0].1 && errors[2].1 < errors[0].1, "degree 3: {errors:?}");
+    assert!(errors[6].1 < errors[5].1 && errors[7].1 < errors[5].1, "degree 4: {errors:?}");
+}

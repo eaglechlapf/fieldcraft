@@ -11,7 +11,7 @@
 
 mod common;
 
-use common::{X_HI, X_LO, Y_LO, Z_LO, block};
+use common::{AT_X0, AT_Y0, AT_Z0, AT_Z1, INNER, X_HI, X_LO, Y_LO, Z_LO, block, quarter_tube};
 use fieldcraft_fcm::{Basis, Error, Load, Material, Options, Solution, Support, solve};
 use fieldcraft_solver::Limits;
 
@@ -176,27 +176,50 @@ fn a_nearly_incompressible_block_keeps_its_constant_stress() {
 }
 
 /// The same bits on one thread and on several: cells are integrated in parallel and assembled in
-/// order.
+/// order. With refinement too: a quarter tube under pressure, whose curved faces divide the cells
+/// they cut twice, with supports on divided cut cells.
 #[test]
 fn the_result_does_not_depend_on_the_threads() {
+    let bits = |solution: &Solution, points: &[[f64; 3]]| {
+        let mut bits = vec![solution.strain_energy.to_bits(), solution.stats.volume.to_bits(), solution.stats.unknowns as u64];
+        for reaction in &solution.reactions {
+            bits.extend(reaction.force.map(f64::to_bits));
+        }
+        for x in points {
+            bits.extend(solution.displacement(*x).unwrap().map(f64::to_bits));
+            bits.extend(solution.stress(*x).unwrap().map(f64::to_bits));
+        }
+        bits
+    };
     let run = |threads: usize| {
         fieldcraft_parallel::with_threads(threads, || {
             let options = Options { degree: 3, basis: Basis::Trunk, offset: [0.31, 0.62, 0.13], ..Options::new(0.25) };
-            let solution = tension(&options).unwrap();
-            let mut bits = vec![solution.strain_energy.to_bits()];
-            for reaction in &solution.reactions {
-                bits.extend(reaction.force.map(f64::to_bits));
-            }
-            for x in [[0.0; 3], [0.3, 0.2, 0.1], SIZE] {
-                bits.extend(solution.displacement(x).unwrap().map(f64::to_bits));
-                bits.extend(solution.stress(x).unwrap().map(f64::to_bits));
-            }
-            bits
+            bits(&tension(&options).unwrap(), &[[0.0; 3], [0.3, 0.2, 0.1], SIZE])
         })
     };
     let one = run(1);
     assert_eq!(one, run(2));
     assert_eq!(one, run(7));
+
+    let tube = quarter_tube(0.1, 0.2, 0.05, 32);
+    let supports = [
+        Support { face: AT_X0, fixed: [true, false, false], value: [0.0; 3] },
+        Support { face: AT_Y0, fixed: [false, true, false], value: [0.0; 3] },
+        Support { face: AT_Z0, fixed: [false, false, true], value: [0.0; 3] },
+        Support { face: AT_Z1, fixed: [false, false, true], value: [0.0; 3] },
+    ];
+    let loads = [Load::Pressure { face: INNER, pressure: STRESS }];
+    let refined = |threads: usize| {
+        fieldcraft_parallel::with_threads(threads, || {
+            let options = Options { degree: 2, refine: 2, offset: [0.37, 0.21, 0.43], ..Options::new(0.1) };
+            let solution = solve(&tube, &STEEL, &supports, &loads, &options, &Limits::default()).unwrap();
+            assert!(solution.stats.levels[1] > 0 && solution.stats.levels[2] > 0, "cells of every level: {:?}", solution.stats.levels);
+            bits(&solution, &[[0.1, 0.0, 0.0], [0.0, 0.2, 0.05], [0.11, 0.1, 0.02], [0.14, 0.03, 0.04]])
+        })
+    };
+    let one = refined(1);
+    assert_eq!(one, refined(2));
+    assert_eq!(one, refined(7));
 }
 
 #[test]
@@ -222,6 +245,7 @@ fn unusable_input_is_refused() {
         Options { degree: 0, ..options },
         Options { degree: 99, ..options },
         Options { depth: 99, ..options },
+        Options { refine: 99, ..options },
         Options { fictitious: 0.0, ..options },
     ] {
         assert!(matches!(run(&STEEL, &fixed, &loads, &bad), Err(Error::Invalid(_))), "{bad:?}");
