@@ -388,14 +388,15 @@ pub fn display(s: &Session) -> (DisplayMesh, Vec<String>) {
 
 /// [`display`] with a section through the mesh, cut away on the side `toward` points to.
 pub fn display_cut(s: &Session, section: Option<Section>, toward: Vec3) -> (DisplayMesh, Vec<String>) {
-    let (d, failed, _) = display_parts(s, section, toward);
+    let (d, failed, _, _) = display_parts(s, section, toward);
     (d, failed)
 }
 
 /// [`display_cut`], and the names of the bodies drawn in the order of their surfaces
 /// ([`fieldcraft_render::SurfaceTri::body`]).
-fn display_parts(s: &Session, section: Option<Section>, toward: Vec3) -> (DisplayMesh, Vec<String>, Vec<String>) {
+fn display_parts(s: &Session, section: Option<Section>, toward: Vec3) -> (DisplayMesh, Vec<String>, Vec<String>, Vec<Tessellated>) {
     let mut bodies = Vec::new();
+    let mut surfaces = Vec::new();
     let mut hidden = s.hidden_elements();
     // The section's position is given in the display units; the mesh is in metres.
     let section = section.map(|c| Section { at: c.at.map(|x| length_si(s, x)), ..c });
@@ -406,7 +407,7 @@ fn display_parts(s: &Session, section: Option<Section>, toward: Vec3) -> (Displa
     let mut d = DisplayMesh::from_model_hiding(&s.model, &hidden);
     let mut failed = Vec::new();
     if cut.is_some() {
-        return (d, failed, bodies);
+        return (d, failed, bodies, surfaces);
     }
     for body in s.design.iter().flat_map(|d| &d.bodies).filter(|b| s.shows(fieldcraft_io::ItemKind::Body, &b.name)) {
         let mesh = body.measure().and_then(|m| body.tessellate(display_tolerance(&Aabb3 { min: m.bbox_min.into(), max: m.bbox_max.into() })));
@@ -421,6 +422,8 @@ fn display_parts(s: &Session, section: Option<Section>, toward: Vec3) -> (Displa
                 let positions: Vec<[f64; 3]> = m.positions.iter().map(|p| crate::units::geometry_point(*p)).collect();
                 d.add_surface(&positions, &m.triangles, &m.tri_face);
                 bodies.push(body.name.clone());
+                let faces = body.faces().iter().map(|f| f.name.clone()).collect();
+                surfaces.push(Tessellated { body: body.name.clone(), faces, positions, triangles: m.triangles, tri_face: m.tri_face });
             }
             Err(e) => failed.push(format!("{}: {e}", body.name)),
         }
@@ -429,7 +432,17 @@ fn display_parts(s: &Session, section: Option<Section>, toward: Vec3) -> (Displa
         let positions: Vec<[f64; 3]> = surface.mesh.positions.iter().map(|p| crate::units::geometry_point(*p)).collect();
         d.add_surface(&positions, &surface.mesh.triangles, &surface.mesh.tri_face);
     }
-    (d, failed, bodies)
+    (d, failed, bodies, surfaces)
+}
+
+/// A body as tessellated for a picture, in metres: where the symbols of a setup with no mesh
+/// go ([`Session::glyphs_on`]).
+struct Tessellated {
+    body: String,
+    faces: Vec<String>,
+    positions: Vec<[f64; 3]>,
+    triangles: Vec<[u32; 3]>,
+    tri_face: Vec<u32>,
 }
 
 /// Move every point within `distance` of an earlier one (in x order) onto it, so copies of one
@@ -508,11 +521,15 @@ impl Picture {
 }
 
 fn picture(s: &Session, p: &Palette, section: Option<Section>, toward: Vec3) -> Picture {
-    let (base, failed, bodies) = display_parts(s, section, toward);
+    let (base, failed, bodies, surfaces) = display_parts(s, section, toward);
+    let surfaces: Vec<crate::BodySurface> = surfaces
+        .iter()
+        .map(|t| crate::BodySurface { body: &t.body, faces: &t.faces, positions: &t.positions, triangles: &t.triangles, tri_face: &t.tri_face })
+        .collect();
     let mut shown = Shown { failed, ..Shown::default() };
     let plot = s.results_view.as_ref().and_then(|v| s.latest_result(&v.step).map(|(r, _)| (v, r)));
     // Over a results plot, the symbols of what its step used.
-    let glyphs = plot.map_or_else(|| s.glyphs(), |(v, _)| s.step_glyphs(&v.step));
+    let glyphs = plot.map_or_else(|| s.glyphs_on(&surfaces), |(v, _)| s.step_glyphs_on(&v.step, &surfaces));
     let Some((view, result)) = plot else {
         let mut scene = model_scene(&base, p);
         mark(&mut scene, &base, &marked(s), p.marked);

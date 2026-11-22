@@ -13,6 +13,11 @@ The model is the one a mesh solve reads: a material and a solid section on the b
 conditions and loads on sets of its faces, a static step. So the same model can be solved both
 ways and compared.
 
+A body with no mesh shows its supports and loads on its surface: the same symbols a mesh
+shows at its nodes, spread over the faces their sets name (triangles where a face is held,
+arrows for forces, pressures and tractions), and thinned to the zoom. **Loads & BCs** in the
+browser hides and shows them.
+
 ## Try it
 
 1. Start the app with the sample: `cargo run --release -p fieldcraft -- --sample bracket-grid`

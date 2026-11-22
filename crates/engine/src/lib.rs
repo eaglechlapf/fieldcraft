@@ -24,6 +24,7 @@ pub mod machine;
 pub use cmd::analytic_surfaces;
 pub use cmd::replace::{MESHERS, Replacement, replacement, thousands};
 pub use cmd::update::enable_checks as enable_update_checks;
+pub use cmd::view::BodySurface;
 /// Write an output (a picture, an export) where a user named, never over a model or design.
 pub use fieldcraft_io::fs::write_output;
 pub use fieldcraft_io::{Item as ViewItem, ItemKind};

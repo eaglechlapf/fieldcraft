@@ -21,6 +21,12 @@
 //!   from the point to some of the coupled nodes; **contact and tie surfaces:** small squares on
 //!   their faces; **rigid walls:** a hatched square.
 //!
+//! **Without a mesh.** A set that names faces of a body with no mesh has no nodes and no element
+//! faces. Its symbols go on the body's surface instead, at the places the caller gives for the
+//! set ([`Places`]: points of the faces with their outward directions, from the tessellation it
+//! draws the body with), thinned like the others. A setup solved without a mesh (Grid Static)
+//! shows its supports and loads that way.
+//!
 //! **Size on screen.** Symbols keep a constant size on screen whatever the zoom: [`Glyphs::draw`]
 //! takes the symbol unit (a support triangle's length) in model length, which the caller works
 //! out from the camera with [`symbol_unit`] (a size in pixels, [`DEFAULT_SIZE`] unless the user
@@ -217,22 +223,33 @@ pub fn quantise_unit(unit: f64) -> Option<(i32, f64)> {
     Some((step, (f64::from(step) / UNIT_STEPS).exp2()))
 }
 
-/// Where a symbol sits: a mesh node, or a reference point (its own node label when a result
-/// moves it, else its coordinates).
+/// Where the symbols of a body with no mesh go: the box around the geometry drawn, and for a
+/// set by its name the places on the faces it names of such bodies, each a point with the
+/// face's outward direction there (none for a set on a mesh, or with no geometry).
+pub struct Places<'a> {
+    pub bounds: Aabb3,
+    pub of_set: &'a dyn Fn(&str) -> Vec<(Vec3, Vec3)>,
+}
+
+/// Where a symbol sits: a mesh node, a reference point (its own node label when a result moves
+/// it, else its coordinates), or a place on the geometry of a body with no mesh.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Anchor {
     Node(u32),
     Point { label: u32, xyz: Vec3 },
+    Place(Vec3),
 }
 
 /// The corners of a loaded face (or the ends of a loaded edge), with the outward direction it
 /// had on the undeformed model (the solver's convention: a face's right-hand normal, outward
-/// for solids; an in-plane edge's normal to the right of its direction).
+/// for solids; an in-plane edge's normal to the right of its direction); or a place on a face
+/// of the geometry of a body with no mesh, `at` with its outward direction.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Face {
     corners: [u32; 4],
     count: usize,
     outward: Vec3,
+    at: Option<Vec3>,
 }
 
 /// A place a node symbol may go: its anchor, where it is on the undeformed model (for
@@ -404,6 +421,10 @@ fn thin<T: Copy>(items: impl IntoIterator<Item = (T, Vec3)>, cell: f64, cap: usi
 /// What [`Glyphs::from_model`] reads, with the sets resolved once each.
 struct Builder<'m> {
     model: &'m Model,
+    /// The places on the geometry of bodies with no mesh, by set ([`Places::of_set`]), asked
+    /// for once each.
+    of_set: &'m dyn Fn(&str) -> Vec<(Vec3, Vec3)>,
+    placed: BTreeMap<String, Vec<(Vec3, Vec3)>>,
     sets: BTreeMap<String, ResolvedSet>,
     /// The nodes that can rotate, worked out when a constraint needs them.
     rotating: Option<BTreeSet<u32>>,
@@ -422,6 +443,17 @@ impl Builder<'_> {
             self.sets.insert(name.to_string(), r);
         }
         self.sets.get(name)
+    }
+
+    /// The places of a set on the geometry of bodies with no mesh (a sample of very many),
+    /// those that are points and directions.
+    fn places(&mut self, set: &str) -> Vec<(Vec3, Vec3)> {
+        if !self.placed.contains_key(set) {
+            let found: Vec<(Vec3, Vec3)> =
+                scan(&(self.of_set)(set)).filter(|(p, n)| p.is_finite() && n.is_finite()).filter_map(|(p, n)| Some((*p, n.normalized()?))).collect();
+            self.placed.insert(set.to_string(), found);
+        }
+        self.placed.get(set).cloned().unwrap_or_default()
     }
 
     fn owner(&mut self, def: Definition, name: &str) -> usize {
@@ -477,11 +509,15 @@ impl Builder<'_> {
                         }
                     }
                 }
-                let spots = at
+                let mut spots: Vec<Spot> = at
                     .into_iter()
                     .map(|(n, p)| Spot { at: Anchor::Node(n), p, normal: normals.get(&n).and_then(|v| v.normalized()), dofs: 0 })
                     .collect();
-                (spots, total)
+                // On a body with no mesh: the places on its faces. They are a sample of the
+                // faces, not what the set has, so they count for no more than are drawn.
+                let places = self.places(s);
+                spots.extend(places.iter().map(|(p, n)| Spot { at: Anchor::Place(*p), p: *p, normal: Some(*n), dofs: 0 }));
+                (spots, total + places.len().min(MAX_PER_DEFINITION))
             }
         }
     }
@@ -496,6 +532,15 @@ impl Builder<'_> {
     /// The faces of a set (its element faces, else the edges of its 2D elements) with their
     /// centres, and how many it has.
     fn faces(&mut self, set: &str) -> (Vec<(Face, Vec3)>, usize) {
+        let (mut found, total) = self.element_faces(set);
+        // On a body with no mesh: the places on its faces (a sample: see [`Builder::spots`]).
+        let places = self.places(set);
+        found.extend(places.iter().map(|(p, n)| (Face { corners: [0; 4], count: 0, outward: *n, at: Some(*p) }, *p)));
+        (found, total + places.len().min(MAX_PER_DEFINITION))
+    }
+
+    /// [`Builder::faces`] on the mesh.
+    fn element_faces(&mut self, set: &str) -> (Vec<(Face, Vec3)>, usize) {
         let model = self.model;
         let Some(r) = self.set(set) else { return (Vec::new(), 0) };
         let face = |labels: &[u32], outward: Vec3| {
@@ -503,7 +548,7 @@ impl Builder<'_> {
             for (slot, l) in corners.iter_mut().zip(labels) {
                 *slot = *l;
             }
-            Face { corners, count: labels.len().min(4), outward }
+            Face { corners, count: labels.len().min(4), outward, at: None }
         };
         let corners_at = |labels: &[u32]| -> Option<Vec<Vec3>> { labels.iter().map(|&n| xyz(model, n)).collect() };
         let mut found: Vec<(Face, Vec3)> = Vec::new();
@@ -534,10 +579,13 @@ impl Builder<'_> {
         (found, r.edges.len())
     }
 
-    /// The bounding box of a set's nodes.
+    /// The bounding box of a set's nodes, and of its places on bodies with no mesh.
     fn set_bounds(&mut self, set: &str) -> Aabb3 {
         let mut b = Aabb3::EMPTY;
         for (_, p) in self.node_points(set).0 {
+            b.add(p);
+        }
+        for (p, _) in self.places(set) {
             b.add(p);
         }
         b
@@ -595,6 +643,8 @@ impl Builder<'_> {
                 let rotates = match s.at {
                     Anchor::Node(n) => rotating.contains(&n),
                     Anchor::Point { .. } => true,
+                    // A solid's surface.
+                    Anchor::Place(_) => false,
                 };
                 let dofs = if rotates { dofs } else { dofs & 0b000_111 };
                 (dofs != 0).then_some(Spot { dofs, ..s })
@@ -739,7 +789,13 @@ impl Glyphs {
     /// The symbols of `model`'s boundary conditions, loads, contact and tie surfaces, reference
     /// points, couplings and explicit steps' initial velocities and rigid walls.
     pub fn from_model(model: &Model) -> Glyphs {
-        let mut bounds = Aabb3::EMPTY;
+        Glyphs::from_model_on(model, &Places { bounds: Aabb3::EMPTY, of_set: &|_| Vec::new() })
+    }
+
+    /// [`Glyphs::from_model`] with the symbols of bodies that have no mesh on their geometry,
+    /// at `places`.
+    pub fn from_model_on(model: &Model, places: &Places) -> Glyphs {
+        let mut bounds = places.bounds;
         for n in model.nodes().values() {
             bounds.add(Vec3::from(n.xyz));
         }
@@ -748,8 +804,18 @@ impl Glyphs {
         }
         let d = bounds.diagonal();
         let unit = if d.is_finite() && d > 0.0 { d * UNIT_FRACTION } else { 1.0 };
-        let mut b =
-            Builder { model, sets: BTreeMap::new(), rotating: None, bounds, owners: Vec::new(), groups: Vec::new(), marks: Vec::new(), free: 0 };
+        let mut b = Builder {
+            model,
+            of_set: places.of_set,
+            placed: BTreeMap::new(),
+            sets: BTreeMap::new(),
+            rotating: None,
+            bounds,
+            owners: Vec::new(),
+            groups: Vec::new(),
+            marks: Vec::new(),
+            free: 0,
+        };
         for (name, bc) in model.boundary_conditions() {
             b.boundary_condition(name, bc);
         }
@@ -765,7 +831,12 @@ impl Glyphs {
 
     /// [`Glyphs::from_model`] without the definitions `hidden` names (the view's hidden items).
     pub fn from_model_hiding(model: &Model, hidden: &dyn Fn(Definition, &str) -> bool) -> Glyphs {
-        let mut g = Glyphs::from_model(model);
+        Glyphs::from_model_on_hiding(model, &Places { bounds: Aabb3::EMPTY, of_set: &|_| Vec::new() }, hidden)
+    }
+
+    /// [`Glyphs::from_model_on`] without the definitions `hidden` names.
+    pub fn from_model_on_hiding(model: &Model, places: &Places, hidden: &dyn Fn(Definition, &str) -> bool) -> Glyphs {
+        let mut g = Glyphs::from_model_on(model, places);
         let gone: Vec<bool> = g.owners.iter().map(|(d, n)| hidden(*d, n)).collect();
         let kept = |owner: usize| !gone.get(owner).copied().unwrap_or(false);
         g.groups.retain(|x| kept(x.owner));
@@ -787,6 +858,7 @@ impl Glyphs {
             match a {
                 Anchor::Node(n) => pos(n),
                 Anchor::Point { label, xyz } => Some(pos(label).unwrap_or(xyz)),
+                Anchor::Place(p) => Some(p),
             }
             .filter(|p| p.is_finite())
         };
@@ -1166,16 +1238,21 @@ impl Draw<'_> {
 
     /// The symbol of a face group's shape on `face` (at its corners' positions `pos`).
     fn face_symbol(&mut self, shape: Shape, face: &Face, pos: &impl Fn(u32) -> Option<Vec3>, u: f64) {
-        let mut p = [Vec3::ZERO; 4];
-        let corners = face.corners.iter().take(face.count).map(|&n| pos(n));
-        if face.count == 0 || corners.zip(p.iter_mut()).any(|(q, slot)| q.map(|q| *slot = q).is_none()) {
-            return;
-        }
-        let p = p.get(..face.count).unwrap_or(&[]);
-        let c = centre(p);
-        // The face's own normal now (it may be deformed), on the side it pointed.
-        let outward = if face.count >= 3 { polygon_normal(p).map(|n| if n.dot(face.outward) < 0.0 { -n } else { n }) } else { None };
-        let outward = outward.unwrap_or(face.outward);
+        let (c, outward) = match face.at {
+            // A place on the geometry: where it is, as it points.
+            Some(at) => (at, face.outward),
+            None => {
+                let mut p = [Vec3::ZERO; 4];
+                let corners = face.corners.iter().take(face.count).map(|&n| pos(n));
+                if face.count == 0 || corners.zip(p.iter_mut()).any(|(q, slot)| q.map(|q| *slot = q).is_none()) {
+                    return;
+                }
+                let p = p.get(..face.count).unwrap_or(&[]);
+                // The face's own normal now (it may be deformed), on the side it pointed.
+                let outward = if face.count >= 3 { polygon_normal(p).map(|n| if n.dot(face.outward) < 0.0 { -n } else { n }) } else { None };
+                (centre(p), outward.unwrap_or(face.outward))
+            }
+        };
         let (len, head) = (2.2 * u, 0.7 * u);
         match shape {
             Shape::Pressure { onto: true } => self.arrow(c + outward * len, -outward, len, head),
@@ -1545,6 +1622,61 @@ mod tests {
         let s = drawn(&Glyphs::from_model(&m), &m, GlyphShow::ALL);
         let l = s.lines.first().unwrap();
         assert!((l.a.x - 4.0).abs() < 1e-9 && l.b.x > l.a.x, "{l:?}");
+    }
+
+    /// A setup with no mesh: its sets name faces of the geometry and have no nodes, and its
+    /// symbols go at the places the caller gives for each set, a point and the face's outward
+    /// direction there.
+    #[test]
+    fn a_setup_with_no_mesh_is_drawn_on_the_geometry() {
+        let u = 0.1;
+        let mut m = Model::default();
+        for name in ["foot", "top"] {
+            m.add_set(name, Set { geometry: vec![fieldcraft_model::GeometryRef::face("Block", name).unwrap()], ..Set::default() }).unwrap();
+        }
+        m.add_boundary_condition("Clamp", BoundaryCondition::Fixed { target: Target::Set("foot".into()) }).unwrap();
+        m.add_load("Press", Load::Pressure { set: "top".into(), magnitude: 2.0 }).unwrap();
+        m.add_load("Pull", Load::Force { target: Target::Set("top".into()), vector: [3.0, 0.0, 0.0], distribution: Default::default() }).unwrap();
+        // Nothing to draw them on: nothing drawn.
+        let none = Glyphs::from_model(&m);
+        assert!(drawn_at(&none, &m, &view(GlyphShow::ALL, u)).0.lines.is_empty());
+
+        // The foot is the face z = 0 (outward −z), the top z = 1 (outward +z): a few places each,
+        // some of them no places at all.
+        let of_set = |set: &str| -> Vec<(Vec3, Vec3)> {
+            let spread = |z: f64, n: Vec3| (0..3).flat_map(move |i| (0..3).map(move |j| (Vec3::new(i as f64, j as f64, z), n)));
+            match set {
+                "foot" => spread(0.0, -Vec3::Z).chain([(Vec3::new(f64::NAN, 0.0, 0.0), Vec3::Z), (Vec3::ZERO, Vec3::ZERO)]).collect(),
+                "top" => spread(1.0, Vec3::Z * 5.0).collect(),
+                _ => Vec::new(),
+            }
+        };
+        let bounds = Aabb3 { min: Vec3::ZERO, max: Vec3::new(2.0, 2.0, 1.0) };
+        let g = Glyphs::from_model_on(&m, &Places { bounds, of_set: &of_set });
+        assert!((g.model_unit() - 3.0 * UNIT_FRACTION).abs() < 1e-12, "the geometry's box gives the unit");
+        let (s, d) = drawn_at(&g, &m, &view(GlyphShow::ALL, u));
+        assert!(d.notes.is_empty(), "a sample of the faces is not a set drawn in part: {:?}", d.notes);
+        let of = |color: Rgb| s.lines.iter().filter(|l| l.color == color).collect::<Vec<_>>();
+        // The clamp: three triangles (six lines each) at each of the nine places, the one along z
+        // from outside the part, under the foot.
+        assert_eq!(of(COLORS.constraint).len(), 9 * 3 * 6);
+        let b = bases(&s, Vec3::new(1.0, 1.0, 0.0));
+        assert_eq!(near(&b, Vec3::new(1.0, 1.0, -u)), 2, "{b:?}");
+        // The pressure: an arrow onto each place of the top from above (five lines each); the
+        // force: an arrow along x ending on each (five lines).
+        let loads = of(COLORS.load);
+        assert_eq!(loads.len(), 9 * 5 + 9 * 5);
+        let onto = loads.iter().filter(|l| l.a.x == l.b.x && l.a.y == l.b.y && l.a.z > 1.0 && (l.b.z - 1.0).abs() < 1e-9).count();
+        assert_eq!(onto, 9, "pressure shafts come down onto the top");
+        let along =
+            loads.iter().filter(|l| l.a.y == l.b.y && l.a.z == 1.0 && l.b.z == 1.0 && l.a.x < l.b.x && (l.b.x - l.b.x.round()).abs() < 1e-9).count();
+        assert_eq!(along, 9, "force shafts end on their places");
+        assert!(s.on_top.is_empty());
+        // Hidden like any other; and the places thin with the zoom like nodes.
+        let hidden = Glyphs::from_model_on_hiding(&m, &Places { bounds, of_set: &of_set }, &|d, _| d == Definition::Load);
+        assert_eq!(drawn_at(&hidden, &m, &view(GlyphShow::ALL, u)).0.lines.len(), 9 * 3 * 6);
+        let (far, _) = drawn_at(&g, &m, &view(GlyphShow::ALL, 10.0));
+        assert_eq!(far.lines.iter().filter(|l| l.color == COLORS.constraint).count(), 3 * 6, "one place a cell of the thinning grid");
     }
 
     /// A load at a reference point or a single node is drawn over the part; its support-sized

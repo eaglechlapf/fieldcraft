@@ -1265,7 +1265,8 @@ impl ModelApp {
             }
             let was_empty = self.display.1.bounds.is_empty();
             self.display = (Some(self.revision), d);
-            self.glyphs = self.session.glyphs();
+            // Bodies with no mesh carry their symbols on their surfaces as drawn here.
+            self.glyphs = self.session.glyphs_on(&body_surfaces(&self.bodies.1));
             if was_empty && !self.display.1.bounds.is_empty() {
                 self.reframe = framing::Reframe::merge(self.reframe, framing::Reframe::Fit);
             }
@@ -1605,7 +1606,7 @@ impl ModelApp {
             if let Some(step) = step.as_ref().filter(|_| self.ui.result_symbols) {
                 let for_plot = Some((self.revision, step.clone()));
                 if self.step_glyphs.0 != for_plot {
-                    self.step_glyphs = (for_plot, self.session.step_glyphs(step));
+                    self.step_glyphs = (for_plot, self.session.step_glyphs_on(step, &body_surfaces(&self.bodies.1)));
                 }
             }
             let glyphs = if step.is_some() { &self.step_glyphs.1 } else { &self.glyphs };
@@ -2675,6 +2676,20 @@ impl ModelApp {
 
 /// A design's bodies tessellated for drawing and picking, each with its names.
 type BodyMeshes = Vec<(selection::BodyNames, fieldcraft_geometry::SurfaceMesh)>;
+
+/// The bodies' surfaces as the engine places symbols on them ([`fieldcraft_engine::Session::glyphs_on`]).
+fn body_surfaces(bodies: &BodyMeshes) -> Vec<fieldcraft_engine::BodySurface<'_>> {
+    bodies
+        .iter()
+        .map(|(names, mesh)| fieldcraft_engine::BodySurface {
+            body: &names.name,
+            faces: &names.faces,
+            positions: &mesh.positions,
+            triangles: &mesh.triangles,
+            tri_face: &mesh.tri_face,
+        })
+        .collect()
+}
 
 /// Whether `a` and `b` are the same open design (or both none).
 fn same_design(a: &Option<Arc<fieldcraft_geometry::Design>>, b: &Option<Arc<fieldcraft_geometry::Design>>) -> bool {
