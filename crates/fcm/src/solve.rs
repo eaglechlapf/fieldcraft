@@ -6,12 +6,10 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use fieldcraft_fem::{DofLayout, DofSet};
 use fieldcraft_mesh::surface::BoundarySurface;
 use fieldcraft_solver::Limits;
-use fieldcraft_solver::cholesky::{Factor, FactorError, PIVOT_TOLERANCE, UpperColumns};
+use fieldcraft_solver::cholesky::{FactorError, PIVOT_TOLERANCE};
 use fieldcraft_solver::ordering::element_dissection;
-use fieldcraft_solver::sparse::{NodeGraph, add_block};
 
 use crate::cell::{self, Face, Lame, Shapes, Surface};
 use crate::gauss::gauss_legendre;
@@ -29,7 +27,7 @@ use crate::{Error, Result};
 const MAX_CELLS: usize = 4_000_000;
 /// Entries of the sparse stiffness, at most (8 bytes each for the values and the column
 /// indices: 2.9 GB).
-const MAX_MATRIX_ENTRIES: usize = 180_000_000;
+pub(crate) const MAX_MATRIX_ENTRIES: usize = 180_000_000;
 /// Quadrature points of one cut cell, at most.
 const MAX_CELL_POINTS: usize = 4_000_000;
 /// Bytes of cell matrices in memory together: the cells are integrated in blocks of as many as
@@ -487,34 +485,17 @@ pub struct Solution {
     pub reactions: Vec<Reaction>,
 }
 
-impl Solution {
-    /// The cells to divide next ([`Options::adapt`]): the leaves whose elements carry the share
-    /// `share` of the indicator's sum, largest first, each by its level and its place, with
-    /// the cells above it (a cell is divided only when the cells above it are).
-    fn least_resolved(&self, share: f64) -> BTreeSet<(u8, [u32; 3])> {
-        let mut order: Vec<usize> = (0..self.surplus.len()).collect();
-        // Largest first, the lower element first among equals.
-        order.sort_by(|a, b| self.surplus[*b].total_cmp(&self.surplus[*a]).then(a.cmp(b)));
-        let total: f64 = self.surplus.iter().filter(|s| s.is_finite()).sum();
-        let mut marked = BTreeSet::new();
-        let mut sum = 0.0;
-        for element in order {
-            let Some(surplus) = self.surplus.get(element).copied().filter(|s| s.is_finite() && *s > 0.0) else { continue };
-            if !(sum < share * total) {
-                break;
-            }
-            sum += surplus;
-            let Some(cell) = self.space.elements.get(element).and_then(|node| self.tree.nodes.get(*node as usize)) else { continue };
-            if usize::from(cell.level) >= MAX_REFINE {
-                continue;
-            }
-            for up in 0..=cell.level {
-                marked.insert((cell.level - up, cell.ijk.map(|i| i >> up)));
-            }
-        }
-        marked
-    }
+/// Where a point is among a body's cells.
+#[derive(Clone, Copy)]
+struct Place<'a> {
+    grid: &'a Grid,
+    tree: &'a Tree,
+    space: &'a Space,
+    /// The cells that hold several islands ([`Solution`]).
+    split: &'a BTreeMap<u32, (Vec<Piece>, Vec<u16>)>,
+}
 
+impl Place<'_> {
     /// The leaf under `node` that holds the point at `t` cells of the grid from its origin and
     /// holds material: its element, the point's natural coordinates in it and its size. A point
     /// within [`NEAR`] of the plane between two children may be in either.
@@ -552,13 +533,8 @@ impl Solution {
         None
     }
 
-    /// The element that holds `x`, its natural coordinates there and the size of its cell.
-    fn locate(&self, x: [f64; 3]) -> Option<(usize, [f64; 3], f64)> {
-        self.locate_in(x, true)
-    }
-
-    /// [`Solution::locate`]; with `island` off, the first element of the cell that holds `x`,
-    /// whichever of the cell's islands the point is in: enough for what the cell alone says.
+    /// The element that holds `x`, its natural coordinates there and the size of its cell; with
+    /// `island` off, the first element of the cell, whichever of its islands the point is in.
     fn locate_in(&self, x: [f64; 3], island: bool) -> Option<(usize, [f64; 3], f64)> {
         let mut t = [0.0; 3];
         let mut candidates = [[None; 2]; 3];
@@ -593,6 +569,123 @@ impl Solution {
             }
         }
         None
+    }
+}
+
+/// How a body is tied to others ([`crate::assembly`]).
+pub(crate) struct Ties<'a> {
+    /// The faces that are fixed to another body where they touch it.
+    pub faces: &'a BTreeSet<u32>,
+    /// Where a piece of such a face may touch the other body ([`cell::Touching`]).
+    pub touching: &'a cell::Touching<'a>,
+    /// Whether another body's tied face holds this one: it needs no support of its own then.
+    pub held: bool,
+}
+
+/// A point where a tied face touches the other body: the element it is in, the face, the point,
+/// its weight (an area), the values of the element's functions there and the traction of each
+/// of their unknowns on the face, `tractions[3 n i + 3 f + k]` component i of function f's
+/// component k, of n functions.
+pub(crate) struct Tied<'a> {
+    pub element: usize,
+    pub tag: u32,
+    pub x: [f64; 3],
+    pub weight: f64,
+    pub values: &'a [f64],
+    pub tractions: &'a [f64],
+}
+
+/// What a body hands over when its cells are ready, before their matrices are added up: enough
+/// to add them into a system of several bodies ([`crate::assembly`]).
+pub(crate) struct View<'a> {
+    /// The body's cells.
+    pub grid: Grid,
+    pub tree: &'a Tree,
+    /// The body's functions (three unknowns each), numbered in its own order of elimination.
+    pub count: usize,
+    /// Where a function sits.
+    pub position: &'a dyn Fn(usize) -> [f64; 3],
+    /// The functions of every element.
+    pub elements: Vec<&'a [usize]>,
+    /// Hand every element's stiffness and load, on its functions, to the caller, in order.
+    #[allow(clippy::type_complexity)]
+    pub assemble: &'a dyn Fn(&mut dyn FnMut(usize, &[f64], &[f64]) -> Result<()>) -> Result<()>,
+    /// Hand every point where a tied face of the body touches another to the caller.
+    #[allow(clippy::type_complexity)]
+    pub tied: &'a dyn Fn(&mut dyn FnMut(&Tied) -> Result<()>) -> Result<()>,
+    /// The element whose cell holds the point, and the values of its functions there; a point
+    /// no cell holds is read in the cell of the second point, one of the body's surface next
+    /// to it.
+    #[allow(clippy::type_complexity)]
+    pub at: &'a dyn Fn([f64; 3], [f64; 3]) -> Option<(usize, Vec<f64>)>,
+    /// The Nitsche parameter of an element's cell, once its matrices were handed over.
+    pub nitsche: &'a dyn Fn(usize) -> f64,
+    /// The levels of refinement asked for, and the stiffness and factor entries of the solve
+    /// before this one, for what a refusal says and when.
+    pub refine: usize,
+    pub before: Option<(usize, usize)>,
+}
+
+/// A body's share of a solved system: three displacement coefficients per function, and the
+/// entries of the system's stiffness and of its factor.
+pub(crate) struct Solved {
+    pub u: Vec<f64>,
+    pub stiffness_entries: usize,
+    pub factor_entries: usize,
+}
+
+/// Where a body's equations go: into a system of its own, or one of several bodies.
+pub(crate) type Join<'a> = &'a dyn Fn(&View) -> Result<Solved>;
+
+/// What the cells of a body add up to while their matrices are handed over.
+struct Tally {
+    stats: Stats,
+    nitsche: Vec<f64>,
+    fractions: Vec<f64>,
+    material: Vec<([f64; 3], [f64; 3])>,
+}
+
+impl Solution {
+    /// The cells to divide next ([`Options::adapt`]): the leaves whose elements carry the share
+    /// `share` of the indicator's sum, largest first, each by its level and its place, with
+    /// the cells above it (a cell is divided only when the cells above it are).
+    fn least_resolved(&self, share: f64) -> BTreeSet<(u8, [u32; 3])> {
+        let mut order: Vec<usize> = (0..self.surplus.len()).collect();
+        // Largest first, the lower element first among equals.
+        order.sort_by(|a, b| self.surplus[*b].total_cmp(&self.surplus[*a]).then(a.cmp(b)));
+        let total: f64 = self.surplus.iter().filter(|s| s.is_finite()).sum();
+        let mut marked = BTreeSet::new();
+        let mut sum = 0.0;
+        for element in order {
+            let Some(surplus) = self.surplus.get(element).copied().filter(|s| s.is_finite() && *s > 0.0) else { continue };
+            if !(sum < share * total) {
+                break;
+            }
+            sum += surplus;
+            let Some(cell) = self.space.elements.get(element).and_then(|node| self.tree.nodes.get(*node as usize)) else { continue };
+            if usize::from(cell.level) >= MAX_REFINE {
+                continue;
+            }
+            for up in 0..=cell.level {
+                marked.insert((cell.level - up, cell.ijk.map(|i| i >> up)));
+            }
+        }
+        marked
+    }
+
+    fn place(&self) -> Place<'_> {
+        Place { grid: &self.grid, tree: &self.tree, space: &self.space, split: &self.split }
+    }
+
+    /// The element that holds `x`, its natural coordinates there and the size of its cell.
+    fn locate(&self, x: [f64; 3]) -> Option<(usize, [f64; 3], f64)> {
+        self.place().locate_in(x, true)
+    }
+
+    /// [`Solution::locate`]; with `island` off, the first element of the cell that holds `x`,
+    /// whichever of the cell's islands the point is in: enough for what the cell alone says.
+    fn locate_in(&self, x: [f64; 3], island: bool) -> Option<(usize, [f64; 3], f64)> {
+        self.place().locate_in(x, island)
     }
 
     /// The displacement and its gradient ∂uᵢ/∂xⱼ at `x`: the displacement of the cell that holds
@@ -816,7 +909,13 @@ impl Solution {
 }
 
 /// What each face carries, and the body force per volume.
-fn conditions(supports: &[Support], loads: &[Load], areas: &BTreeMap<u32, f64>, density: f64) -> Result<(BTreeMap<u32, Face>, [f64; 3])> {
+fn conditions(
+    supports: &[Support],
+    loads: &[Load],
+    areas: &BTreeMap<u32, f64>,
+    density: f64,
+    ties: Option<&Ties>,
+) -> Result<(BTreeMap<u32, Face>, [f64; 3])> {
     let area = |face: u32| areas.get(&face).copied().filter(|a| *a > 0.0).ok_or_else(|| Error::Invalid(format!("the surface has no face {face}")));
     let finite = |what: &str, values: &[f64]| {
         if values.iter().all(|x| x.is_finite()) { Ok(()) } else { Err(Error::Invalid(format!("{what} is not finite"))) }
@@ -872,7 +971,17 @@ fn conditions(supports: &[Support], loads: &[Load], areas: &BTreeMap<u32, f64>, 
             }
         }
     }
-    if !faces.values().any(Face::supported) {
+    // A face tied to another body is fixed to it, in every component, where the two touch.
+    for tag in ties.into_iter().flat_map(|ties| ties.faces) {
+        area(*tag)?;
+        let face = faces.entry(*tag).or_default();
+        if face.supported() {
+            return Err(Error::Invalid(format!("face {tag} is supported and bonded to another body: one or the other")));
+        }
+        face.fixed = [true; 3];
+        face.tied = true;
+    }
+    if !faces.values().any(Face::supported) && !ties.is_some_and(|ties| ties.held) {
         return Err(Error::Invalid("the part has no support: prescribe the displacement of at least one face".into()));
     }
     Ok((faces, body))
@@ -905,11 +1014,11 @@ fn chebyshev(p: usize, x: f64) -> f64 {
 }
 
 /// What makes a model smaller, for the message of a limit.
-fn smaller(refine: usize) -> &'static str {
+pub(crate) fn smaller(refine: usize) -> &'static str {
     if refine > 0 { "use a larger cell size, a lower degree or fewer levels of refinement" } else { "use a larger cell size or a lower degree" }
 }
 
-fn factor_error(e: FactorError, refine: usize) -> Error {
+pub(crate) fn factor_error(e: FactorError, refine: usize) -> Error {
     match e {
         FactorError::NotPositiveDefinite { column } | FactorError::Singular { column } => Error::Singular(format!(
             "the stiffness is singular to working precision (equation {column}): the supports leave a rigid motion of the part free, or a cell holds so little material that the fictitious stiffness no longer determines its unknowns"
@@ -965,7 +1074,8 @@ pub fn solve(
     limits: &Limits,
 ) -> Result<Solution> {
     let mut next = Round::default();
-    let (mut solution, used) = solve_marked(surface, material, supports, loads, options, limits, None, &next)?;
+    let alone = alone(limits);
+    let (mut solution, used) = solve_marked(surface, material, supports, loads, options, limits, None, &next, &alone)?;
     // The rounds that follow the solution ([`Options::adapt`]): each divides the cells the last
     // solution is least resolved in and solves again, as the first solve was solved in the end
     // (with the levels where gaps end that fitted, with the pieces joined if they had to be).
@@ -976,7 +1086,7 @@ pub fn solve(
             break;
         }
         next.before = Some((solution.stats.stiffness_entries, solution.stats.factor_entries));
-        match solve_raising(surface, material, supports, loads, &used, limits, None, &next) {
+        match solve_raising(surface, material, supports, loads, &used, limits, None, &next, &alone) {
             Ok(mut finer) => {
                 finer.stats.rounds = round + 1;
                 finer.stats.joined = solution.stats.joined;
@@ -998,6 +1108,13 @@ pub fn solve(
         }
     }
     Ok(solution)
+}
+
+/// The system of one body alone ([`Join`]).
+fn alone(limits: &Limits) -> impl Fn(&View) -> Result<Solved> + '_ {
+    |view: &View| {
+        crate::assembly::solve_system(&[view], &|_, _, _| None, limits)?.pop().ok_or_else(|| Error::Internal("the system has no solution".into()))
+    }
 }
 
 /// What a solve of [`solve`] takes from the solves before it ([`Options::adapt`]).
@@ -1027,14 +1144,14 @@ fn solve_raising(
     limits: &Limits,
     marker: Option<Marker>,
     round: &Round,
+    join: Join,
 ) -> Result<Solution> {
-    let lame = material.lame()?;
     options.check()?;
-    let most = margin_fraction(&lame).min(1.0);
+    let most = most_fictitious(material)?;
     let mut fictitious = options.fictitious;
     // Each step multiplies the fraction, so the loop ends.
     loop {
-        match solve_at(surface, material, supports, loads, options, limits, fictitious, marker, round) {
+        match solve_at(surface, material, supports, loads, options, limits, fictitious, marker, round, None, join) {
             Err(Error::Singular(_)) if fictitious < most => fictitious = (fictitious * FICTITIOUS_STEP).min(most),
             result => return result,
         }
@@ -1053,8 +1170,9 @@ fn solve_marked(
     limits: &Limits,
     marker: Option<Marker>,
     round: &Round,
+    join: Join,
 ) -> Result<(Solution, Options)> {
-    let attempt = |options: &Options| solve_raising(surface, material, supports, loads, options, limits, marker, round);
+    let attempt = |options: &Options| solve_raising(surface, material, supports, loads, options, limits, marker, round, join);
     // The cells divided where gaps end may make the system too large ([`Options::gaps`]): then
     // with a level less of them, down to none.
     let mut fewer = *options;
@@ -1082,9 +1200,34 @@ fn solve_marked(
     }
 }
 
+/// The largest fictitious stiffness a material leaves room for ([`Options::fictitious`]), as a
+/// fraction of its own.
+pub(crate) fn most_fictitious(material: &Material) -> Result<f64> {
+    Ok(margin_fraction(&material.lame()?).min(1.0))
+}
+
+/// One body of several ([`crate::assembly`]): its solve with exactly these options and this
+/// fictitious stiffness, its faces tied as `ties` say, its equations handed to `join`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn solve_tied(
+    surface: &BoundarySurface,
+    material: &Material,
+    supports: &[Support],
+    loads: &[Load],
+    options: &Options,
+    limits: &Limits,
+    fictitious: f64,
+    ties: &Ties,
+    join: Join,
+) -> Result<Solution> {
+    options.check()?;
+    let alone = Options { adapt: 0, ..*options };
+    solve_at(surface, material, supports, loads, &alone, limits, fictitious, None, &Round::default(), Some(ties), join)
+}
+
 /// How much the fictitious stiffness is raised at a time when the system is singular to working
 /// precision: the two decades of margin [`Options::FICTITIOUS`] has over the pivot tolerance.
-const FICTITIOUS_STEP: f64 = 100.0;
+pub(crate) const FICTITIOUS_STEP: f64 = 100.0;
 
 /// Divide the cells of `tree` that are too coarse, level by level up to `levels`
 /// ([`Options::refine`]): the cut cells across which the surface turns by more than `turn` and
@@ -1236,6 +1379,8 @@ fn solve_at(
     fictitious: f64,
     marker: Option<Marker>,
     round: &Round,
+    ties: Option<&Ties>,
+    join: Join,
 ) -> Result<Solution> {
     let asked = &round.asked;
     let lame = material.lame()?;
@@ -1285,8 +1430,8 @@ fn solve_at(
         normals.push(if length > 0.0 { [normal[0] / length, normal[1] / length, normal[2] / length] } else { [0.0; 3] });
         *areas.entry(*tag).or_insert(0.0) += 0.5 * length;
     }
-    let (faces, body) = conditions(supports, loads, &areas, material.density)?;
-    let on_surface = Surface { normals: &normals, tags: &tags, faces: &faces };
+    let (faces, body) = conditions(supports, loads, &areas, material.density, ties)?;
+    let on_surface = Surface { normals: &normals, tags: &tags, faces: &faces, touching: ties.map(|ties| ties.touching) };
     let feature = grid::feature_flags(surface);
     let on_grid = Triangles { corners: &triangles, normals: &normals, across: surface.neighbors(), feature: &feature };
 
@@ -1476,34 +1621,6 @@ fn solve_at(
         element_dissection(space.count, &lists, &centres)
     };
     space.renumber(&order)?;
-    let layout = DofLayout::uniform(0..space.count as u32, DofSet::TRANSLATIONS);
-    if layout.dofs() != unknowns {
-        return Err(Error::Internal("the layout does not hold three unknowns per mode".into()));
-    }
-    let (mut stiffness, stiffness_entries) = {
-        let graph = NodeGraph::new(space.count, (0..elements).map(|element| space.functions(element)));
-        let entries = graph.entries(&layout);
-        if entries > MAX_MATRIX_ENTRIES {
-            return Err(too_large(entries));
-        }
-        // A round of [`Options::adapt`] is refused here, before its cells are integrated, when
-        // its factor cannot fit: the larger system of the same part is taken to have no fewer
-        // entries of the factor for each of the stiffness than the solve before it had (the
-        // fill of a nested dissection grows with the system).
-        if let Some((stiffness, factor)) = round.before.filter(|(stiffness, _)| *stiffness > 0 && entries >= *stiffness) {
-            let least = entries as f64 * factor as f64 / stiffness as f64;
-            if least > limits.max_factor_entries as f64 {
-                return Err(Error::Limit(format!(
-                    "the factorization would need {least:.0} entries or more; the limit is {} ({})",
-                    limits.max_factor_entries,
-                    smaller(options.refine)
-                )));
-            }
-        }
-        (graph.zero_matrix(&layout), entries)
-    };
-    let mut load = vec![0.0; unknowns];
-
     // A cell the surface does not cut: every one of a level has the same matrices.
     let mut whole = Vec::with_capacity(m);
     for (z, wz) in &rule {
@@ -1607,15 +1724,15 @@ fn solve_at(
         Ok(Integrated { stiffness: Some(stiffness), load: Some(load), cut: Some(cut) })
     };
 
-    // Assembly, elements in order.
-    let mut stats = Stats {
+    // What the cells add up to as their matrices are handed over, elements in order.
+    let stats = Stats {
         cells: grid.cells,
         inside_cells: 0,
         cut_cells: 0,
         unknowns,
         quadrature_points: 0,
         exact_cells: 0,
-        stiffness_entries,
+        stiffness_entries: 0,
         factor_entries: 0,
         volume: 0.0,
         surface_volume: surface.volume(),
@@ -1631,73 +1748,157 @@ fn solve_at(
         settled: 0.0,
         left_out: false,
     };
-    let mut nitsche = vec![0.0; elements];
-    let mut fractions = vec![1.0; elements];
-    let mut material = vec![([0.0; 3], [1.0; 3]); elements];
-    for block in fieldcraft_parallel::blocks(elements, block_size) {
-        let first = block.start;
-        let cells = fieldcraft_parallel::map(block.len(), |i| integrate(first + i));
-        for (i, integrated) in cells.into_iter().enumerate() {
-            let integrated = integrated?;
-            let element = first + i;
-            let (node, cell, whole) = cell_of(element)?;
-            let island = space.island(element);
-            let nodes = space.functions(element);
-            let (cell_stiffness, cell_load) =
-                (integrated.stiffness.as_ref().unwrap_or(&whole.stiffness), integrated.load.as_ref().unwrap_or(&whole.load));
-            add_block(&mut stiffness, &layout, nodes, DofSet::TRANSLATIONS, cell_stiffness)?;
-            for (a, mode) in nodes.iter().enumerate() {
-                for i in 0..3 {
-                    if let (Some(total), Some(value)) = (load.get_mut(3 * mode + i), cell_load.get(3 * a + i)) {
-                        *total += value;
-                    }
+    let tally =
+        RefCell::new(Tally { stats, nitsche: vec![0.0; elements], fractions: vec![1.0; elements], material: vec![([0.0; 3], [1.0; 3]); elements] });
+    let in_use = || Error::Internal("the cells' sums are in use".into());
+    let assemble = |sink: &mut dyn FnMut(usize, &[f64], &[f64]) -> Result<()>| -> Result<()> {
+        let mut tally = tally.try_borrow_mut().map_err(|_| in_use())?;
+        let Tally { stats, nitsche, fractions, material } = &mut *tally;
+        for block in fieldcraft_parallel::blocks(elements, block_size) {
+            let first = block.start;
+            let cells = fieldcraft_parallel::map(block.len(), |i| integrate(first + i));
+            for (i, integrated) in cells.into_iter().enumerate() {
+                let integrated = integrated?;
+                let element = first + i;
+                let (node, cell, whole) = cell_of(element)?;
+                let island = space.island(element);
+                let (cell_stiffness, cell_load) =
+                    (integrated.stiffness.as_ref().unwrap_or(&whole.stiffness), integrated.load.as_ref().unwrap_or(&whole.load));
+                sink(element, cell_stiffness, cell_load)?;
+                let size = grid.step(usize::from(cell.level));
+                // A cell is counted with its first island.
+                if island == 0
+                    && let Some(count) = stats.levels.get_mut(usize::from(cell.level))
+                {
+                    *count += 1;
                 }
-            }
-            let size = grid.step(usize::from(cell.level));
-            // A cell is counted with its first island.
-            if island == 0
-                && let Some(count) = stats.levels.get_mut(usize::from(cell.level))
-            {
-                *count += 1;
-            }
-            match integrated.cut {
-                Some(cut) => {
-                    stats.cut_cells += usize::from(island == 0);
-                    stats.quadrature_points += cut.points;
-                    stats.exact_cells += usize::from(island == 0 && cut_of(node).is_some_and(|leaf| leaf.exact));
-                    stats.volume += cut.volume;
-                    stats.smallest_fraction = stats.smallest_fraction.min(cut.volume / (size * size * size));
-                    if let Some(fraction) = fractions.get_mut(element) {
-                        *fraction = cut.volume / (size * size * size);
+                match integrated.cut {
+                    Some(cut) => {
+                        stats.cut_cells += usize::from(island == 0);
+                        stats.quadrature_points += cut.points;
+                        stats.exact_cells += usize::from(island == 0 && cut_of(node).is_some_and(|leaf| leaf.exact));
+                        stats.volume += cut.volume;
+                        stats.smallest_fraction = stats.smallest_fraction.min(cut.volume / (size * size * size));
+                        if let Some(fraction) = fractions.get_mut(element) {
+                            *fraction = cut.volume / (size * size * size);
+                        }
+                        // A uniform box with the material's middle and spread: its half extent is
+                        // √3 standard deviations.
+                        let spread = cut_of(node).and_then(|leaf| leaf.inside.get(island)).and_then(Moments::spread);
+                        if let (Some(place), Some((mean, deviation))) = (material.get_mut(element), spread) {
+                            *place = (mean, deviation.map(|sigma| 3f64.sqrt() * sigma));
+                        }
+                        stats.largest_nitsche = stats.largest_nitsche.max(cut.nitsche);
+                        if let Some(parameter) = nitsche.get_mut(element) {
+                            *parameter = cut.nitsche;
+                        }
                     }
-                    // A uniform box with the material's middle and spread: its half extent is
-                    // √3 standard deviations.
-                    let spread = cut_of(node).and_then(|leaf| leaf.inside.get(island)).and_then(Moments::spread);
-                    if let (Some(place), Some((mean, deviation))) = (material.get_mut(element), spread) {
-                        *place = (mean, deviation.map(|sigma| 3f64.sqrt() * sigma));
+                    None => {
+                        stats.inside_cells += 1;
+                        stats.volume += size * size * size;
                     }
-                    stats.largest_nitsche = stats.largest_nitsche.max(cut.nitsche);
-                    if let Some(parameter) = nitsche.get_mut(element) {
-                        *parameter = cut.nitsche;
-                    }
-                }
-                None => {
-                    stats.inside_cells += 1;
-                    stats.volume += size * size * size;
                 }
             }
         }
-    }
+        Ok(())
+    };
 
-    // The solution. The factorization reads the matrix's lower triangle, and nothing reads the
-    // matrix after it.
-    let factor = Factor::new(&UpperColumns::from_symmetric(&stiffness), limits.max_factor_entries).map_err(|e| factor_error(e, options.refine))?;
-    stats.factor_entries = factor.entries();
-    let mut u = load;
-    factor.solve(&mut u)?;
-    drop(factor);
-    drop(stiffness);
-    if u.iter().any(|x| !x.is_finite()) {
+    // The cells of several islands, for reading the solution: which island a point is in.
+    let mut split = BTreeMap::new();
+    for (node, leaf) in cuts.iter().enumerate() {
+        if let (Some(leaf), Some(owned), Ok(node)) = (leaf.as_ref().filter(|leaf| !leaf.of_piece.is_empty()), pieces.get(node), u32::try_from(node)) {
+            split.insert(node, (owned.clone(), leaf.of_piece.clone()));
+        }
+    }
+    // The values of an element's functions from those of its cell's modes.
+    let on_functions = |element: usize, values: &[f64]| -> Vec<f64> {
+        match space.map(element) {
+            Some(map) => {
+                let mut wide = vec![0.0; 3 * m];
+                for (slot, value) in wide.iter_mut().step_by(3).zip(values) {
+                    *slot = *value;
+                }
+                map.vector(m, &wide).iter().step_by(3).copied().collect()
+            }
+            None => values.to_vec(),
+        }
+    };
+    let place = Place { grid: &grid, tree: &tree, space: &space, split: &split };
+    let at = |x: [f64; 3], y: [f64; 3]| -> Option<(usize, Vec<f64>)> {
+        let (element, xi, size) = place.locate_in(x, true).or_else(|| {
+            let (element, xi, size) = place.locate_in(y, true)?;
+            Some((element, [0, 1, 2].map(|a| xi[a] + 2.0 * (x[a] - y[a]) / size), size))
+        })?;
+        let (mut values, mut gradients) = (vec![0.0; m], vec![[0.0; 3]; m]);
+        cell::eval(&shapes, xi, 2.0 / size, &mut values, &mut gradients);
+        Some((element, on_functions(element, &values)))
+    };
+    let pieces_of_element = |element: usize| pieces_of(space.elements.get(element).map_or(usize::MAX, |node| *node as usize), space.island(element));
+    let tied = |visit: &mut dyn FnMut(&Tied) -> Result<()>| -> Result<()> {
+        if ties.is_none() {
+            return Ok(());
+        }
+        for element in 0..elements {
+            let owned = pieces_of_element(element);
+            if !on_surface.ties(&owned) {
+                continue;
+            }
+            let (_, cell, _) = cell_of(element)?;
+            let level = usize::from(cell.level);
+            let (corner, size) = (grid.fine_lo(level, cell.position()), grid.step(level));
+            let functions = space.functions(element).len();
+            let mut failed = None;
+            cell::tied_points(&shapes, corner, size, &owned, &on_surface, &lame, &surface_rule, |tag, x, weight, values, tractions| {
+                if failed.is_some() {
+                    return;
+                }
+                // On the element's functions: Bᵀ of the cell's modes' values and tractions.
+                let values = on_functions(element, values);
+                let mut all = Vec::with_capacity(9 * functions);
+                for i in 0..3 {
+                    let of_modes: Vec<f64> = tractions.iter().flat_map(|mode| mode[i]).collect();
+                    match space.map(element) {
+                        Some(map) => all.extend(map.vector(m, &of_modes)),
+                        None => all.extend(of_modes),
+                    }
+                }
+                if let Err(e) = visit(&Tied { element, tag, x, weight, values: &values, tractions: &all }) {
+                    failed = Some(e);
+                }
+            });
+            if let Some(e) = failed {
+                return Err(e);
+            }
+        }
+        Ok(())
+    };
+    let position = |function: usize| {
+        let at = space.xyz.get(function).copied().unwrap_or_default();
+        [0, 1, 2].map(|a| grid.origin[a] + 0.5 * grid.spacing * at[a])
+    };
+    let nitsche_of = |element: usize| tally.try_borrow().ok().and_then(|tally| tally.nitsche.get(element).copied()).unwrap_or(0.0);
+    let view = View {
+        grid,
+        tree: &tree,
+        count: space.count,
+        position: &position,
+        elements: (0..elements).map(|element| space.functions(element)).collect(),
+        assemble: &assemble,
+        tied: &tied,
+        at: &at,
+        nitsche: &nitsche_of,
+        refine: options.refine,
+        before: round.before,
+    };
+
+    // The solution: of this body's system alone, or of the system of several bodies.
+    let solved = join(&view)?;
+    drop(view);
+    let Tally { mut stats, nitsche, fractions, material } = tally.into_inner();
+    stats.stiffness_entries = solved.stiffness_entries;
+    stats.factor_entries = solved.factor_entries;
+    let u = solved.u;
+    if u.len() != unknowns || u.iter().any(|x| !x.is_finite()) {
         return Err(Error::Singular("the solution is not finite: the stiffness is singular to working precision".into()));
     }
 
@@ -1742,7 +1943,7 @@ fn solve_at(
     }
 
     // The reactions of the supported faces.
-    let pieces_of = |element: usize| pieces_of(space.elements.get(element).map_or(usize::MAX, |node| *node as usize), space.island(element));
+    let pieces_of = pieces_of_element;
     let supported: Vec<usize> = (0..elements).filter(|element| on_surface.supports(&pieces_of(*element))).collect();
     let mut reactions: BTreeMap<u32, [f64; 3]> = BTreeMap::new();
     for block in fieldcraft_parallel::blocks(supported.len(), block_size) {
@@ -1770,13 +1971,6 @@ fn solve_at(
     }
     let reactions = reactions.into_iter().map(|(face, force)| Reaction { face, force }).collect();
 
-    // The cells of several islands, for reading the solution: which island a point is in.
-    let mut split = BTreeMap::new();
-    for (node, leaf) in cuts.iter().enumerate() {
-        if let (Some(leaf), Some(owned), Ok(node)) = (leaf.as_ref().filter(|leaf| !leaf.of_piece.is_empty()), pieces.get(node), u32::try_from(node)) {
-            split.insert(node, (owned.clone(), leaf.of_piece.clone()));
-        }
-    }
     drop(cuts);
     // The positions of the modes were for the ordering only.
     space.xyz = Vec::new();
@@ -1844,7 +2038,19 @@ mod tests {
             Support { face: 4, fixed: [false, false, true], value: [0.0; 3] },
         ];
         let loads = [Load::Traction { face: 1, traction: [STRESS, 0.0, 0.0] }];
-        let solution = solve_marked(&block(SIZE), &STEEL, &supports, &loads, options, &Limits::default(), Some(marker), &Round::default()).unwrap().0;
+        let solution = solve_marked(
+            &block(SIZE),
+            &STEEL,
+            &supports,
+            &loads,
+            options,
+            &Limits::default(),
+            Some(marker),
+            &Round::default(),
+            &alone(&Limits::default()),
+        )
+        .unwrap()
+        .0;
         let elongation = STRESS * SIZE[0] / STEEL.young;
         let (mut displacement, mut stress) = (0.0f64, 0.0f64);
         for fx in [0.0, 0.07, 0.31, 0.5, 0.88, 1.0] {
@@ -1939,8 +2145,19 @@ mod tests {
         let (size, gravity) = ([0.5, 0.25, 1.0], 9.81);
         let supports = [Support { face: 5, fixed: [true; 3], value: [0.0; 3] }];
         let loads = [Load::Gravity { acceleration: [0.0, 0.0, -gravity] }];
-        let solution =
-            solve_marked(&block(size), &material, &supports, &loads, options, &Limits::default(), Some(marker), &Round::default()).unwrap().0;
+        let solution = solve_marked(
+            &block(size),
+            &material,
+            &supports,
+            &loads,
+            options,
+            &Limits::default(),
+            Some(marker),
+            &Round::default(),
+            &alone(&Limits::default()),
+        )
+        .unwrap()
+        .0;
         let weight = material.density * gravity;
         let scale = weight * size[2] * size[2] / (2.0 * material.young);
         let (mut displacement, mut stress) = (0.0f64, 0.0f64);

@@ -145,10 +145,15 @@ fn clear(p: [f64; 3], q: [f64; 3], reach: &[u32], surface: &Triangles) -> bool {
     !reach.iter().any(|t| surface.corners.get(*t as usize).is_some_and(|triangle| crosses(p, q, triangle)))
 }
 
-/// The square of the distance from `p` to a triangle (C. Ericson, *Real-Time Collision
-/// Detection*, Morgan Kaufmann 2005, section 5.1.5: the closest point by the Voronoi region of
-/// the triangle the point is in).
+/// The square of the distance from `p` to a triangle.
 pub(crate) fn distance_squared(p: [f64; 3], triangle: &[[f64; 3]; 3]) -> f64 {
+    let d = sub(p, closest_point(p, triangle));
+    dot(d, d)
+}
+
+/// The point of a triangle closest to `p` (C. Ericson, *Real-Time Collision Detection*, Morgan
+/// Kaufmann 2005, section 5.1.5: by the Voronoi region of the triangle the point is in).
+pub(crate) fn closest_point(p: [f64; 3], triangle: &[[f64; 3]; 3]) -> [f64; 3] {
     let [a, b, c] = *triangle;
     let (ab, ac, ap) = (sub(b, a), sub(c, a), sub(p, a));
     let away = |x: [f64; 3]| {
@@ -158,37 +163,43 @@ pub(crate) fn distance_squared(p: [f64; 3], triangle: &[[f64; 3]; 3]) -> f64 {
     let on = |from: [f64; 3], along: [f64; 3], s: f64| [from[0] + s * along[0], from[1] + s * along[1], from[2] + s * along[2]];
     let (d1, d2) = (dot(ab, ap), dot(ac, ap));
     if d1 <= 0.0 && d2 <= 0.0 {
-        return away(a);
+        return a;
     }
     let bp = sub(p, b);
     let (d3, d4) = (dot(ab, bp), dot(ac, bp));
     if d3 >= 0.0 && d4 <= d3 {
-        return away(b);
+        return b;
     }
     let vc = d1 * d4 - d3 * d2;
     if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 && d1 - d3 > 0.0 {
-        return away(on(a, ab, d1 / (d1 - d3)));
+        return on(a, ab, d1 / (d1 - d3));
     }
     let cp = sub(p, c);
     let (d5, d6) = (dot(ab, cp), dot(ac, cp));
     if d6 >= 0.0 && d5 <= d6 {
-        return away(c);
+        return c;
     }
     let vb = d5 * d2 - d1 * d6;
     if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 && d2 - d6 > 0.0 {
-        return away(on(a, ac, d2 / (d2 - d6)));
+        return on(a, ac, d2 / (d2 - d6));
     }
     let va = d3 * d6 - d5 * d4;
     if va <= 0.0 && d4 - d3 >= 0.0 && d5 - d6 >= 0.0 && (d4 - d3) + (d5 - d6) > 0.0 {
-        return away(on(b, sub(c, b), (d4 - d3) / ((d4 - d3) + (d5 - d6))));
+        return on(b, sub(c, b), (d4 - d3) / ((d4 - d3) + (d5 - d6)));
     }
     let sum = va + vb + vc;
     if !(sum != 0.0 && sum.is_finite()) {
-        // A triangle of no area: its corners.
-        return away(a).min(away(b)).min(away(c));
+        // A triangle of no area: the nearest of its corners.
+        let mut nearest = a;
+        for corner in [b, c] {
+            if away(corner) < away(nearest) {
+                nearest = corner;
+            }
+        }
+        return nearest;
     }
     let (v, w) = (vb / sum, vc / sum);
-    away([a[0] + v * ab[0] + w * ac[0], a[1] + v * ab[1] + w * ac[1], a[2] + v * ab[2] + w * ac[2]])
+    [a[0] + v * ab[0] + w * ac[0], a[1] + v * ab[1] + w * ac[1], a[2] + v * ab[2] + w * ac[2]]
 }
 
 /// The piece nearest to `x` (the first of several as near).

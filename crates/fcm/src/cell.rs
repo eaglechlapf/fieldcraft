@@ -84,6 +84,10 @@ pub(crate) struct Face {
     pub traction: [f64; 3],
     /// A pressure, pushing against the outward normal.
     pub pressure: f64,
+    /// Whether the face is tied to another body where the two touch ([`crate::assembly`]): it
+    /// is then fixed in every component over the points [`Surface::touching`] keeps, and the
+    /// value prescribed there is the other body's displacement, an unknown.
+    pub tied: bool,
 }
 
 impl Face {
@@ -103,7 +107,14 @@ pub(crate) struct Surface<'a> {
     /// The face of each surface triangle.
     pub tags: &'a [u32],
     pub faces: &'a BTreeMap<u32, Face>,
+    /// Where a piece of a tied face ([`Face::tied`]) may touch the other body.
+    pub touching: Option<&'a Touching<'a>>,
 }
+
+/// Hands the parts of a piece (a triangle) of the tied face with this tag to the caller: each
+/// part lies in one cell of the other body, whose functions are polynomials there, and comes
+/// with whether a point of it touches that body.
+pub(crate) type Touching<'a> = dyn Fn(u32, &[[f64; 3]; 3], &mut dyn FnMut(&[[f64; 3]; 3], &dyn Fn([f64; 3]) -> bool)) + Sync + 'a;
 
 impl Surface<'_> {
     /// The face a piece belongs to, when it carries anything, with the piece's normal.
@@ -116,6 +127,31 @@ impl Surface<'_> {
     /// Whether any of the pieces is supported.
     pub fn supports(&self, pieces: &[Piece]) -> bool {
         pieces.iter().any(|piece| self.face(piece).is_some_and(|(_, face, _)| face.supported()))
+    }
+
+    /// Whether any of the pieces is of a face tied to another body.
+    pub fn ties(&self, pieces: &[Piece]) -> bool {
+        pieces.iter().any(|piece| self.face(piece).is_some_and(|(_, face, _)| face.tied))
+    }
+
+    /// Visit the quadrature points of a piece at which its face's support acts, each with its
+    /// natural coordinates in the cell at `lo` of size `h` and its weight: every point of a
+    /// piece of a supported face; of a tied face, the points that touch the other body, taken
+    /// part by part of the piece, each part within one of that body's cells.
+    #[allow(clippy::too_many_arguments)]
+    fn held_points(&self, tag: u32, face: &Face, piece: &Piece, lo: [f64; 3], h: f64, rule: &[(f64, f64)], mut visit: impl FnMut([f64; 3], f64)) {
+        if !face.tied {
+            piece_points(piece, lo, h, rule, visit);
+            return;
+        }
+        let Some(touching) = self.touching else { return };
+        touching(tag, &piece.corners, &mut |part, touches| {
+            piece_points(&Piece { corners: *part, triangle: piece.triangle }, lo, h, rule, |xi, w| {
+                if touches([0, 1, 2].map(|i| lo[i] + 0.5 * (xi[i] + 1.0) * h)) {
+                    visit(xi, w);
+                }
+            });
+        });
     }
 }
 
@@ -336,6 +372,9 @@ struct Flat {
     normal: [f64; 3],
     face: Face,
     moments: Moments,
+    /// Of a tied face: the moments of the points its support acts at
+    /// ([`Surface::held_points`]).
+    held: Option<Moments>,
 }
 
 /// The flat groups of the pieces that carry something, in the order the pieces name them.
@@ -347,12 +386,16 @@ fn flats(shapes: &Shapes, lo: [f64; 3], h: f64, pieces: &[Piece], surface: &Surf
         let at = match groups.iter().position(same) {
             Some(at) => at,
             None => {
-                groups.push(Flat { tag, normal, face: *face, moments: Moments::new(&shapes.tables) });
+                let held = face.tied.then(|| Moments::new(&shapes.tables));
+                groups.push(Flat { tag, normal, face: *face, moments: Moments::new(&shapes.tables), held });
                 groups.len() - 1
             }
         };
         if let Some(group) = groups.get_mut(at) {
             piece_points(piece, lo, h, rule, |xi, w| group.moments.add(xi, w));
+            if let Some(held) = group.held.as_mut() {
+                surface.held_points(tag, face, piece, lo, h, rule, |xi, w| held.add(xi, w));
+            }
         }
     }
     groups
@@ -398,14 +441,17 @@ pub(crate) fn boundary(
                 }
             }
         }
-        if !face.supported() || size == 0 {
+        // The support acts over the whole of a face, or where a tied face touches the other body.
+        let held = group.held.as_ref().unwrap_or(&group.moments);
+        if !face.supported() || size == 0 || held.is_zero() {
             continue;
         }
+        let integrals = if group.held.is_some() { moments::singles(tables, held, &shapes.modes, None, scratch) } else { integrals };
         let c = traction_coefficients(normal, face.fixed, lame);
         let g = face.value;
         // The loads of the prescribed values: −∫ tᵢ(v) gᵢ and ∫ vᵢ gᵢ.
         for along in 0..3 {
-            let slope = moments::singles(tables, &group.moments, &shapes.modes, Some(along), scratch);
+            let slope = moments::singles(tables, held, &shapes.modes, Some(along), scratch);
             for a in 0..m {
                 for k in 0..3 {
                     out.consistency_load[3 * a + k] -= scale * slope[a] * (c[0][k][along] * g[0] + c[1][k][along] * g[1] + c[2][k][along] * g[2]);
@@ -420,23 +466,13 @@ pub(crate) fn boundary(
             }
         }
         // The matrices.
-        moments::pairs(tables, &group.moments, &shapes.modes, [VALUE_VALUE; 3], true, &mut values, 1, 0, scratch);
+        moments::pairs(tables, held, &shapes.modes, [VALUE_VALUE; 3], true, &mut values, 1, 0, scratch);
         for along in 0..3 {
             let mut kinds = [VALUE_VALUE; 3];
             kinds[along] = SLOPE_VALUE;
-            moments::pairs(tables, &group.moments, &shapes.modes, kinds, false, &mut slopes, 3, along, scratch);
+            moments::pairs(tables, held, &shapes.modes, kinds, false, &mut slopes, 3, along, scratch);
             for other in 0..3 {
-                moments::pairs(
-                    tables,
-                    &group.moments,
-                    &shapes.modes,
-                    gradient_kinds(along, other),
-                    true,
-                    &mut gradients,
-                    9,
-                    3 * along + other,
-                    scratch,
-                );
+                moments::pairs(tables, held, &shapes.modes, gradient_kinds(along, other), true, &mut gradients, 9, 3 * along + other, scratch);
             }
         }
         // H of two displacement components k, l from the gradient products c, d:
@@ -565,7 +601,8 @@ pub(crate) fn reaction(
     let (mut values, mut gradients) = (vec![0.0; m], vec![[0.0; 3]; m]);
     for piece in pieces {
         let Some((tag, face, normal)) = surface.face(piece) else { continue };
-        if !face.supported() {
+        // What a tied face carries goes into the other body: it is no reaction of a support.
+        if !face.supported() || face.tied {
             continue;
         }
         let mut sum = [0.0; 3];
@@ -591,6 +628,38 @@ pub(crate) fn reaction(
         for i in 0..3 {
             total[i] += sum[i];
         }
+    }
+}
+
+/// The points of the tied pieces of a cell at which they touch the other body
+/// ([`Surface::held_points`]), the same points [`boundary`] sums: each with the point, its weight (an
+/// face, the point, its weight (an area), the values of the cell's modes there, and the traction
+/// of every mode's displacement component k on the piece, `tractions[a][i][k]` its component i.
+pub(crate) fn tied_points(
+    shapes: &Shapes,
+    lo: [f64; 3],
+    h: f64,
+    pieces: &[Piece],
+    surface: &Surface,
+    lame: &Lame,
+    rule: &[(f64, f64)],
+    mut visit: impl FnMut(u32, [f64; 3], f64, &[f64], &[[[f64; 3]; 3]]),
+) {
+    let m = shapes.len();
+    let (mut values, mut gradients, mut traction) = (vec![0.0; m], vec![[0.0; 3]; m], vec![[[0.0; 3]; 3]; m]);
+    for piece in pieces {
+        let Some((tag, face, normal)) = surface.face(piece) else { continue };
+        if !face.tied {
+            continue;
+        }
+        surface.held_points(tag, face, piece, lo, h, rule, |xi, w| {
+            let x = [0, 1, 2].map(|i| lo[i] + 0.5 * (xi[i] + 1.0) * h);
+            eval(shapes, xi, 2.0 / h, &mut values, &mut gradients);
+            for (t, gradient) in traction.iter_mut().zip(&gradients) {
+                *t = tractions(*gradient, normal, [true; 3], lame);
+            }
+            visit(tag, x, w, &values, &traction);
+        });
     }
 }
 
@@ -740,7 +809,7 @@ mod tests {
         // Two inclined triangles of two faces: one supported in x and z with a prescribed value
         // and under pressure, one loaded only.
         let faces = BTreeMap::from([
-            (3u32, Face { fixed: [true, false, true], value: [0.02, 0.0, -0.01], traction: [0.0; 3], pressure: 4.0 }),
+            (3u32, Face { fixed: [true, false, true], value: [0.02, 0.0, -0.01], traction: [0.0; 3], pressure: 4.0, tied: false }),
             (5u32, Face { traction: [1.0, -2.0, 0.5], ..Face::default() }),
         ]);
         let at = |x: f64, y: f64, z: f64| [lo[0] + x * h, lo[1] + y * h, lo[2] + z * h];
@@ -755,7 +824,7 @@ mod tests {
             normal.map(|x| x / length)
         };
         let normals = [unit(&pieces[0]), unit(&pieces[1]), unit(&pieces[2])];
-        let surface = Surface { normals: &normals, tags: &[3, 3, 5], faces: &faces };
+        let surface = Surface { normals: &normals, tags: &[3, 3, 5], faces: &faces, touching: None };
         let rule = gauss_legendre(2 * p + 1);
         let mut scratch = Scratch::default();
         let b = boundary(&shapes, lo, h, &pieces, &surface, &lame, &rule, &mut scratch);
@@ -817,7 +886,7 @@ mod tests {
         let parameter = |p: usize, h: f64, lame: Lame| -> f64 {
             let shapes = shapes(p, false);
             let faces = BTreeMap::from([(7u32, Face { fixed: [true; 3], ..Face::default() })]);
-            let surface = Surface { normals: &[[-1.0, 0.0, 0.0]], tags: &[7], faces: &faces };
+            let surface = Surface { normals: &[[-1.0, 0.0, 0.0]], tags: &[7], faces: &faces, touching: None };
             let corner = |y: f64, z: f64| [0.0, y * h, z * h];
             let pieces = [
                 Piece { corners: [corner(0.0, 0.0), corner(0.0, 1.0), corner(1.0, 1.0)], triangle: 0 },

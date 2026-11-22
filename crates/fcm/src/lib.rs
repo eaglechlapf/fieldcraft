@@ -97,6 +97,7 @@
 // Matrix kernels read as the textbook formulas with index loops.
 #![allow(clippy::needless_range_loop)]
 
+pub mod assembly;
 mod cell;
 mod dense;
 pub mod exact;
@@ -110,6 +111,7 @@ mod refine;
 mod solve;
 mod space;
 
+pub use assembly::{Bond, Part, solve_assembly};
 pub use solve::{Basis, Change, Load, Material, Options, Reaction, Solution, Stats, Support, solve};
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
