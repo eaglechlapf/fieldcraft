@@ -580,6 +580,8 @@ impl Model {
             couplings: _,
             contacts,
             ties,
+            connections: _,
+            connections_found: _,
             masses,
             springs,
             boundary_conditions,

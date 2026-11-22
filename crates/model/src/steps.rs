@@ -1310,6 +1310,12 @@ pub struct StepInputs<'a> {
     couplings: &'a BTreeMap<String, crate::Coupling>,
     contacts: &'a BTreeMap<String, crate::Contact>,
     ties: &'a BTreeMap<String, crate::Tie>,
+    /// Left out while there are none, so that what a step of a model without connections reads
+    /// is written as it was before there were any.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    connections: &'a BTreeMap<String, crate::Connection>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    connections_found: bool,
     masses: &'a BTreeMap<String, crate::PointMass>,
     springs: &'a BTreeMap<String, crate::Spring>,
     boundary_conditions: BTreeMap<&'a str, &'a crate::BoundaryCondition>,
@@ -1342,6 +1348,8 @@ impl Model {
             couplings: &self.couplings,
             contacts: &self.contacts,
             ties: &self.ties,
+            connections: &self.connections,
+            connections_found: self.connections_found,
             masses: &self.masses,
             springs: &self.springs,
             boundary_conditions: self

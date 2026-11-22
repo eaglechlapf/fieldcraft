@@ -4,9 +4,9 @@
 //! When the design is opened again, a name the design no longer has leaves the definition
 //! naming nothing; [`Model::name_uses`] lists every such use so the opener can say which, and
 //! [`Model::rename_entity`] moves every use of a name, and the mesh's tags, to the entity's new
-//! name. The uses: sets, edge and face seeds, size controls, mesh plans, face merges and splits, fluid
-//! domains' obstacle faces and fluid steps' monitors; boundary conditions, loads, contacts and
-//! ties reach geometry through their sets. Defeatures name features by id, which do not change.
+//! name. The uses: sets, connections, edge and face seeds, size controls, mesh plans, face merges and
+//! splits, fluid domains' obstacle faces and fluid steps' monitors; boundary conditions, loads,
+//! contacts and ties reach geometry through their sets. Defeatures name features by id, which do not change.
 
 use crate::geometry::{Entity, GeometryRef};
 use crate::{Error, FluidBoundary, Model, Procedure, Result, SizeRegion};
@@ -43,6 +43,11 @@ impl Model {
         for (name, set) in &self.sets {
             for r in &set.geometry {
                 push(format!("set `{name}`"), r);
+            }
+        }
+        for (name, connection) in &self.connections {
+            for r in connection.first.iter().chain(&connection.second) {
+                push(format!("connection `{name}`"), r);
             }
         }
         for seed in &self.seeds {
@@ -159,6 +164,9 @@ impl Model {
         };
         for set in self.sets.values_mut() {
             set.geometry.iter_mut().for_each(&mut swap);
+        }
+        for connection in self.connections.values_mut() {
+            connection.first.iter_mut().chain(&mut connection.second).for_each(&mut swap);
         }
         for seed in &mut self.seeds {
             swap(&mut seed.on);

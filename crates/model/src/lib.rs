@@ -35,6 +35,7 @@
 
 pub mod bcs;
 pub mod check;
+pub mod connections;
 pub mod constraints;
 pub mod contact;
 mod convert;
@@ -71,6 +72,7 @@ use serde::{Deserialize, Serialize};
 
 pub use bcs::{BoundaryCondition, Dofs, Symmetry, TEMPERATURE_DOF, Target};
 pub use check::{Diagnostic, Resolved, ResolvedSet, Severity};
+pub use connections::{Connection, ConnectionKind};
 pub use constraints::{Coupling, CouplingKind, ReferencePoint};
 pub use contact::{Contact, ContactSurfaces, Friction, InitialPenetration};
 pub use curves::{TableRange, TemperatureDependent, TemperatureTable};
@@ -170,6 +172,12 @@ pub struct Model {
     contacts: BTreeMap<String, Contact>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     ties: BTreeMap<String, Tie>,
+    /// How the bodies of the design hold each other where they touch.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    connections: BTreeMap<String, Connection>,
+    /// Whether the design was searched for them ([`Model::connections_found`]).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    connections_found: bool,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     masses: BTreeMap<String, PointMass>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -246,6 +254,10 @@ struct ModelData {
     contacts: BTreeMap<String, Contact>,
     #[serde(default)]
     ties: BTreeMap<String, Tie>,
+    #[serde(default)]
+    connections: BTreeMap<String, Connection>,
+    #[serde(default)]
+    connections_found: bool,
     #[serde(default)]
     masses: BTreeMap<String, PointMass>,
     #[serde(default)]
@@ -337,6 +349,10 @@ impl TryFrom<ModelData> for Model {
         for (n, v) in d.ties {
             m.add_tie(&n, v)?;
         }
+        for (n, v) in d.connections {
+            m.add_connection(&n, v)?;
+        }
+        m.connections_found = d.connections_found;
         for (n, v) in d.masses {
             m.add_mass(&n, v)?;
         }
@@ -518,6 +534,8 @@ impl Model {
             couplings: self.couplings.clone(),
             contacts: self.contacts.clone(),
             ties: self.ties.clone(),
+            connections: self.connections.clone(),
+            connections_found: self.connections_found,
             masses: self.masses.clone(),
             springs: self.springs.clone(),
             boundary_conditions: self.boundary_conditions.clone(),
@@ -587,7 +605,7 @@ impl Model {
     }
 
     /// Counts of each kind of definition, for summaries.
-    pub fn definition_counts(&self) -> [(&'static str, usize); 22] {
+    pub fn definition_counts(&self) -> [(&'static str, usize); 23] {
         [
             ("sets", self.sets.len()),
             ("materials", self.materials.len()),
@@ -596,6 +614,7 @@ impl Model {
             ("couplings", self.couplings.len()),
             ("contacts", self.contacts.len()),
             ("ties", self.ties.len()),
+            ("connections", self.connections.len()),
             ("masses", self.masses.len()),
             ("springs", self.springs.len()),
             ("boundary_conditions", self.boundary_conditions.len()),

@@ -26,6 +26,7 @@ pub enum Kind {
     Coupling,
     Contact,
     Tie,
+    Connection,
     PointMass,
     Spring,
     FluidDomain,
@@ -46,6 +47,7 @@ impl Kind {
             Kind::Coupling => "coupling",
             Kind::Contact => "contact",
             Kind::Tie => "tie",
+            Kind::Connection => "connection",
             Kind::PointMass => "point mass",
             Kind::Spring => "spring",
             Kind::FluidDomain => "fluid domain",
@@ -105,6 +107,7 @@ impl Model {
             Kind::Coupling => rekey(&mut self.couplings, what, from, to)?,
             Kind::Contact => rekey(&mut self.contacts, what, from, to)?,
             Kind::Tie => rekey(&mut self.ties, what, from, to)?,
+            Kind::Connection => rekey(&mut self.connections, what, from, to)?,
             Kind::PointMass => rekey(&mut self.masses, what, from, to)?,
             Kind::Spring => rekey(&mut self.springs, what, from, to)?,
             Kind::FluidDomain => rekey(&mut self.fluid_domains, what, from, to)?,
@@ -132,6 +135,7 @@ impl Model {
             Kind::Coupling => self.couplings.contains_key(name),
             Kind::Contact => self.contacts.contains_key(name),
             Kind::Tie => self.ties.contains_key(name),
+            Kind::Connection => self.connections.contains_key(name),
             Kind::PointMass => self.masses.contains_key(name),
             Kind::Spring => self.springs.contains_key(name),
             Kind::FluidDomain => self.fluid_domains.contains_key(name),
@@ -240,7 +244,7 @@ impl Model {
                     self.suppressed_datums.insert(to.to_string());
                 }
             }
-            Kind::Section | Kind::Coupling | Kind::Contact | Kind::Tie | Kind::PointMass | Kind::Spring => {}
+            Kind::Section | Kind::Coupling | Kind::Contact | Kind::Tie | Kind::Connection | Kind::PointMass | Kind::Spring => {}
         }
     }
 
