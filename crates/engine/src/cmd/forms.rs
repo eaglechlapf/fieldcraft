@@ -2826,6 +2826,9 @@ pub const SOLVE_STATIC_GRID: &[Field] = &[
         .def("\"open\""),
     flag("check_convergence", "Check convergence")
         .help("Also solves one degree lower on the same grid and reports how much the peak von Mises stress and the strain energy changed: an indicator of convergence, not a bound of the error."),
+    choice("solver", "Solver", &[("auto", "Automatic"), ("direct", "Factorization"), ("iterative", "Iteration")])
+        .help("How the unknowns are solved for. Factorization: exact to rounding, its time grows with the square of the unknowns of a compact part. Iteration: its time grows with the unknowns, and its result is right to about nine digits. Automatic: the factorization for small systems and thin parts, the iteration for large compact ones and for those whose factor would not fit.")
+        .def("\"auto\""),
     positive("tolerance", "Chordal tolerance", D::Length)
         .help("Largest distance between the triangulated surface, which is all the solver knows of the body, and the true curved surface. Small cells resolve the facets of a fillet as notches, so it is far below the smallest cell.")
         .hint("smallest cell / 250"),

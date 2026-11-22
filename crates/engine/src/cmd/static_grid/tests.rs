@@ -740,6 +740,19 @@ fn rounds_and_the_check_run_over_several_bodies() {
     let e = s.execute("solve.static.grid", &json!({"cell_size": 5, "degree": 1, "check_convergence": true})).unwrap_err().to_string();
     assert!(e.contains("degree of 2 or more"), "{e}");
 
+    // By iteration: the same tip and reactions to its tolerance, with the rounds it took; left
+    // to the choice, a system this small is factored.
+    let iterated = solve(&mut s, json!({"solver": "iterative"}));
+    assert_eq!((iterated["solver"].as_str(), plain["solver"].as_str()), (Some("iteration"), Some("factorization")));
+    assert!(iterated["iterations"].as_u64().unwrap() > 5 && iterated["residual"].as_f64().unwrap() <= 1e-8, "{iterated}");
+    assert!(plain["iterations"].is_null() && plain["residual"].is_null());
+    assert!(close(tip(&iterated), tip(&plain), 1e-7), "{} against {}", tip(&iterated), tip(&plain));
+    assert!(close(iterated["reaction_total"][2].as_f64().unwrap(), plain["reaction_total"][2].as_f64().unwrap(), 1e-7));
+    assert!(iterated["factor_entries"].as_u64().unwrap() < plain["factor_entries"].as_u64().unwrap());
+    let one = s.execute("solve.static.grid", &json!({"body": "First", "cell_size": 5, "degree": 2, "solver": "iterative", "connections": "none"}));
+    assert!(one.is_err(), "the first block alone is held, but its sets name the second: {one:?}");
+    assert!(s.execute("solve.static.grid", &json!({"solver": "fastest"})).unwrap_err().to_string().contains("solver"));
+
     // A round too large for a limit is left out, and the reply says so.
     s.limits.max_grid_dofs = plain["unknowns"].as_u64().unwrap() as usize;
     let left = solve(&mut s, json!({"adapt": 2}));

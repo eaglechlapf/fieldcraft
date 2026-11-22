@@ -237,6 +237,7 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
     }
     // Refused at degree 1 by the caller.
     let check_convergence = opt::<bool>(p, "check_convergence")?.unwrap_or(false);
+    let solver = solver(p)?;
     let asked_basis = match opt::<String>(p, "basis")?.as_deref() {
         None | Some("auto") => None,
         Some("tensor") => Some(Basis::Tensor),
@@ -323,6 +324,7 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
             refine: levels,
             settle,
             basis,
+            solver,
             separate: open_gaps,
             gaps: if open_gaps { GAP_LEVELS } else { 0 },
             offset: OFFSET,
@@ -636,6 +638,7 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
 
     let unknowns: usize = solutions.iter().map(|solution| solution.stats.unknowns).sum();
     let factor_entries = solutions.first().map_or(0, |solution| solution.stats.factor_entries);
+    let iterations = solutions.first().map_or(0, |solution| solution.stats.iterations);
     let nodes: Vec<u32> = (0..values.len()).map(|v| GRID_LABELS.saturating_add(u32::try_from(v).unwrap_or(u32::MAX))).collect();
     let stress: Vec<[f64; 6]> = values.iter().map(|v| v.map_or([f64::NAN; 6], |(_, s)| s)).collect();
     let (shown_mesh, tri_face) = display(&all);
@@ -717,6 +720,9 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
         "gaps": if open_gaps { "open" } else { "joined" },
         "unknowns": unknowns,
         "factor_entries": factor_entries,
+        "solver": solved_by(iterations),
+        "iterations": if iterations > 0 { json!(iterations) } else { Value::Null },
+        "residual": if iterations > 0 { json!(solutions.first().map_or(0.0, |solution| solution.stats.residual)) } else { Value::Null },
         "seconds": seconds,
         "max_von_mises": peak(&result, &sampled_values.von_mises),
         "max_displacement": peak(&result, &displacement),
