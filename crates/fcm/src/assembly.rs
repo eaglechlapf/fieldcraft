@@ -98,9 +98,12 @@ pub struct Bond {
     pub tolerance: f64,
 }
 
-/// The triangles of the faces of one body that a bond names, sorted into buckets.
+/// The triangles of the faces of one body that a bond names (or of all its faces), sorted into
+/// buckets.
 struct Reach {
     triangles: Vec<[[f64; 3]; 3]>,
+    /// The face of each.
+    tags: Vec<u32>,
     lo: [f64; 3],
     step: [f64; 3],
     count: [usize; 3],
@@ -109,15 +112,16 @@ struct Reach {
 }
 
 impl Reach {
-    fn new(surface: &BoundarySurface, faces: &BTreeSet<u32>, tolerance: f64) -> Result<Reach> {
+    fn new(surface: &BoundarySurface, faces: Option<&BTreeSet<u32>>, tolerance: f64) -> Result<Reach> {
         let points = surface.points();
-        let mut triangles = Vec::new();
+        let (mut triangles, mut tags) = (Vec::new(), Vec::new());
         for (triangle, tag) in surface.triangles().iter().zip(surface.tri_face()) {
-            if !faces.contains(tag) {
+            if faces.is_some_and(|faces| !faces.contains(tag)) {
                 continue;
             }
             let corner = |v: u32| points.get(v as usize).copied().ok_or_else(|| Error::Internal("a surface triangle names a missing vertex".into()));
             triangles.push([corner(triangle[0])?, corner(triangle[1])?, corner(triangle[2])?]);
+            tags.push(*tag);
         }
         let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
         for corner in triangles.iter().flatten() {
@@ -126,7 +130,7 @@ impl Reach {
                 hi[a] = hi[a].max(corner[a] + tolerance);
             }
         }
-        let mut reach = Reach { triangles, lo, step: [1.0; 3], count: [1; 3], buckets: Vec::new(), tolerance };
+        let mut reach = Reach { triangles, tags, lo, step: [1.0; 3], count: [1; 3], buckets: Vec::new(), tolerance };
         if reach.triangles.is_empty() {
             return Ok(reach);
         }
@@ -178,18 +182,23 @@ impl Reach {
     /// The point of the faces nearest to `x`, when it is within the tolerance, and the square of
     /// its distance.
     fn nearest(&self, x: [f64; 3]) -> Option<([f64; 3], f64)> {
+        self.nearest_triangle(x).map(|(y, apart, _)| (y, apart))
+    }
+
+    /// [`Reach::nearest`], with the triangle the point is on.
+    fn nearest_triangle(&self, x: [f64; 3]) -> Option<([f64; 3], f64, usize)> {
         if self.buckets.is_empty() || (0..3).any(|a| !(x[a] >= self.lo[a] && x[a] <= self.lo[a] + self.step[a] * self.count[a] as f64)) {
             return None;
         }
         let bucket = self.buckets.get(self.bucket(0, x[0]) + self.count[0] * (self.bucket(1, x[1]) + self.count[1] * self.bucket(2, x[2])))?;
-        let mut best: Option<([f64; 3], f64)> = None;
+        let mut best: Option<([f64; 3], f64, usize)> = None;
         for t in bucket {
             let Some(triangle) = self.triangles.get(*t as usize) else { continue };
             let y = closest_point(x, triangle);
             let apart = sub(x, y);
             let apart = dot(apart, apart);
-            if apart <= self.tolerance * self.tolerance && best.is_none_or(|(_, least)| apart < least) {
-                best = Some((y, apart));
+            if apart <= self.tolerance * self.tolerance && best.is_none_or(|(_, least, _)| apart < least) {
+                best = Some((y, apart, *t as usize));
             }
         }
         best
@@ -348,7 +357,7 @@ pub fn solve_assembly(parts: &[Part], bonds: &[Bond], limits: &Limits) -> Result
         if let Some(own) = held.get_mut(other.0) {
             *own = true;
         }
-        couplings.push(Coupling { flux: flux.0, faces, other: other.0, reach: Reach::new(surface, &others, bond.tolerance)? });
+        couplings.push(Coupling { flux: flux.0, faces, other: other.0, reach: Reach::new(surface, Some(&others), bond.tolerance)? });
     }
     // As small a fictitious stiffness as the factorization allows, as for one body: a hundred
     // times more at a time for every body, up to what its material leaves. Each step raises
@@ -438,6 +447,101 @@ fn leaf_parts(grid: &Grid, tree: &Tree, triangle: &[[f64; 3]; 3], visit: &mut dy
             }
         }
     }
+}
+
+/// Faces of two bodies that touch, as [`find_bonds`] found them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Touch {
+    pub bond: Bond,
+    /// The area over which they touch, as the triangles of the two surfaces sample it.
+    pub area: f64,
+}
+
+/// A face touches another over at least this share of the smaller of the two: less is an edge
+/// or a corner that rests on a face, which is no bond.
+const LEAST_SHARE: f64 = 0.01;
+
+/// The faces of every two bodies that touch: lie within `tolerance` of each other, facing each
+/// other, over more than an edge. One [`Bond`] for each two bodies that have such faces, with
+/// all of them. `tolerance` is a length above the chordal tolerance of the triangulations.
+///
+/// A triangle touches where sample points of it (its middle and a point towards each corner)
+/// have a triangle of the other body within the tolerance that faces the other way; each body's
+/// triangles are sampled against the other's, so a small face on a large one is found from the
+/// small one's side.
+pub fn find_bonds(surfaces: &[&BoundarySurface], tolerance: f64) -> Result<Vec<Touch>> {
+    if !(tolerance > 0.0 && tolerance.is_finite()) {
+        return Err(Error::Invalid(format!("the tolerance {tolerance} is not a positive length")));
+    }
+    if surfaces.len() > MAX_PARTS {
+        return Err(Error::Invalid(format!("an assembly has at most {MAX_PARTS} bodies; this one has {}", surfaces.len())));
+    }
+    let reaches: Vec<Reach> = surfaces.iter().map(|surface| Reach::new(surface, None, tolerance)).collect::<Result<_>>()?;
+    let normal = |triangle: &[[f64; 3]; 3]| cross(sub(triangle[1], triangle[0]), sub(triangle[2], triangle[0]));
+    // The area of each face of a body.
+    let areas = |reach: &Reach| {
+        let mut areas: BTreeMap<u32, f64> = BTreeMap::new();
+        for (triangle, tag) in reach.triangles.iter().zip(&reach.tags) {
+            let doubled = normal(triangle);
+            *areas.entry(*tag).or_insert(0.0) += 0.5 * dot(doubled, doubled).sqrt();
+        }
+        areas
+    };
+    // The area of each face of a body against each face of another, where triangles of the
+    // first touch the second.
+    let touching = |from: &Reach, onto: &Reach| {
+        let mut found: BTreeMap<(u32, u32), f64> = BTreeMap::new();
+        let end = [0, 1, 2].map(|a| onto.lo[a] + onto.step[a] * onto.count[a] as f64);
+        for (triangle, tag) in from.triangles.iter().zip(&from.tags) {
+            // Outside the other body's box nothing touches.
+            if (0..3).any(|a| triangle.iter().all(|corner| corner[a] < onto.lo[a]) || triangle.iter().all(|corner| corner[a] > end[a])) {
+                continue;
+            }
+            let doubled = normal(triangle);
+            let area = 0.5 * dot(doubled, doubled).sqrt();
+            if !(area > 0.0) {
+                continue;
+            }
+            for weights in [[1.0 / 3.0; 3], [2.0 / 3.0, 1.0 / 6.0, 1.0 / 6.0], [1.0 / 6.0, 2.0 / 3.0, 1.0 / 6.0], [1.0 / 6.0, 1.0 / 6.0, 2.0 / 3.0]] {
+                let x = [0, 1, 2].map(|a| weights[0] * triangle[0][a] + weights[1] * triangle[1][a] + weights[2] * triangle[2][a]);
+                let Some((_, _, other)) = onto.nearest_triangle(x) else { continue };
+                let (Some(facing), Some(other_tag)) = (onto.triangles.get(other).map(normal), onto.tags.get(other)) else { continue };
+                if dot(doubled, facing) < 0.0 {
+                    *found.entry((*tag, *other_tag)).or_insert(0.0) += 0.25 * area;
+                }
+            }
+        }
+        found
+    };
+    let mut touches = Vec::new();
+    for (first, reach) in reaches.iter().enumerate() {
+        let own = areas(reach);
+        for (second, other) in reaches.iter().enumerate().skip(first + 1) {
+            let theirs = areas(other);
+            // Either body's estimate of every pair of faces: the larger of the two.
+            let mut pairs = touching(reach, other);
+            for ((b, a), area) in touching(other, reach) {
+                let seen = pairs.entry((a, b)).or_insert(0.0);
+                *seen = seen.max(area);
+            }
+            let (mut faces, mut others, mut total) = (BTreeSet::new(), BTreeSet::new(), 0.0);
+            for ((a, b), area) in pairs {
+                // Two faces touch over no more than the smaller of them.
+                let smaller = own.get(&a).copied().unwrap_or(0.0).min(theirs.get(&b).copied().unwrap_or(0.0));
+                let area = area.min(smaller);
+                if area > LEAST_SHARE * smaller && area > 0.0 {
+                    faces.insert(a);
+                    others.insert(b);
+                    total += area;
+                }
+            }
+            if !faces.is_empty() {
+                let bond = Bond { first: (first, faces.into_iter().collect()), second: (second, others.into_iter().collect()), tolerance };
+                touches.push(Touch { bond, area: total });
+            }
+        }
+    }
+    Ok(touches)
 }
 
 /// What a bond adds between the functions of two elements, without the parameter β: the

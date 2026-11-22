@@ -7,7 +7,7 @@
 //! fictitious stiffness of the cut cells, as in `tests/patch.rs`: the bond is consistent, and
 //! the cells of the two bodies need not match.
 
-use fieldcraft_fcm::{Bond, Error, Load, Material, Options, Part, Solution, Support, solve_assembly};
+use fieldcraft_fcm::{Bond, Error, Load, Material, Options, Part, Solution, Support, find_bonds, solve_assembly};
 use fieldcraft_mesh::surface::{BoundarySurface, SurfaceOptions};
 use fieldcraft_solver::Limits;
 
@@ -288,4 +288,121 @@ fn the_bond_passes_the_patch_test_on_any_two_grids() {
             assert!(displacement < tolerance && stress < tolerance, "{name}: displacement {displacement:.3e}, stress {stress:.3e}");
         }
     }
+}
+
+/// A prism of `sides` sides around the z axis from `from` to `to`, with a hole of the radius
+/// `bore` through it when that is not zero. Faces: 0 the side, 1 the lower end, 2 the upper
+/// end, 3 the hole's wall.
+fn prism(sides: usize, radius: f64, bore: f64, from: f64, to: f64) -> BoundarySurface {
+    let n = sides as u32;
+    let ring = |r: f64, z: f64| {
+        (0..sides).map(move |i| {
+            let angle = 2.0 * std::f64::consts::PI * i as f64 / sides as f64;
+            [r * angle.cos(), r * angle.sin(), z]
+        })
+    };
+    let mut points: Vec<[f64; 3]> = ring(radius, from).chain(ring(radius, to)).collect();
+    let (mut triangles, mut tags) = (Vec::new(), Vec::new());
+    let mut add = |faces: &[[u32; 3]], tag: u32| {
+        triangles.extend_from_slice(faces);
+        tags.extend(faces.iter().map(|_| tag));
+    };
+    for i in 0..n {
+        let j = (i + 1) % n;
+        add(&[[i, j, n + j], [i, n + j, n + i]], 0);
+    }
+    if bore > 0.0 {
+        points.extend(ring(bore, from).chain(ring(bore, to)));
+        for i in 0..n {
+            let j = (i + 1) % n;
+            add(&[[2 * n + j, 2 * n + i, 3 * n + i], [2 * n + j, 3 * n + i, 3 * n + j]], 3);
+            add(&[[j, i, 2 * n + i], [j, 2 * n + i, 2 * n + j]], 1);
+            add(&[[n + i, n + j, 3 * n + j], [n + i, 3 * n + j, 3 * n + i]], 2);
+        }
+    } else {
+        points.extend([[0.0, 0.0, from], [0.0, 0.0, to]]);
+        for i in 0..n {
+            let j = (i + 1) % n;
+            add(&[[2 * n, j, i]], 1);
+            add(&[[2 * n + 1, n + i, n + j]], 2);
+        }
+    }
+    BoundarySurface::new(&points, &triangles, &tags, &SurfaceOptions::default()).unwrap()
+}
+
+/// The faces of two bodies that touch are found: blocks end to end, a block on a part of a
+/// plate (from the block's side: the plate's two triangles hardly sample it), a pin in a hole
+/// whose facets do not match. Bodies apart, and bodies that meet in an edge only, do not touch.
+#[test]
+fn faces_that_touch_are_found() {
+    let ends = [block([0.0; 3], [1.0, 0.8, 0.6]), block([1.0, 0.0, 0.0], [2.3, 0.8, 0.6])];
+    let found = find_bonds(&[&ends[0], &ends[1]], 1e-6).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!((&found[0].bond.first, &found[0].bond.second), (&(0, vec![1]), &(1, vec![0])));
+    assert!((found[0].area - 0.48).abs() < 1e-12, "{}", found[0].area);
+
+    let (plate, post) = (block([0.0; 3], [2.0, 1.5, 0.3]), block([0.6, 0.5, 0.3], [1.1, 0.9, 1.0]));
+    let found = find_bonds(&[&plate, &post], 1e-6).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!((&found[0].bond.first, &found[0].bond.second), (&(0, vec![5]), &(1, vec![4])));
+    assert!((found[0].area - 0.2).abs() < 1e-12, "{}", found[0].area);
+
+    // A gap wider than the tolerance, and an edge on an edge.
+    let apart = block([1.001, 0.0, 0.0], [2.0, 0.8, 0.6]);
+    assert!(find_bonds(&[&ends[0], &apart], 1e-6).unwrap().is_empty());
+    let diagonal = block([1.0, 0.8, 0.0], [2.0, 1.6, 0.6]);
+    assert!(find_bonds(&[&ends[0], &diagonal], 1e-6).unwrap().is_empty());
+    // Three bodies: each pair that touches, in order.
+    let third = block([2.3, 0.0, 0.0], [3.0, 0.8, 0.6]);
+    let found = find_bonds(&[&ends[0], &ends[1], &third], 1e-6).unwrap();
+    assert_eq!(found.iter().map(|t| (t.bond.first.0, t.bond.second.0)).collect::<Vec<_>>(), vec![(0, 1), (1, 2)]);
+
+    // A pin of 24 sides in a hole of 40: the facets are up to 0.9 % of the radius apart.
+    let (pin, sleeve) = (prism(24, 0.2, 0.0, -0.1, 0.9), prism(40, 0.5, 0.2, 0.0, 0.6));
+    assert!(find_bonds(&[&pin, &sleeve], 1e-6).unwrap().is_empty(), "facets that do not match are apart to rounding");
+    let found = find_bonds(&[&pin, &sleeve], 0.01 * 0.2).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!((&found[0].bond.first, &found[0].bond.second), (&(0, vec![0]), &(1, vec![3])));
+    let wall = 2.0 * std::f64::consts::PI * 0.2 * 0.6;
+    assert!((found[0].area / wall - 1.0).abs() < 0.03, "{} of {wall}", found[0].area);
+    for tolerance in [0.0, -1.0, f64::NAN] {
+        assert!(matches!(find_bonds(&[&pin, &sleeve], tolerance), Err(Error::Invalid(_))));
+    }
+}
+
+/// A pin bonded in the hole of a sleeve that is clamped on its outside, pulled along its axis:
+/// the curved faces touch facet against facet, and the sleeve's support carries the pull.
+#[test]
+fn a_pin_bonded_in_a_hole_carries_its_pull() {
+    let (pin, sleeve) = (prism(24, 0.2, 0.0, -0.1, 0.9), prism(40, 0.5, 0.2, 0.0, 0.6));
+    let clamp = [Support { face: 0, fixed: [true; 3], value: [0.0; 3] }];
+    let pull = [Load::Force { face: 2, force: [2.0e4, 0.0, 1.0e5] }];
+    let parts = [
+        Part {
+            surface: &pin,
+            material: STEEL,
+            supports: &[],
+            loads: &pull,
+            options: Options { degree: 2, offset: [0.37, 0.21, 0.43], ..Options::new(0.15) },
+        },
+        Part {
+            surface: &sleeve,
+            material: STEEL,
+            supports: &clamp,
+            loads: &[],
+            options: Options { degree: 2, offset: [0.17, 0.41, 0.29], ..Options::new(0.2) },
+        },
+    ];
+    let bonds: Vec<Bond> = find_bonds(&[&pin, &sleeve], 0.01 * 0.2).unwrap().into_iter().map(|touch| touch.bond).collect();
+    let solutions = solve_assembly(&parts, &bonds, &Limits::default()).unwrap();
+    let reaction = solutions[1].reactions.iter().find(|r| r.face == 0).unwrap().force;
+    for (i, applied) in [2.0e4, 0.0, 1.0e5].into_iter().enumerate() {
+        assert!((reaction[i] + applied).abs() < 1e-6 * 1.0e5, "component {i}: reaction {} against {applied}", reaction[i]);
+    }
+    // The pin's top moves up and sideways, and the pin moves with the sleeve in the hole.
+    let top = solutions[0].displacement([0.0, 0.0, 0.9]).unwrap();
+    assert!(top[2] > 0.0 && top[0] > 0.0, "{top:?}");
+    let (inside, around) = (solutions[0].displacement([0.19, 0.0, 0.3]).unwrap(), solutions[1].displacement([0.21, 0.0, 0.3]).unwrap());
+    println!("the pin's top {top:?}; in the hole the pin {inside:?}, the sleeve {around:?}");
+    assert!((inside[2] - around[2]).abs() < 0.2 * top[2], "{inside:?} {around:?}");
 }
