@@ -539,10 +539,32 @@ Mises stress of an assembly is often at such an edge, and it rises with every re
 clamps' tops moves by 2 %). Read the stress a cell away from the edge, or model the fillet or
 the weld that is there in the part.
 
-**Not yet:** the rounds that follow the solution and **Check convergence** (solve the body
-that matters on its own for them, with `body`); bolts, welds and contact, which are the plan
-below. The solvers on a mesh do not read connections: they join element faces by ties and
-contacts.
+**Rounds and the convergence check** work on all the bodies together. A round of **Adaptive
+rounds** (`adapt`) ranks the cells of every body by the one indicator, divides those the
+assembly is least resolved in, in whichever body they are, and solves all of it again; the
+rounds end when one moves the strain energy of all the bodies by no more than `settle`. Left
+to the command (`"auto"`), up to two rounds are run when any body is thin for its grid, and
+none otherwise. **Check convergence** solves every body one degree lower and compares over
+the sampled points of all of them.
+
+On the plate with two clamps of the example above:
+
+| Rounds | Unknowns | Time | Tip of the clamp | Strain energy moved by | Largest von Mises |
+|---|---|---|---|---|---|
+| 0 | 130,000 | 8 s | 0.518 µm | | 27 MPa |
+| 1 | 152,000 | 19 s | 0.534 µm | 2.6 % | 44 MPa |
+| 2 | 184,000 | 46 s | 0.537 µm | 0.5 % | 62 MPa |
+| 3 | 230,000 | 89 s | 0.540 µm | 0.4 % | 89 MPa |
+
+The first round goes almost wholly into the plate (7,000 to 19,000 unknowns), whose cells are
+more than twice its thickness across: that is where the assembly was least resolved, and the
+deflection gains 3 % from it. The deflection settles; the largest stress does not, because it
+sits on the edge of a bonded area (above), and every round divides the cells there again. The
+check at the default settings says the same in 3 s more: the strain energy is 2.5 % from the
+solve one degree lower, the largest von Mises stress 32 %.
+
+**Not yet:** bolts, welds and contact, which are the plan below. The solvers on a mesh do not
+read connections: they join element faces by ties and contacts.
 
 ### What comes next
 

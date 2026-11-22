@@ -224,18 +224,19 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let default_degree = Options::new(1.0).degree;
     let degree = super::super::mesh::optional_count(p, "degree", default_degree as u64, 1..=MAX_DEGREE as u64)?;
     let levels = super::super::mesh::optional_count(p, "refine", DEFAULT_REFINE, 0..=MAX_REFINE as u64)?;
-    let not_yet = |what: &str| refused(format!("{what} for several bodies yet: name one `body`, or leave it out"));
-    let rounds = match p.get("adapt") {
-        None => 0,
-        Some(Value::String(auto)) if auto == "auto" => 0,
-        Some(_) => super::super::mesh::optional_count(p, "adapt", 0, 0..=MAX_REFINE as u64)?,
+    // The rounds that follow the solution, over all the bodies together: a number, or as many
+    // as a body that is thin for its grid needs.
+    let asked_rounds = match p.get("adapt") {
+        None => None,
+        Some(Value::String(auto)) if auto == "auto" => None,
+        Some(_) => Some(super::super::mesh::optional_count(p, "adapt", 0, 0..=MAX_REFINE as u64)?),
     };
-    if rounds > 0 {
-        return Err(not_yet("rounds of refinement that follow the solution (`adapt`) are not run"));
+    let settle = super::super::optional_number(p, "settle", Options::SETTLED)?;
+    if !(0.0..=1.0).contains(&settle) {
+        return Err(EngineError::invalid("settle", "must be a fraction from 0 to 1 (0 runs every round)"));
     }
-    if opt::<bool>(p, "check_convergence")?.unwrap_or(false) {
-        return Err(not_yet("`check_convergence` is not run"));
-    }
+    // Refused at degree 1 by the caller.
+    let check_convergence = opt::<bool>(p, "check_convergence")?.unwrap_or(false);
     let asked_basis = match opt::<String>(p, "basis")?.as_deref() {
         None | Some("auto") => None,
         Some("tensor") => Some(Basis::Tensor),
@@ -298,7 +299,9 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
         )?;
         let thin = skin > 0.0 && cell_size * skin > THIN * 2.0 * volume;
         let basis = asked_basis.unwrap_or(if thin { Basis::Trunk } else { Basis::Tensor });
-        let smallest_cell = cell_size / (1u64 << levels.min(MAX_REFINE as usize)) as f64;
+        // The facets are far smaller than the smallest cell the rounds may make.
+        let rounds = asked_rounds.unwrap_or(if thin { THIN_ROUNDS } else { 0 });
+        let smallest_cell = cell_size / (1u64 << (levels + rounds).min(MAX_REFINE as usize)) as f64;
         let tolerance = length(
             "tolerance",
             (DEFAULT_TOLERANCE_PER_CELL * smallest_cell).clamp(MIN_RELATIVE_TOLERANCE * diagonal, DEFAULT_RELATIVE_TOLERANCE * diagonal),
@@ -318,6 +321,7 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
         let options = Options {
             degree,
             refine: levels,
+            settle,
             basis,
             separate: open_gaps,
             gaps: if open_gaps { GAP_LEVELS } else { 0 },
@@ -444,10 +448,12 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
 
     fieldcraft_model::progress::stage("grid solve", None, "");
     fieldcraft_model::progress::check()?;
-    // Cells that grow take the samples with them, and a body can become thin for them.
+    // Cells that grow take the samples with them, and a body can become thin for them. The
+    // rounds that follow the solution are the assembly's: as many as were asked for, or those of
+    // a thin body when any of the bodies is thin for its grid.
     let own_samples = p.get("sample_size").is_none();
     let grow = |prepared: &mut [Prepared], by: f64| {
-        for body in prepared {
+        for body in prepared.iter_mut() {
             body.options.cell_size *= by;
             if own_samples {
                 body.sample_size *= by;
@@ -457,7 +463,13 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
                 body.options.basis = Basis::Trunk;
             }
         }
+        let rounds = asked_rounds.unwrap_or(if prepared.iter().any(|body| body.thin) { THIN_ROUNDS } else { 0 });
+        for body in prepared.iter_mut() {
+            body.options.adapt = rounds;
+        }
     };
+    // The cells as they are: the rounds of the bodies as they come.
+    grow(&mut prepared, 1.0);
     // The default cells: a twentieth of each body's own diagonal, and all of them larger by one
     // factor when the bodies would have more unknowns between them than one compact body has.
     // The unknowns are counted on the bodies' grids, with nothing integrated.
@@ -499,7 +511,7 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
         ));
     }
     let most = MAX_SAMPLES / prepared.len().max(1);
-    let (solutions, sampled) = with_threads(threads, || -> Result<_> {
+    let (solutions, sampled, change) = with_threads(threads, || -> Result<_> {
         fieldcraft_model::progress::stage("results", None, "");
         fieldcraft_model::progress::check()?;
         let sampled: Vec<(Sampled, Vec<Option<([f64; 3], [f64; 6])>>)> = prepared
@@ -512,7 +524,21 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
                 (sampled, values)
             })
             .collect();
-        Ok((solutions, sampled))
+        // The p-extension's own check: the same step one degree lower on the same grids, and
+        // how far the two solutions are apart at the sampled points of every body.
+        let change = if check_convergence {
+            fieldcraft_model::progress::stage(&format!("convergence check at degree {}", degree - 1), None, "");
+            fieldcraft_model::progress::check()?;
+            let coarser: Vec<Part> =
+                parts_of(&prepared).into_iter().map(|part| Part { options: Options { degree: degree - 1, ..part.options }, ..part }).collect();
+            let lower = solve_assembly(&coarser, &bonds, &limits).map_err(grid_error)?;
+            let bodies: Vec<(&Solution, &Solution, &[[f64; 3]])> =
+                solutions.iter().zip(&lower).zip(&sampled).map(|((finer, lower), (sampled, _))| (finer, lower, sampled.points.as_slice())).collect();
+            Some(Solution::change_of(&bodies))
+        } else {
+            None
+        };
+        Ok((solutions, sampled, change))
     })?;
 
     // One surface of all the bodies: one body's points, triangles and faces after another's.
@@ -542,10 +568,32 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
             shown(longest)
         ));
     }
+    // How far the result is from settled: the rounds are the assembly's, and every body's
+    // solution counts them. Every round asked for (`settle` 0) is read against the default.
+    let (rounds, moved, left_out) =
+        solutions.first().map_or((0, 0.0, false), |solution| (solution.stats.rounds, solution.stats.settled, solution.stats.left_out));
+    let bar = if settle > 0.0 { settle } else { Options::SETTLED };
+    let still_moving = rounds > 0 && moved.abs().sqrt() > bar;
+    if still_moving || (left_out && rounds > 0) {
+        warnings.push(format!(
+            "the result was still changing when the rounds of refinement ended: the last one changed the strain energy by {:.2} %{}",
+            100.0 * moved.abs(),
+            if left_out {
+                "; one more round would have been too large to solve (a smaller `cell_size` with fewer rounds, or a higher `max_factor_entries`, goes further)"
+            } else {
+                "; more rounds (`adapt`) or a smaller `cell_size` bring it closer"
+            },
+        ));
+    } else if left_out {
+        warnings.push(
+            "no round of refinement was run: the first would have been too large to solve (a larger `cell_size`, a lower `degree` or a higher `max_factor_entries` leaves room for them)"
+                .into(),
+        );
+    }
     for (body, solution) in prepared.iter().zip(&solutions) {
-        if body.thin {
+        if body.thin && rounds == 0 && !left_out {
             warnings.push(format!(
-                "body `{}` is thin for its grid (cells of {}): where a bend or a thin wall carries the load, the deflection can be up to a tenth too small; solved on its own (`body`), rounds of refinement show how far the result is from settled",
+                "body `{}` is thin for its grid (cells of {}): where a bend or a thin wall carries the load, the deflection can be up to a tenth too small; rounds of refinement (`adapt`) or a smaller `cell_size` show how far the result is from settled",
                 short(&body.shape.name),
                 shown(body.options.cell_size),
             ));
@@ -655,6 +703,17 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
         "connections_added": found.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(),
         "degree": degree,
         "refine": levels,
+        // The rounds that followed the solution, and how much the last one still changed the
+        // strain energy of all the bodies.
+        "adapt": rounds,
+        "settled": if rounds > 0 { json!(moved) } else { Value::Null },
+        "convergence": change.map(|c| json!({
+            "against_degree": degree - 1,
+            "peak_von_mises": c.peak_von_mises,
+            "von_mises": c.von_mises,
+            "strain_energy": c.strain_energy,
+            "points": c.points,
+        })),
         "gaps": if open_gaps { "open" } else { "joined" },
         "unknowns": unknowns,
         "factor_entries": factor_entries,

@@ -648,17 +648,105 @@ fn bodies_that_touch_are_solved_together() {
     assert!(e.contains("limit"), "{e}");
     s.limits.max_grid_dofs = limit;
 
-    // Free of each other, nothing holds the second block along x; what is not run for several
-    // bodies yet is refused, and one body can still be solved on its own.
+    // Free of each other, nothing holds the second block along x; and one body can still be
+    // solved on its own.
     let e = s.execute("solve.static.grid", &json!({"cell_size": 5, "degree": 2, "connections": "none"})).unwrap_err().to_string();
     assert!(e.contains("`Second` can still slide along (1, 0, 0)"), "{e}");
-    for (params, word) in
-        [(json!({"adapt": 2}), "adapt"), (json!({"check_convergence": true}), "check_convergence"), (json!({"connections": "welded"}), "connections")]
-    {
-        let e = s.execute("solve.static.grid", &params).unwrap_err().to_string();
-        assert!(e.contains(word), "{e}");
-    }
+    let e = s.execute("solve.static.grid", &json!({"connections": "welded"})).unwrap_err().to_string();
+    assert!(e.contains("connections"), "{e}");
+    // A stress the cells hold leaves the rounds nothing to do: one finds that, and is the last.
+    let settled = s.execute("solve.static.grid", &json!({"cell_size": 5, "degree": 2, "adapt": 3})).unwrap();
+    assert!(settled["adapt"].as_u64().unwrap() <= 1 && settled["warnings"].as_array().unwrap().is_empty(), "{settled}");
+    assert!(close(settled["max_displacement"]["value"].as_f64().unwrap(), PULL * 35.0 / YOUNG, 2e-2), "{}", settled["max_displacement"]);
     // One body on its own takes sets of its own faces only.
     let e = s.execute("solve.static.grid", &json!({"body": "First", "cell_size": 5, "degree": 2})).unwrap_err().to_string();
     assert!(e.contains("set `y0` names body `Second`"), "{e}");
+}
+
+/// Rounds that follow the solution and the convergence check run over several bodies together.
+/// The two blocks end to end, the first clamped at its end and the second pushed sideways at
+/// its own: a cantilever of two bonded bodies. The rounds divide cells in both, the reply
+/// counts them and says how much the last one still moved the strain energy, and the tip moves
+/// a little further, as a finer solution under a load must; it stays at the beam's,
+/// F L³ / (3 E I) with the shear's share (Timoshenko), to the half percent by which a beam
+/// stands for a short clamped block. The check compares with the solve of both bodies one
+/// degree lower.
+#[test]
+fn rounds_and_the_check_run_over_several_bodies() {
+    const FORCE: f64 = 100.0;
+    let bytes = fieldcraft_geometry::script_design(TWO).unwrap();
+    let (_dir, path) = crate::tests::design_file(&bytes);
+    let mut s = Session { limits: SessionLimits { max_grid_dofs: 60_000, ..SessionLimits::default() }, ..Session::default() };
+    s.execute("geometry.open", &json!({"path": path})).unwrap();
+    let design = s.design.clone().unwrap();
+    let face = |body: &str, at: [f64; 3]| -> Value {
+        let shape = design.body(body).unwrap();
+        let found = shape.faces().iter().find(|f| {
+            let c = shape.face_centre(&f.name).unwrap();
+            (0..3).all(|k| (c[k] - at[k]).abs() < 1e-6)
+        });
+        json!({"body": body, "face": found.unwrap_or_else(|| panic!("no face of {body} at {at:?}")).name})
+    };
+    s.run_script(&json!([
+        {"command": "model.set.create", "params": {"name": "both", "geometry": [{"body": "First"}, {"body": "Second"}]}},
+        {"command": "model.material.create", "params": {"name": "Steel", "elastic": {"type": "isotropic", "young": YOUNG, "poisson": POISSON}, "density": 7.85e-9}},
+        {"command": "model.section.create", "params": {"name": "Solid", "set": "both", "material": "Steel", "kind": {"type": "solid"}}},
+        {"command": "model.set.create", "params": {"name": "x0", "geometry": [face("First", [0.0, 5.0, 5.0])]}},
+        {"command": "model.set.create", "params": {"name": "end", "geometry": [face("Second", [35.0, 5.0, 5.0])]}},
+        {"command": "model.boundary_condition.create", "params": {"name": "Clamp", "type": "fixed", "target": {"set": "x0"}}},
+        {"command": "model.load.create", "params": {"name": "Push", "type": "force", "target": {"set": "end"}, "vector": [0, 0, -FORCE]}},
+        {"command": "model.step.create", "params": {"name": "Bend", "procedure": {"type": "static"}, "boundary_conditions": ["Clamp"], "loads": ["Push"]}},
+    ]))
+    .unwrap();
+    // The beam's tip: bending, and shear with the rectangle's factor 5/6.
+    let (length, inertia, area, shear) = (35.0f64, 10.0f64.powi(4) / 12.0, 100.0, YOUNG / (2.0 * (1.0 + POISSON)));
+    let beam = FORCE * length.powi(3) / (3.0 * YOUNG * inertia) + FORCE * length / (5.0 / 6.0 * shear * area);
+    let solve = |s: &mut Session, more: Value| {
+        let mut params = json!({"cell_size": 5, "degree": 2});
+        params.as_object_mut().unwrap().extend(more.as_object().unwrap().clone());
+        s.execute("solve.static.grid", &params).unwrap()
+    };
+    let tip = |r: &Value| r["max_displacement"]["value"].as_f64().unwrap();
+    let unknowns = |r: &Value, body: usize| r["bodies"][body]["unknowns"].as_u64().unwrap();
+
+    // Left to the command, bodies that are not thin for their grids get no rounds.
+    let plain = solve(&mut s, json!({}));
+    assert_eq!((plain["adapt"].as_u64(), plain["settled"].is_null(), plain["convergence"].is_null()), (Some(0), true, true), "{plain}");
+    let rounds = solve(&mut s, json!({"adapt": 2, "settle": 0}));
+    assert_eq!(rounds["adapt"], 2);
+    let settled = rounds["settled"].as_f64().unwrap();
+    assert!(settled > 0.0 && settled < 0.05, "{settled}");
+    assert!(unknowns(&rounds, 0) > unknowns(&plain, 0) && unknowns(&rounds, 1) > unknowns(&plain, 1), "cells are divided in both bodies: {rounds}");
+    println!("the tip: {} without rounds, {} with two, the beam's {beam}", tip(&plain), tip(&rounds));
+    assert!(tip(&rounds) > tip(&plain) && tip(&rounds) < 1.005 * tip(&plain), "the finer solution is the softer one, by little");
+    assert!(close(tip(&plain), beam, 5e-3) && close(tip(&rounds), beam, 5e-3), "{} and {} against {beam}", tip(&plain), tip(&rounds));
+    let (applied, reaction) = (rounds["applied_total"][2].as_f64().unwrap(), rounds["reaction_total"][2].as_f64().unwrap());
+    assert!(close(applied, -FORCE, 1e-9) && close(-reaction, applied, 1e-6), "{applied} {reaction}");
+    assert!(rounds["bodies"].as_array().unwrap().iter().all(|b| b["levels"].as_array().unwrap().len() >= 2), "{}", rounds["bodies"]);
+
+    // A round that moves the strain energy by no more than `settle` is the last, without a
+    // warning; one that leaves it moving more than the bar says so.
+    let early = solve(&mut s, json!({"adapt": 4, "settle": 0.5}));
+    assert!(early["adapt"] == 1 && early["warnings"].as_array().unwrap().is_empty(), "{early}");
+    let moving = solve(&mut s, json!({"adapt": 1, "settle": 1e-6}));
+    assert!(moving["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("still changing")), "{moving}");
+
+    // The check: both bodies one degree lower, which bends far too little.
+    let checked = solve(&mut s, json!({"check_convergence": true}));
+    let convergence = &checked["convergence"];
+    assert_eq!(convergence["against_degree"], 1);
+    assert!(convergence["strain_energy"].as_f64().unwrap() > 0.05 && convergence["points"].as_u64().unwrap() > 100, "{convergence}");
+    assert!(convergence["von_mises"].as_f64().unwrap() > 0.0, "{convergence}");
+    let e = s.execute("solve.static.grid", &json!({"cell_size": 5, "degree": 1, "check_convergence": true})).unwrap_err().to_string();
+    assert!(e.contains("degree of 2 or more"), "{e}");
+
+    // A round too large for a limit is left out, and the reply says so.
+    s.limits.max_grid_dofs = plain["unknowns"].as_u64().unwrap() as usize;
+    let left = solve(&mut s, json!({"adapt": 2}));
+    assert_eq!((left["adapt"].as_u64(), left["unknowns"].as_u64()), (Some(0), plain["unknowns"].as_u64()));
+    assert!(left["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("no round of refinement was run")), "{left}");
+    // Hostile rounds are refused.
+    for bad in [json!({"adapt": 7}), json!({"adapt": -1}), json!({"adapt": "often"}), json!({"settle": 2}), json!({"settle": -0.1})] {
+        assert!(s.execute("solve.static.grid", &bad).is_err(), "{bad}");
+    }
 }
