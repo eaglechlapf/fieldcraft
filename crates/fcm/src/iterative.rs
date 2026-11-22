@@ -48,8 +48,8 @@
 //! ([`crate::assembly`]).
 //!
 //! # Determinism
-//! Every sum runs in a fixed order: the products of the matrix row by row, each over its
-//! columns in order; the blocks one by one into the result in their order; the inner products
+//! Every sum runs in a fixed order: the products of the matrix node by node, each over the
+//! blocks of its rows in order; the blocks one by one into the result in their order; the inner products
 //! from the first unknown to the last. The result is the same on any number of threads.
 
 use fieldcraft_parallel as parallel;
@@ -85,6 +85,110 @@ pub(crate) struct Outcome {
     pub residual: f64,
     /// Entries of the coarse level's factor.
     pub coarse_entries: usize,
+}
+
+/// Nodes a task of the product takes.
+const ROWS: usize = 1024;
+
+/// The matrix as the rounds multiply by it: a node has three unknowns, so the entries are kept
+/// as blocks of three by three with one column each, in a little over half the memory of the
+/// entries with a column each. The product takes its time to read the matrix, and that much
+/// less of it.
+struct Blocked {
+    /// Where each node's blocks start, and where the last one's end.
+    start: Vec<usize>,
+    /// The node each block is for.
+    node: Vec<u32>,
+    /// The blocks, row by row.
+    value: Vec<[f64; 9]>,
+}
+
+/// The nodes that the three rows of `node` have entries for, rising, each with its block.
+fn coupled(matrix: &Csr, node: usize, mut each: impl FnMut(usize, [f64; 9])) {
+    let rows = [matrix.row(3 * node), matrix.row(3 * node + 1), matrix.row(3 * node + 2)];
+    let mut at = [0usize; 3];
+    // Every pass takes an entry of one row at least.
+    while let Some(next) = rows.iter().zip(&at).filter_map(|((columns, _), at)| columns.get(*at)).map(|column| column / 3).min() {
+        let mut block = [0.0; 9];
+        for (row, ((columns, values), at)) in rows.iter().zip(&mut at).enumerate() {
+            while let (Some(column), Some(value)) = (columns.get(*at), values.get(*at))
+                && column / 3 == next
+            {
+                if let Some(slot) = block.get_mut(3 * row + column % 3) {
+                    *slot = *value;
+                }
+                *at += 1;
+            }
+        }
+        each(next, block);
+    }
+}
+
+impl Blocked {
+    /// `matrix` by blocks. None when it has more nodes than a column counts.
+    fn new(matrix: &Csr) -> Option<Blocked> {
+        let nodes = matrix.n / 3;
+        u32::try_from(nodes).ok()?;
+        let counts = parallel::map_grained(nodes, ROWS, |node| {
+            let mut count = 0usize;
+            coupled(matrix, node, |_, _| count += 1);
+            count
+        });
+        let mut start = Vec::with_capacity(nodes + 1);
+        let mut total = 0usize;
+        start.push(0);
+        for count in &counts {
+            total += count;
+            start.push(total);
+        }
+        drop(counts);
+        let mut node = vec![0u32; total];
+        let mut value = vec![[0.0f64; 9]; total];
+        // Each task's part of the two lists.
+        let mut parts = Vec::new();
+        let (mut nodes_left, mut values_left) = (node.as_mut_slice(), value.as_mut_slice());
+        for range in parallel::blocks(nodes, ROWS) {
+            let length = start.get(range.end)?.checked_sub(*start.get(range.start)?)?;
+            let (own_nodes, rest) = std::mem::take(&mut nodes_left).split_at_mut_checked(length)?;
+            nodes_left = rest;
+            let (own_values, rest) = std::mem::take(&mut values_left).split_at_mut_checked(length)?;
+            values_left = rest;
+            parts.push((range, own_nodes, own_values));
+        }
+        parallel::for_each_mut(&mut parts, |_, (range, own_nodes, own_values)| {
+            let mut at = 0;
+            for node in range.clone() {
+                coupled(matrix, node, |other, block| {
+                    if let (Some(column), Some(slot)) = (own_nodes.get_mut(at), own_values.get_mut(at)) {
+                        *column = u32::try_from(other).unwrap_or(u32::MAX);
+                        *slot = block;
+                    }
+                    at += 1;
+                });
+            }
+        });
+        drop(parts);
+        Some(Blocked { start, node, value })
+    }
+
+    /// y = A x: the nodes in parallel, each row's sum over its blocks in order.
+    fn mul(&self, x: &[f64], y: &mut [f64]) {
+        parallel::chunks_mut(y, 3 * ROWS, |task, out| {
+            for (i, sums) in out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                let node = task * ROWS + i;
+                let (from, to) = (self.start.get(node).copied().unwrap_or(0), self.start.get(node + 1).copied().unwrap_or(0));
+                let mut sum = [0.0f64; 3];
+                for (other, a) in self.node.get(from..to).unwrap_or_default().iter().zip(self.value.get(from..to).unwrap_or_default()) {
+                    let at = 3 * *other as usize;
+                    let Some(&[x0, x1, x2]) = x.get(at..at + 3).and_then(|x| x.first_chunk::<3>()) else { continue };
+                    sum[0] += a[0] * x0 + a[1] * x1 + a[2] * x2;
+                    sum[1] += a[3] * x0 + a[4] * x1 + a[5] * x2;
+                    sum[2] += a[6] * x0 + a[7] * x1 + a[8] * x2;
+                }
+                *sums = sum;
+            }
+        });
+    }
 }
 
 /// One block of the local level: its unknowns in rising order, and the Cholesky factor of
@@ -230,6 +334,8 @@ pub(crate) fn solve(
         return Ok(scale.is_finite().then(|| Outcome { u: vec![0.0; n], iterations: 0, residual: 0.0, coarse_entries: 0 }));
     }
 
+    let Some(product) = Blocked::new(matrix) else { return Ok(None) };
+
     // The coarse level: the linear functions' part of the matrix, factored.
     let mut place = vec![usize::MAX; n];
     let mut coarse = Vec::new();
@@ -344,7 +450,7 @@ pub(crate) fn solve(
         if iteration % LOOK == 0 && cancelled() {
             return Err(Error::Internal("cancelled".into()));
         }
-        matrix.mul(&p, &mut ap);
+        product.mul(&p, &mut ap);
         let curvature = dot(&p, &ap);
         // A direction with no stiffness, or a number that is none: not this method's system.
         if !(curvature > 0.0 && rz > 0.0) || !curvature.is_finite() || !rz.is_finite() {
@@ -362,7 +468,7 @@ pub(crate) fn solve(
         if residual <= settled {
             // The residual of the recurrence drifts from the true one over many rounds: the
             // true one decides.
-            matrix.mul(&u, &mut ap);
+            product.mul(&u, &mut ap);
             for ((res, b), a) in r.iter_mut().zip(load).zip(&ap) {
                 *res = b - a;
             }
@@ -471,6 +577,26 @@ mod tests {
         for (a, b) in alone.u.iter().zip(&direct) {
             assert!((a - b).abs() < 1e-7 * largest, "{a} against {b}");
         }
+    }
+
+    #[test]
+    fn the_product_by_blocks_is_the_product_by_rows() {
+        // The rows of a node here differ in their columns: the blocks hold a zero where a row
+        // has no entry.
+        let (matrix, _) = chain(40);
+        let blocked = Blocked::new(&matrix).expect("few nodes");
+        assert_eq!(blocked.start.len(), 41);
+        assert_eq!(blocked.node.len(), 3 * 40 - 2, "a node with its neighbours");
+        let x: Vec<f64> = (0..matrix.n).map(|i| ((i * i) as f64 * 0.37).sin()).collect();
+        let (mut rows, mut blocks) = (vec![0.0; matrix.n], vec![1.0; matrix.n]);
+        matrix.mul(&x, &mut rows);
+        blocked.mul(&x, &mut blocks);
+        for (a, b) in rows.iter().zip(&blocks) {
+            assert!((a - b).abs() < 1e-13, "{a} against {b}");
+        }
+        let mut one = vec![0.0; matrix.n];
+        parallel::with_threads(1, || Blocked::new(&matrix).expect("few nodes").mul(&x, &mut one));
+        assert!(one.iter().zip(&blocks).all(|(a, b)| a.to_bits() == b.to_bits()));
     }
 
     #[test]
