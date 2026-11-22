@@ -547,7 +547,8 @@ pub fn find_bonds(surfaces: &[&BoundarySurface], tolerance: f64) -> Result<Vec<T
 /// What a bond adds between the functions of two elements, without the parameter β: the
 /// integrals over the points where the first's tied face touches the second.
 struct Pair {
-    /// ∫ t_l(v) N_b of the first's unknowns (rows) and the second's (columns).
+    /// ∫ t_l(v) N_b: for each of the first's unknowns, each component l of the traction, the
+    /// second's functions.
     flux: Vec<f64>,
     /// ∫ N_a N_b, functions of the first by functions of the second.
     mass: Vec<f64>,
@@ -605,8 +606,8 @@ pub(crate) fn solve_system(
                     if scaled == 0.0 {
                         continue;
                     }
-                    if let Some(out) = pair.flux.get_mut(row * 3 * nb..(row + 1) * 3 * nb) {
-                        for (slot, value) in out.iter_mut().skip(l).step_by(3).zip(&values) {
+                    if let Some(out) = pair.flux.get_mut((3 * row + l) * nb..(3 * row + l + 1) * nb) {
+                        for (slot, value) in out.iter_mut().zip(&values) {
                             *slot += scaled * value;
                         }
                     }
@@ -751,7 +752,7 @@ pub(crate) fn solve_system(
         for row in 0..3 * na {
             for (fb, mass) in pair.mass.get((row / 3) * nb..(row / 3 + 1) * nb).unwrap_or_default().iter().enumerate() {
                 for l in 0..3 {
-                    let flux = pair.flux.get(row * 3 * nb + 3 * fb + l).copied().unwrap_or(0.0);
+                    let flux = pair.flux.get((3 * row + l) * nb + fb).copied().unwrap_or(0.0);
                     let value = flux - if l == row % 3 { beta * mass } else { 0.0 };
                     let column = 3 * (na + fb) + l;
                     if let Some(slot) = block.get_mut(row * n + column) {
