@@ -93,7 +93,7 @@ use crate::cell::{Curved, Grip};
 use crate::grid::{self, Grid, cross, dot, sub};
 use crate::islands::closest_point;
 use crate::refine::Tree;
-use crate::solve::{self, Load, MAX_MATRIX_ENTRIES, Material, Options, Solution, Solved, Support, Tied, Ties, View};
+use crate::solve::{self, Load, MAX_MATRIX_ENTRIES, Material, Options, Round, Solution, Solved, Support, Tied, Ties, View};
 use crate::space::NONE;
 use crate::{Error, Result};
 
@@ -111,7 +111,8 @@ pub struct Part<'a> {
     pub material: Material,
     pub supports: &'a [Support],
     pub loads: &'a [Load],
-    /// The grid of this body ([`Options::adapt`] is not run for a body of an assembly yet).
+    /// The grid of this body. The rounds of [`Options::adapt`] are run over all the bodies
+    /// together ([`solve_assembly`]).
     pub options: Options,
     /// The faces that lie on a cylinder, a sphere, a cone or a torus, each with its surface: a
     /// face that slides on another body takes its normal from it ([`Curved`]). Faces not listed
@@ -263,6 +264,8 @@ struct Shared<'a> {
     fictitious: &'a [f64],
     /// Of each body: the curved surfaces its faces lie on.
     curved: &'a [BTreeMap<u32, Curved>],
+    /// Of each body: what its solve takes from the rounds before ([`Options::adapt`]).
+    rounds: &'a [Round],
     /// The cells of each body, once its solve has them: a copy the other bodies' pieces are
     /// cut along.
     frames: &'a [OnceLock<(Grid, Tree)>],
@@ -360,8 +363,9 @@ fn nest(shared: &Shared, index: usize, up: Option<&Chain>) -> Result<()> {
         kept.get_mut(index).and_then(Option::take).ok_or_else(|| broken("a body has no solution"))
     };
     let fictitious = shared.fictitious.get(index).copied().unwrap_or(part.options.fictitious);
+    let round = shared.rounds.get(index).ok_or_else(|| broken("a body's round is missing"))?;
     let solution =
-        solve::solve_tied(part.surface, &part.material, part.supports, part.loads, &part.options, shared.limits, fictitious, &ties, &join)?;
+        solve::solve_tied(part.surface, &part.material, part.supports, part.loads, &part.options, shared.limits, fictitious, round, &ties, &join)?;
     let mut solutions = shared.solutions.try_borrow_mut().map_err(|_| broken("the solutions are in use"))?;
     if let Some(slot) = solutions.get_mut(index) {
         *slot = Some(solution);
@@ -717,6 +721,7 @@ pub fn assembly_unknowns(parts: &[Part], bonds: &[Bond], limits: &Limits) -> Res
     let Bonded { couplings, tied, held, curved } = couplings(parts, bonds)?;
     let fictitious: Vec<f64> = parts.iter().map(|part| part.options.fictitious).collect();
     let frames: Vec<OnceLock<(Grid, Tree)>> = (0..parts.len()).map(|_| OnceLock::new()).collect();
+    let rounds: Vec<Round> = parts.iter().map(|_| Round::default()).collect();
     let count = Cell::new(None);
     let shared = Shared {
         parts,
@@ -726,6 +731,7 @@ pub fn assembly_unknowns(parts: &[Part], bonds: &[Bond], limits: &Limits) -> Res
         held: &held,
         fictitious: &fictitious,
         curved: &curved,
+        rounds: &rounds,
         frames: &frames,
         count: Some(&count),
         solved: RefCell::new(Vec::new()),
@@ -742,41 +748,97 @@ pub fn assembly_unknowns(parts: &[Part], bonds: &[Bond], limits: &Limits) -> Res
 /// solutions come in the bodies' order. A body needs supports of its own or connections that
 /// hold it against every rigid motion ([`free_motions`]). Refused like a single body's solve: a
 /// system above the limits, a body or a group of bodies that can still move.
+///
+/// **Rounds that follow the solution** ([`Options::adapt`]) are run as for one body, over all
+/// the bodies together: as many as the body that asks for the most, each a whole solve. The
+/// cells are ranked across the bodies by the one indicator, so a round divides cells where the
+/// assembly is least resolved, in whichever body that is, and none in a body that is resolved.
+/// The rounds end once one moves the strain energy of all the bodies by no more than the
+/// smallest [`Options::settle`] among them; each solution's [`crate::Stats::rounds`],
+/// [`crate::Stats::settled`] and [`crate::Stats::left_out`] are the assembly's.
 pub fn solve_assembly(parts: &[Part], bonds: &[Bond], limits: &Limits) -> Result<Vec<Solution>> {
     let Bonded { couplings, tied, held, curved } = couplings(parts, bonds)?;
     refuse_free(&motions(parts, &couplings, &curved)?)?;
-    // As small a fictitious stiffness as the factorization allows, as for one body: a hundred
-    // times more at a time for every body, up to what its material leaves. Each step raises
-    // one at least, so the loop ends.
     let most: Vec<f64> = parts.iter().map(|part| solve::most_fictitious(&part.material)).collect::<Result<_>>()?;
-    let mut fictitious: Vec<f64> = parts.iter().map(|part| part.options.fictitious).collect();
-    loop {
-        let frames: Vec<OnceLock<(Grid, Tree)>> = (0..parts.len()).map(|_| OnceLock::new()).collect();
-        let shared = Shared {
-            parts,
-            couplings: &couplings,
-            limits,
-            tied: &tied,
-            held: &held,
-            fictitious: &fictitious,
-            curved: &curved,
-            frames: &frames,
-            count: None,
-            solved: RefCell::new(Vec::new()),
-            solutions: RefCell::new((0..parts.len()).map(|_| None).collect()),
-        };
-        match nest(&shared, 0, None) {
-            Err(Error::Singular(_)) if fictitious.iter().zip(&most).any(|(now, most)| now < most) => {
-                for (now, most) in fictitious.iter_mut().zip(&most) {
-                    *now = (*now * solve::FICTITIOUS_STEP).min(*most).max(*now);
+    // One solve of all the bodies, each dividing the cells its round asks for.
+    let attempt = |rounds: &[Round]| -> Result<Vec<Solution>> {
+        // As small a fictitious stiffness as the factorization allows, as for one body: a
+        // hundred times more at a time for every body, up to what its material leaves. Each
+        // step raises one at least, so the loop ends.
+        let mut fictitious: Vec<f64> = parts.iter().map(|part| part.options.fictitious).collect();
+        loop {
+            let frames: Vec<OnceLock<(Grid, Tree)>> = (0..parts.len()).map(|_| OnceLock::new()).collect();
+            let shared = Shared {
+                parts,
+                couplings: &couplings,
+                limits,
+                tied: &tied,
+                held: &held,
+                fictitious: &fictitious,
+                curved: &curved,
+                rounds,
+                frames: &frames,
+                count: None,
+                solved: RefCell::new(Vec::new()),
+                solutions: RefCell::new((0..parts.len()).map(|_| None).collect()),
+            };
+            match nest(&shared, 0, None) {
+                Err(Error::Singular(_)) if fictitious.iter().zip(&most).any(|(now, most)| now < most) => {
+                    for (now, most) in fictitious.iter_mut().zip(&most) {
+                        *now = (*now * solve::FICTITIOUS_STEP).min(*most).max(*now);
+                    }
+                }
+                Err(e) => return Err(e),
+                Ok(()) => {
+                    return shared
+                        .solutions
+                        .into_inner()
+                        .into_iter()
+                        .map(|solution| solution.ok_or_else(|| broken("a body has no solution")))
+                        .collect();
                 }
             }
-            Err(e) => return Err(e),
-            Ok(()) => {
-                return shared.solutions.into_inner().into_iter().map(|solution| solution.ok_or_else(|| broken("a body has no solution"))).collect();
+        }
+    };
+    let mut rounds: Vec<Round> = parts.iter().map(|_| Round::default()).collect();
+    let mut solutions = attempt(&rounds)?;
+    let asked = parts.iter().map(|part| part.options.adapt).max().unwrap_or(0).min(grid::MAX_REFINE);
+    let settle = parts.iter().map(|part| part.options.settle).fold(f64::INFINITY, f64::min);
+    let energy = |solutions: &[Solution]| solutions.iter().map(|solution| solution.strain_energy).sum::<f64>();
+    for round in 0..asked {
+        let marked = solve::least_resolved(&solutions.iter().collect::<Vec<_>>(), Options::SHARE);
+        let mut more = false;
+        for ((own, cells), solution) in rounds.iter_mut().zip(marked).zip(&solutions) {
+            more |= own.ask(cells, solution);
+        }
+        if !more {
+            break;
+        }
+        match attempt(&rounds) {
+            Ok(mut finer) => {
+                let (now, before) = (energy(&finer), energy(&solutions));
+                let settled = if now != 0.0 { (now - before) / now } else { 0.0 };
+                for solution in &mut finer {
+                    solution.stats.rounds = round + 1;
+                    solution.stats.settled = settled;
+                }
+                solutions = finer;
+                if settled.abs().sqrt() <= settle {
+                    break;
+                }
             }
+            // Too large with this round's cells, or not to be solved with them: the solutions
+            // before it stand.
+            Err(Error::Limit(_) | Error::Singular(_)) => {
+                for solution in &mut solutions {
+                    solution.stats.left_out = true;
+                }
+                break;
+            }
+            Err(e) => return Err(e),
         }
     }
+    Ok(solutions)
 }
 
 /// The parts of a triangle in the cells of a body that hold material and are not divided, each
@@ -1137,9 +1199,7 @@ pub(crate) fn solve_system(
         // its factor cannot fit: the larger system of the same part is taken to have no fewer
         // entries of the factor for each of the stiffness than the solve before it had (the
         // fill of a nested dissection grows with the system).
-        if let [view] = views
-            && let Some((before, factor)) = view.before.filter(|(before, _)| *before > 0 && entries >= *before)
-        {
+        if let Some((before, factor)) = views.iter().find_map(|view| view.before).filter(|(before, _)| *before > 0 && entries >= *before) {
             let least = entries as f64 * factor as f64 / before as f64;
             if least > limits.max_factor_entries as f64 {
                 return Err(Error::Limit(format!(

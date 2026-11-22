@@ -651,34 +651,44 @@ struct Tally {
     material: Vec<([f64; 3], [f64; 3])>,
 }
 
-impl Solution {
-    /// The cells to divide next ([`Options::adapt`]): the leaves whose elements carry the share
-    /// `share` of the indicator's sum, largest first, each by its level and its place, with
-    /// the cells above it (a cell is divided only when the cells above it are).
-    fn least_resolved(&self, share: f64) -> BTreeSet<(u8, [u32; 3])> {
-        let mut order: Vec<usize> = (0..self.surplus.len()).collect();
-        // Largest first, the lower element first among equals.
-        order.sort_by(|a, b| self.surplus[*b].total_cmp(&self.surplus[*a]).then(a.cmp(b)));
-        let total: f64 = self.surplus.iter().filter(|s| s.is_finite()).sum();
-        let mut marked = BTreeSet::new();
-        let mut sum = 0.0;
-        for element in order {
-            let Some(surplus) = self.surplus.get(element).copied().filter(|s| s.is_finite() && *s > 0.0) else { continue };
-            if !(sum < share * total) {
-                break;
-            }
-            sum += surplus;
-            let Some(cell) = self.space.elements.get(element).and_then(|node| self.tree.nodes.get(*node as usize)) else { continue };
-            if usize::from(cell.level) >= MAX_REFINE {
-                continue;
-            }
+/// The cells to divide next ([`Options::adapt`]) in each of the solutions of one step (one
+/// body's, or those of the bodies of an assembly, which are ranked together: the indicator is
+/// an energy, the same measure in every body): the leaves whose elements carry the share
+/// `share` of the indicator's sum, largest first, each by its level and its place, with the
+/// cells above it (a cell is divided only when the cells above it are).
+pub(crate) fn least_resolved(solutions: &[&Solution], share: f64) -> Vec<BTreeSet<(u8, [u32; 3])>> {
+    let surplus = |body: usize, element: usize| solutions.get(body).and_then(|solution| solution.surplus.get(element)).copied().unwrap_or(f64::NAN);
+    let mut order: Vec<(usize, usize)> =
+        solutions.iter().enumerate().flat_map(|(body, solution)| (0..solution.surplus.len()).map(move |element| (body, element))).collect();
+    // Largest first, the lower body and element first among equals.
+    order.sort_by(|a, b| surplus(b.0, b.1).total_cmp(&surplus(a.0, a.1)).then(a.cmp(b)));
+    let total: f64 = solutions.iter().map(|solution| solution.surplus.iter().filter(|s| s.is_finite()).sum::<f64>()).sum();
+    let mut marked = vec![BTreeSet::new(); solutions.len()];
+    let mut sum = 0.0;
+    for (body, element) in order {
+        let own = surplus(body, element);
+        if !(own.is_finite() && own > 0.0) {
+            continue;
+        }
+        if !(sum < share * total) {
+            break;
+        }
+        sum += own;
+        let Some(solution) = solutions.get(body) else { continue };
+        let Some(cell) = solution.space.elements.get(element).and_then(|node| solution.tree.nodes.get(*node as usize)) else { continue };
+        if usize::from(cell.level) >= MAX_REFINE {
+            continue;
+        }
+        if let Some(cells) = marked.get_mut(body) {
             for up in 0..=cell.level {
-                marked.insert((cell.level - up, cell.ijk.map(|i| i >> up)));
+                cells.insert((cell.level - up, cell.ijk.map(|i| i >> up)));
             }
         }
-        marked
     }
+    marked
+}
 
+impl Solution {
     fn place(&self) -> Place<'_> {
         Place { grid: &self.grid, tree: &self.tree, space: &self.space, split: &self.split }
     }
@@ -885,6 +895,13 @@ impl Solution {
     /// never settles. A ratio whose denominator is zero is zero when nothing changed and
     /// infinite otherwise.
     pub fn change_from(&self, coarser: &Solution, points: &[[f64; 3]]) -> Change {
+        Solution::change_of(&[(self, coarser, points)])
+    }
+
+    /// [`Solution::change_from`] of several bodies solved together: each body's solution, its
+    /// coarser one and its points. The strain energies are those of all the bodies, and the
+    /// peak is the largest von Mises stress in any of them.
+    pub fn change_of(bodies: &[(&Solution, &Solution, &[[f64; 3]])]) -> Change {
         let ratio = |change: f64, of: f64| {
             if of != 0.0 {
                 change / of
@@ -895,18 +912,23 @@ impl Solution {
             }
         };
         let (mut peak, mut peak_coarser, mut apart, mut count) = (0.0f64, 0.0f64, 0.0f64, 0usize);
-        for x in points {
-            let (Some(fine), Some(coarse)) = (self.von_mises(*x), coarser.von_mises(*x)) else { continue };
-            if !(fine.is_finite() && coarse.is_finite()) {
-                continue;
+        let (mut energy, mut energy_coarser) = (0.0, 0.0);
+        for (finer, coarser, points) in bodies {
+            energy += finer.strain_energy;
+            energy_coarser += coarser.strain_energy;
+            for x in *points {
+                let (Some(fine), Some(coarse)) = (finer.von_mises(*x), coarser.von_mises(*x)) else { continue };
+                if !(fine.is_finite() && coarse.is_finite()) {
+                    continue;
+                }
+                peak = peak.max(fine);
+                peak_coarser = peak_coarser.max(coarse);
+                apart = apart.max((fine - coarse).abs());
+                count += 1;
             }
-            peak = peak.max(fine);
-            peak_coarser = peak_coarser.max(coarse);
-            apart = apart.max((fine - coarse).abs());
-            count += 1;
         }
         Change {
-            strain_energy: ratio(self.strain_energy - coarser.strain_energy, self.strain_energy),
+            strain_energy: ratio(energy - energy_coarser, energy),
             peak_von_mises: ratio(peak - peak_coarser, peak),
             von_mises: ratio(apart, peak),
             points: count,
@@ -1086,12 +1108,10 @@ pub fn solve(
     // solution is least resolved in and solves again, as the first solve was solved in the end
     // (with the levels where gaps end that fitted, with the pieces joined if they had to be).
     for round in 0..options.adapt.min(MAX_REFINE) {
-        let before = next.asked.len();
-        next.asked.extend(solution.least_resolved(Options::SHARE));
-        if next.asked.len() == before {
+        let cells = least_resolved(&[&solution], Options::SHARE).pop().unwrap_or_default();
+        if !next.ask(cells, &solution) {
             break;
         }
-        next.before = Some((solution.stats.stiffness_entries, solution.stats.factor_entries));
         match solve_raising(surface, material, supports, loads, &used, limits, None, &next, &alone) {
             Ok(mut finer) => {
                 finer.stats.rounds = round + 1;
@@ -1125,7 +1145,7 @@ fn alone(limits: &Limits) -> impl Fn(&View) -> Result<Solved> + '_ {
 
 /// What a solve of [`solve`] takes from the solves before it ([`Options::adapt`]).
 #[derive(Default)]
-struct Round {
+pub(crate) struct Round {
     /// The cells to divide besides those the surface's curvature names, by level and place.
     asked: BTreeSet<(u8, [u32; 3])>,
     /// The entries of the stiffness and of its factor in the solve before, when there was one.
@@ -1134,6 +1154,17 @@ struct Round {
     /// its integrals ([`Options::reuse`]), and whether their pieces of material were told apart
     /// ([`Options::separate`]).
     cuts: RefCell<(bool, BTreeMap<(u8, [u32; 3]), Arc<CutLeaf>>)>,
+}
+
+impl Round {
+    /// Ask the next solve to divide `cells` as well, after `solution`, the solve before it;
+    /// whether any of them was not asked for already.
+    pub(crate) fn ask(&mut self, cells: BTreeSet<(u8, [u32; 3])>, solution: &Solution) -> bool {
+        let before = self.asked.len();
+        self.asked.extend(cells);
+        self.before = Some((solution.stats.stiffness_entries, solution.stats.factor_entries));
+        self.asked.len() > before
+    }
 }
 
 /// One solve of [`solve`] with exactly these options: dividing the cells `marker` names (up to
@@ -1212,8 +1243,10 @@ pub(crate) fn most_fictitious(material: &Material) -> Result<f64> {
     Ok(margin_fraction(&material.lame()?).min(1.0))
 }
 
-/// One body of several ([`crate::assembly`]): its solve with exactly these options and this
-/// fictitious stiffness, its faces tied as `ties` say, its equations handed to `join`.
+/// One body of several ([`crate::assembly`]): one solve of it with exactly these options and
+/// this fictitious stiffness, dividing the cells `round` asks for besides, its faces tied as
+/// `ties` say, its equations handed to `join`. The rounds of [`Options::adapt`] are the
+/// caller's to run, over all the bodies together.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn solve_tied(
     surface: &BoundarySurface,
@@ -1223,12 +1256,12 @@ pub(crate) fn solve_tied(
     options: &Options,
     limits: &Limits,
     fictitious: f64,
+    round: &Round,
     ties: &Ties,
     join: Join,
 ) -> Result<Solution> {
     options.check()?;
-    let alone = Options { adapt: 0, ..*options };
-    solve_at(surface, material, supports, loads, &alone, limits, fictitious, None, &Round::default(), Some(ties), join)
+    solve_at(surface, material, supports, loads, options, limits, fictitious, None, round, Some(ties), join)
 }
 
 /// How much the fictitious stiffness is raised at a time when the system is singular to working

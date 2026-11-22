@@ -246,6 +246,20 @@ fn one_body_and_hostile_assemblies() {
     let alone = fieldcraft_fcm::solve(&bar, &STEEL, &supports, &loads, &options, &Limits::default()).unwrap();
     let one = solve_assembly(&[part], &[], &Limits::default()).unwrap();
     assert_eq!(one[0].strain_energy.to_bits(), alone.strain_energy.to_bits());
+    // With rounds that follow the solution too: the same cells are divided, round by round.
+    let bent = [Load::Traction { face: 1, traction: [0.0, 0.0, 1e6] }];
+    let fixed = [Support { face: 0, fixed: [true; 3], value: [0.0; 3] }];
+    let rounds = Options { adapt: 2, ..options };
+    let alone = fieldcraft_fcm::solve(&bar, &STEEL, &fixed, &bent, &rounds, &Limits::default()).unwrap();
+    let one = solve_assembly(&[Part { supports: &fixed, loads: &bent, options: rounds, ..part }], &[], &Limits::default()).unwrap();
+    assert_eq!(alone.stats.rounds, 2);
+    assert_eq!((one[0].stats.rounds, one[0].stats.unknowns), (alone.stats.rounds, alone.stats.unknowns));
+    assert_eq!(one[0].strain_energy.to_bits(), alone.strain_energy.to_bits());
+    assert_eq!(one[0].stats.settled.to_bits(), alone.stats.settled.to_bits());
+    // And the change from a coarser solution is the one body's.
+    let lower = fieldcraft_fcm::solve(&bar, &STEEL, &fixed, &bent, &Options { degree: 1, ..rounds }, &Limits::default()).unwrap();
+    let points = [[0.5, 0.25, 0.25], [0.1, 0.4, 0.1], [0.9, 0.1, 0.4]];
+    assert_eq!(Solution::change_of(&[(&alone, &lower, &points)]), alone.change_from(&lower, &points));
     let limits = Limits::default();
     let refused = |bonds: &[Bond]| matches!(solve_assembly(&[part, part], bonds, &limits), Err(Error::Invalid(_)));
     assert!(matches!(solve_assembly(&[], &[], &limits), Err(Error::Invalid(_))));
@@ -654,4 +668,101 @@ fn a_body_a_sliding_connection_leaves_free_is_refused() {
     let solutions = solutions.unwrap();
     let reaction = solutions[0].reactions.iter().find(|r| r.face == 4).unwrap().force;
     assert!((reaction[2] - 2.0e5).abs() < 1e-6 * 2.0e5 && reaction[0].abs() < 1e-6 * 2.0e5 && reaction[1].abs() < 1e-6 * 2.0e5, "{reaction:?}");
+}
+
+/// Rounds that follow the solution, over the bodies of an assembly together: a post bonded to
+/// a clamped plate and pushed over. Each round divides the cells the assembly is least resolved
+/// in, whichever body they are in, and solves all of it again: the strain energy rises (the
+/// spaces are nested and the loads prescribed), the reactions still balance, and the rounds end
+/// when one moves the energy by no more than asked, or when the next would be too large.
+#[test]
+fn rounds_follow_the_solution_over_all_the_bodies() {
+    let (plate, post) = (block([0.0; 3], [2.0, 1.5, 0.3]), block([0.6, 0.5, 0.3], [1.1, 0.9, 1.0]));
+    let clamp = [Support { face: 4, fixed: [true; 3], value: [0.0; 3] }];
+    let push = [Load::Force { face: 1, force: [3.0e5, 0.0, 0.0] }, Load::Force { face: 5, force: [0.0, 1.0e5, -2.0e5] }];
+    let bond = Bond { first: (0, vec![5]), second: (1, vec![4]), tolerance: 1e-6, grip: Grip::Bonded };
+    let solve = |adapt: usize, settle: f64, limits: &Limits| {
+        let parts = [
+            Part {
+                surface: &plate,
+                material: STEEL,
+                supports: &clamp,
+                loads: &[],
+                options: Options { degree: 2, adapt, settle, offset: [0.37, 0.21, 0.43], ..Options::new(0.25) },
+                curved: &[],
+            },
+            Part {
+                surface: &post,
+                material: STEEL,
+                supports: &[],
+                loads: &push,
+                options: Options { degree: 2, adapt, settle, offset: [0.17, 0.41, 0.29], ..Options::new(0.2) },
+                curved: &[],
+            },
+        ];
+        solve_assembly(&parts, std::slice::from_ref(&bond), limits).unwrap()
+    };
+    let energy = |solutions: &[Solution]| solutions.iter().map(|s| s.strain_energy).sum::<f64>();
+    let unknowns = |solutions: &[Solution]| solutions.iter().map(|s| s.stats.unknowns).sum::<usize>();
+    let (none, one, two) = (solve(0, 0.0, &Limits::default()), solve(1, 0.0, &Limits::default()), solve(2, 0.0, &Limits::default()));
+    for (rounds, solutions) in [(0, &none), (1, &one), (2, &two)] {
+        // The rounds are the assembly's: every body's solution counts the same.
+        assert!(solutions.iter().all(|s| s.stats.rounds == rounds && !s.stats.left_out), "{rounds} rounds");
+        assert_eq!(solutions[0].stats.settled.to_bits(), solutions[1].stats.settled.to_bits());
+        let reaction = solutions[0].reactions.iter().find(|r| r.face == 4).unwrap().force;
+        for (i, applied) in [3.0e5, 1.0e5, -2.0e5].into_iter().enumerate() {
+            assert!((reaction[i] + applied).abs() < 1e-6 * 3.0e5, "{rounds} rounds, component {i}: {}", reaction[i]);
+        }
+        println!(
+            "{rounds} rounds: {} + {} unknowns, energy {:.6e}, settled {:.3e}",
+            solutions[0].stats.unknowns,
+            solutions[1].stats.unknowns,
+            energy(solutions),
+            solutions[0].stats.settled
+        );
+    }
+    assert!(energy(&one) > energy(&none) && energy(&two) > energy(&one), "the energy rises with every round");
+    assert!(unknowns(&one) > unknowns(&none) && unknowns(&two) > unknowns(&one));
+    assert!(two[0].stats.settled > 0.0 && two[0].stats.settled < one[0].stats.settled, "each round moves the energy by less");
+    // The cells go where the solution is least resolved: the plate, which is as large again as
+    // the post, gets far fewer of them than its share.
+    let added = |body: usize| two[body].stats.unknowns - none[body].stats.unknowns;
+    assert!(added(0) > 0 && added(1) > 0 && added(0) < added(1) * none[0].stats.unknowns / none[1].stats.unknowns, "{} and {}", added(0), added(1));
+
+    // A round that moves the energy by no more than asked is the last.
+    let settled = solve(6, one[0].stats.settled.sqrt() * 1.001, &Limits::default());
+    assert_eq!(settled[0].stats.rounds, 1);
+    // A round too large for a limit is left out, and the solutions before it stand.
+    let first = solve(2, 0.0, &Limits { max_dofs: unknowns(&two) - 1, ..Limits::default() });
+    assert!(first.iter().all(|s| s.stats.left_out && s.stats.rounds == 1), "{:?}", first[0].stats.rounds);
+    assert_eq!(unknowns(&first), unknowns(&one));
+
+    // How far the solution is from the one a degree lower, over both bodies.
+    let lower = {
+        let parts = [
+            Part {
+                surface: &plate,
+                material: STEEL,
+                supports: &clamp,
+                loads: &[],
+                options: Options { degree: 1, offset: [0.37, 0.21, 0.43], ..Options::new(0.25) },
+                curved: &[],
+            },
+            Part {
+                surface: &post,
+                material: STEEL,
+                supports: &[],
+                loads: &push,
+                options: Options { degree: 1, offset: [0.17, 0.41, 0.29], ..Options::new(0.2) },
+                curved: &[],
+            },
+        ];
+        solve_assembly(&parts, std::slice::from_ref(&bond), &Limits::default()).unwrap()
+    };
+    let (on_plate, on_post) = ([[1.5, 1.0, 0.3], [0.3, 0.3, 0.0]], [[0.85, 0.7, 1.0], [0.6, 0.7, 0.6], [1.1, 0.7, 0.35]]);
+    let change = Solution::change_of(&[(&none[0], &lower[0], &on_plate), (&none[1], &lower[1], &on_post)]);
+    println!("against degree 1: {change:?}");
+    assert_eq!(change.points, 5);
+    assert!((change.strain_energy - (energy(&none) - energy(&lower)) / energy(&none)).abs() < 1e-15 && change.strain_energy > 0.01, "{change:?}");
+    assert!(change.von_mises > 0.0 && change.von_mises.is_finite() && change.peak_von_mises.is_finite(), "{change:?}");
 }
