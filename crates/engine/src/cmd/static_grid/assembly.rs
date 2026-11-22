@@ -44,13 +44,45 @@ struct Prepared<'a> {
     /// The body's volume and the area of its surface.
     volume: f64,
     skin: f64,
+    /// The round surfaces its faces lie on, for the normals of those that slide.
+    curved: Vec<(u32, Curved)>,
+}
+
+/// The cylinders, cones, spheres and tori the faces of a body lie on, by face, in the solver's
+/// unit: the geometry's are in millimetres.
+fn curved(shape: &Shape) -> Result<Vec<(u32, Curved)>> {
+    let point = crate::units::geometry_point;
+    let surfaces = shape.face_surfaces()?;
+    Ok(surfaces
+        .into_iter()
+        .enumerate()
+        .filter_map(|(face, surface)| {
+            let surface = match surface? {
+                FaceSurface::Plane { .. } => return None,
+                FaceSurface::Cylinder { origin, axis, .. } => Curved::Cylinder { origin: point(origin), axis },
+                FaceSurface::Cone { apex, axis, half_angle } => Curved::Cone { apex: point(apex), axis, half_angle },
+                FaceSurface::Sphere { center, .. } => Curved::Sphere { centre: point(center) },
+                FaceSurface::Torus { center, axis, major, .. } => {
+                    Curved::Torus { centre: point(center), axis, major: crate::units::geometry_length(major) }
+                }
+            };
+            Some((u32::try_from(face).ok()?, surface))
+        })
+        .collect())
 }
 
 /// The bodies as the solver takes them.
 fn parts_of<'a>(prepared: &'a [Prepared]) -> Vec<Part<'a>> {
     prepared
         .iter()
-        .map(|body| Part { surface: &body.surface, material: body.material, supports: &body.supports, loads: &body.loads, options: body.options })
+        .map(|body| Part {
+            surface: &body.surface,
+            material: body.material,
+            supports: &body.supports,
+            loads: &body.loads,
+            options: body.options,
+            curved: &body.curved,
+        })
         .collect()
 }
 
@@ -183,6 +215,7 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
             thin,
             volume,
             skin,
+            curved: curved(shape)?,
         });
     }
     // Cells of a size that was asked for are refused before anything is built on them; ours

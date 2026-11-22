@@ -713,7 +713,7 @@ mod tests {
                 }
             }
             let faces = BTreeMap::from([(7u32, Face { fixed: [true; 3], ..Face::default() })]);
-            let surface = Surface { normals: &[[0.0, -1.0, 0.0]], tags: &[7], faces: &faces, touching: None };
+            let surface = Surface { normals: &[[0.0, -1.0, 0.0]], tags: &[7], faces: &faces, touching: None, curved: &crate::cell::NO_CURVES };
             let mut checked = 0;
             for element in 0..space.elements.len() {
                 let Some(map) = space.map(element) else { continue };

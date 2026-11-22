@@ -14,9 +14,9 @@
 use std::collections::BTreeMap;
 
 use fieldcraft_fcm::{
-    Basis, Bond, Load as GridLoad, Material as GridMaterial, Options, Part, Solution, Support, assembly_unknowns, find_bonds, solve_assembly,
+    Basis, Bond, Curved, Load as GridLoad, Material as GridMaterial, Options, Part, Solution, Support, assembly_unknowns, find_bonds, solve_assembly,
 };
-use fieldcraft_geometry::Shape;
+use fieldcraft_geometry::{FaceSurface, Shape};
 use fieldcraft_mesh::surface::{BoundarySurface, SurfaceOptions};
 use fieldcraft_model::units::Quantity;
 use fieldcraft_model::{BoundaryCondition, Elastic, ElementKind, Entity, GeometryRef, Load, Model, Procedure, SectionKind, Step, Target};

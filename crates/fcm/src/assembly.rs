@@ -1,9 +1,10 @@
-//! Several bodies in one solve, bonded where they touch.
+//! Several bodies in one solve, joined where they touch.
 //!
 //! Every body is solved as one body is ([`crate::solve`]): on a grid of its own, with its own
 //! cell size, material, supports and loads, its cells cut by its own surface. Two bodies share
 //! no unknown, however close they are, so nothing joins them by accident; what joins them is a
-//! [`Bond`], which names faces of the two that may touch.
+//! [`Bond`], which names faces of the two that may touch and says how the two hold each other
+//! there: bonded, or sliding ([`Grip`]).
 //!
 //! # A bond
 //! Where the faces touch, the displacements of the two bodies are made equal weakly, by
@@ -28,6 +29,34 @@
 //! which are what a prescribed displacement's load would be if B's displacement were known.
 //! A is the body whose named faces have the smaller area: the face that is more likely to be
 //! covered by the other.
+//!
+//! # A sliding connection
+//! Two bodies that keep touching and slide along each other without friction share only the
+//! component of the displacement across the faces, and pull on each other only across them.
+//! With n the normal of A's face, tₙ(u) = n · σ_A(u) n and [u]ₙ = [u] · n, the terms are those
+//! of a bond with the traction and the jump replaced by their parts along n:
+//!
+//! a(u, v) += − ∫ tₙ(u_A) [v]ₙ dΓ − ∫ tₙ(v_A) [u]ₙ dΓ + β ∫ [u]ₙ [v]ₙ dΓ,
+//!
+//! the frictionless limit of the sliding interface of C. Annavarapu, M. Hautefeuille,
+//! J. E. Dolbow, *A Nitsche stabilized finite element method for frictional sliding on embedded
+//! interfaces. Part I: Single interface*, Comput. Methods Appl. Mech. Engrg. 268:417–436, 2014,
+//! for two bodies that do not part: the solve is linear, so a sliding connection pulls as well
+//! as it pushes (it is not contact). The tangential traction of the exact solution vanishes on
+//! Γ, so the terms are consistent like a bond's.
+//!
+//! **The normal of a curved face.** The triangles of a round face are flat, and held across
+//! every one of them a pin could not turn in its hole: the facets would lock it like a spline.
+//! A face named in [`Part::curved`] with the surface it lies on (a cylinder, a sphere, a cone,
+//! a torus) takes its normal from that surface at every point, and the pin turns and slides.
+//! Other curved faces keep their triangles' normals, which is right for a face swept along a
+//! line (it slides along the line) and stiffer than the surface for any other.
+//!
+//! # Bodies left free
+//! A sliding connection holds less than a bond, and bodies it leaves free to move have no
+//! static solution. Before anything is solved, [`free_motions`] finds the rigid motions that no
+//! support and no connection resists (the null space of the bodies' restraints on their six
+//! motions each), and the solve is refused with them.
 //!
 //! # Where two faces touch
 //! Γ is not drawn; it is found. The pieces of A's named faces are integrated by their quadrature
@@ -60,6 +89,7 @@ use fieldcraft_solver::cholesky::{Factor, UpperColumns};
 use fieldcraft_solver::ordering::element_dissection;
 use fieldcraft_solver::sparse::{NodeGraph, add_block};
 
+use crate::cell::{Curved, Grip};
 use crate::grid::{self, Grid, cross, dot, sub};
 use crate::islands::closest_point;
 use crate::refine::Tree;
@@ -83,9 +113,13 @@ pub struct Part<'a> {
     pub loads: &'a [Load],
     /// The grid of this body ([`Options::adapt`] is not run for a body of an assembly yet).
     pub options: Options,
+    /// The faces that lie on a cylinder, a sphere, a cone or a torus, each with its surface: a
+    /// face that slides on another body takes its normal from it ([`Curved`]). Faces not listed
+    /// have the normals of their triangles, which is exact for flat ones.
+    pub curved: &'a [(u32, Curved)],
 }
 
-/// Two bodies bonded where faces of theirs touch.
+/// Two bodies joined where faces of theirs touch.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Bond {
     /// A body (its index among the parts) and the faces of it (their tags) that may touch the
@@ -96,6 +130,8 @@ pub struct Bond {
     /// length: above the rounding of flat faces that lie on each other, and above the chordal
     /// tolerance of the triangulations where curved faces do.
     pub tolerance: f64,
+    /// How the two hold each other where they touch.
+    pub grip: Grip,
 }
 
 /// The triangles of the faces of one body that a bond names (or of all its faces), sorted into
@@ -212,6 +248,7 @@ struct Coupling {
     faces: BTreeSet<u32>,
     other: usize,
     reach: Reach,
+    grip: Grip,
 }
 
 /// What the nested solves of the bodies share.
@@ -224,6 +261,8 @@ struct Shared<'a> {
     tied: &'a [BTreeSet<u32>],
     held: &'a [bool],
     fictitious: &'a [f64],
+    /// Of each body: the curved surfaces its faces lie on.
+    curved: &'a [BTreeMap<u32, Curved>],
     /// The cells of each body, once its solve has them: a copy the other bodies' pieces are
     /// cut along.
     frames: &'a [OnceLock<(Grid, Tree)>],
@@ -234,17 +273,18 @@ struct Shared<'a> {
     solutions: RefCell<Vec<Option<Solution>>>,
 }
 
-/// The body a point of a tied face of `body` touches, and the nearest point of its faces.
+/// The connection through which a point of a tied face of `body` touches another body (its
+/// place among the couplings), and the nearest point of that body's faces.
 fn partner(couplings: &[Coupling], body: usize, tag: u32, x: [f64; 3]) -> Option<(usize, [f64; 3])> {
     let mut best: Option<(usize, [f64; 3], f64)> = None;
-    for coupling in couplings.iter().filter(|coupling| coupling.flux == body && coupling.faces.contains(&tag)) {
+    for (at, coupling) in couplings.iter().enumerate().filter(|(_, coupling)| coupling.flux == body && coupling.faces.contains(&tag)) {
         if let Some((y, apart)) = coupling.reach.nearest(x)
             && best.is_none_or(|(_, _, least)| apart < least)
         {
-            best = Some((coupling.other, y, apart));
+            best = Some((at, y, apart));
         }
     }
-    best.map(|(other, y, _)| (other, y))
+    best.map(|(at, y, _)| (at, y))
 }
 
 /// The views of the bodies whose solves are under way, the last first.
@@ -262,21 +302,29 @@ fn broken(what: &str) -> Error {
 fn nest(shared: &Shared, index: usize, up: Option<&Chain>) -> Result<()> {
     let part = shared.parts.get(index).ok_or_else(|| broken("a body is missing"))?;
     let (couplings, frames) = (shared.couplings, shared.frames);
-    let touching = |tag: u32, piece: &[[f64; 3]; 3], visit: &mut dyn FnMut(&[[f64; 3]; 3], &dyn Fn([f64; 3]) -> bool)| {
-        // The bodies this face is bonded to, each once.
-        let others: BTreeSet<usize> =
-            couplings.iter().filter(|coupling| coupling.flux == index && coupling.faces.contains(&tag)).map(|coupling| coupling.other).collect();
-        for other in others {
-            let touches = |x: [f64; 3]| partner(couplings, index, tag, x).is_some_and(|(body, _)| body == other);
+    let touching = |tag: u32, piece: &[[f64; 3]; 3], visit: &mut dyn FnMut(&[[f64; 3]; 3], &dyn Fn([f64; 3]) -> bool, Grip)| {
+        // The bodies this face is tied to and how, each once.
+        let ways: BTreeSet<(usize, Grip)> = couplings
+            .iter()
+            .filter(|coupling| coupling.flux == index && coupling.faces.contains(&tag))
+            .map(|coupling| (coupling.other, coupling.grip))
+            .collect();
+        for (other, grip) in ways {
+            let touches = |x: [f64; 3]| {
+                partner(couplings, index, tag, x)
+                    .and_then(|(found, _)| couplings.get(found))
+                    .is_some_and(|coupling| coupling.other == other && coupling.grip == grip)
+            };
             match frames.get(other).and_then(OnceLock::get) {
-                Some((grid, tree)) => leaf_parts(grid, tree, piece, &mut |part| visit(part, &touches)),
-                None => visit(piece, &touches),
+                Some((grid, tree)) => leaf_parts(grid, tree, piece, &mut |part| visit(part, &touches, grip)),
+                None => visit(piece, &touches, grip),
             }
         }
     };
     let ties = Ties {
         faces: shared.tied.get(index).ok_or_else(|| broken("a body's ties are missing"))?,
         touching: &touching,
+        curved: shared.curved.get(index).ok_or_else(|| broken("a body's curved faces are missing"))?,
         held: shared.held.get(index).copied().unwrap_or(false),
     };
     let join = |view: &View| -> Result<Solved> {
@@ -301,7 +349,10 @@ fn nest(shared: &Shared, index: usize, up: Option<&Chain>) -> Result<()> {
                 count.set(Some(views.iter().fold(0usize, |sum, view| sum.saturating_add(3 * view.count))));
                 return Err(broken("counted"));
             }
-            let solved = solve_system(&views, &|body, tag, x| partner(couplings, body, tag, x), shared.limits)?;
+            let touched = |body: usize, tag: u32, x: [f64; 3]| {
+                partner(couplings, body, tag, x).and_then(|(found, y)| couplings.get(found).map(|coupling| (coupling.other, y)))
+            };
+            let solved = solve_system(&views, &touched, shared.limits)?;
             let mut kept = shared.solved.try_borrow_mut().map_err(|_| broken("the solutions are in use"))?;
             *kept = solved.into_iter().map(Some).collect();
         }
@@ -318,12 +369,13 @@ fn nest(shared: &Shared, index: usize, up: Option<&Chain>) -> Result<()> {
     Ok(())
 }
 
-/// The bonds as the solves read them, and of each body the faces a bond takes the traction of
-/// and whether a bond holds it.
+/// The bonds as the solves read them, and of each body the faces a bond takes the traction of,
+/// whether a bond holds it, and the curved surfaces its faces lie on.
 struct Bonded {
     couplings: Vec<Coupling>,
     tied: Vec<BTreeSet<u32>>,
     held: Vec<bool>,
+    curved: Vec<BTreeMap<u32, Curved>>,
 }
 
 /// The bonds of an assembly, checked.
@@ -371,16 +423,271 @@ fn couplings(parts: &[Part], bonds: &[Bond]) -> Result<Bonded> {
         if let Some(own) = held.get_mut(other.0) {
             *own = true;
         }
-        couplings.push(Coupling { flux: flux.0, faces, other: other.0, reach: Reach::new(surface, Some(&others), bond.tolerance)? });
+        couplings.push(Coupling { flux: flux.0, faces, other: other.0, reach: Reach::new(surface, Some(&others), bond.tolerance)?, grip: bond.grip });
     }
-    Ok(Bonded { couplings, tied, held })
+    let curved = parts.iter().map(|part| part.curved.iter().copied().collect()).collect();
+    Ok(Bonded { couplings, tied, held, curved })
+}
+
+/// A motion nothing resists: bodies that move as rigid pieces against no support and no
+/// connection ([`free_motions`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Motion {
+    /// The bodies that move, each with the displacement of the middle of its box and its turn
+    /// about that point: a vector along the axis, as long as the displacement the turn gives a
+    /// point half the box's diagonal away. All are scaled together, the largest number to 1.
+    pub bodies: Vec<(usize, [f64; 3], [f64; 3])>,
+}
+
+/// The least share of the strongest restraint that still holds a motion ([`free_motions`]): a
+/// connection over a patch a hundred-thousandth of a body's size across still holds the body
+/// against turning about it, with (1e-5)², and the rounding of the decomposition, about 1e-13
+/// for the most bodies there can be (N. J. Higham, *Analysis of the Cholesky decomposition of a
+/// semi-definite matrix*, in Reliable Numerical Computation, Oxford University Press,
+/// 1990, pp. 161–185), does not.
+const HELD: f64 = 1e-10;
+/// A body moves in a motion when its share of it is above this part of the largest.
+const MOVES: f64 = 1e-6; // unit-factors: a ratio of two displacements
+
+/// The rigid motions of the bodies that nothing resists: no support and no bond, and no sliding
+/// connection across its faces. With any, the bodies have no static solution; an assembly that
+/// can be solved has none.
+///
+/// Every body has six rigid motions, and every restraint resists some of them: a support those
+/// that move its face in a fixed component, a bond those that move the two bodies apart where
+/// they touch, a sliding connection those that move them apart across the faces. The energy of
+/// each restraint under the motions, ∫ |P (r_A − r_B)|² dΓ over its area, summed over all of
+/// them is a positive semi-definite matrix of six rows a body, and the motions it gives no
+/// energy are free. They are found by its Cholesky decomposition with complete pivoting, which
+/// reveals its rank (Higham 1990, as at [`HELD`]): one motion for every pivot that is left
+/// below [`HELD`] of the largest.
+pub fn free_motions(parts: &[Part], bonds: &[Bond]) -> Result<Vec<Motion>> {
+    let Bonded { couplings, curved, .. } = couplings(parts, bonds)?;
+    motions(parts, &couplings, &curved)
+}
+
+/// [`free_motions`] of the bonds as the solves read them.
+fn motions(parts: &[Part], couplings: &[Coupling], curved: &[BTreeMap<u32, Curved>]) -> Result<Vec<Motion>> {
+    let n = 6 * parts.len();
+    // Each body's motions: three displacements, and three turns about the middle of its box,
+    // scaled by half its diagonal so that all six move its points by about as much.
+    let frames: Vec<([f64; 3], f64)> = parts
+        .iter()
+        .map(|part| {
+            let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+            for point in part.surface.points() {
+                for a in 0..3 {
+                    lo[a] = lo[a].min(point[a]);
+                    hi[a] = hi[a].max(point[a]);
+                }
+            }
+            let reach = 0.5 * dot(sub(hi, lo), sub(hi, lo)).sqrt();
+            ([0, 1, 2].map(|a| 0.5 * (lo[a] + hi[a])), if reach > 0.0 && reach.is_finite() { reach } else { 1.0 })
+        })
+        .collect();
+    let moved = |body: usize, x: [f64; 3]| -> [[f64; 3]; 6] {
+        let (centre, reach) = frames.get(body).copied().unwrap_or(([0.0; 3], 1.0));
+        let arm = sub(x, centre).map(|c| c / reach);
+        let mut motions = [[0.0; 3]; 6];
+        for axis in 0..3 {
+            motions[axis][axis] = 1.0;
+            let mut along = [0.0; 3];
+            along[axis] = 1.0;
+            motions[3 + axis] = cross(along, arm);
+        }
+        motions
+    };
+    // The triangles of the faces of a body a restraint names, each by the middles of its sides
+    // with a third of its area: exact for the squares of the motions, which are linear.
+    let sampled = |body: usize, faces: &dyn Fn(u32) -> bool, visit: &mut dyn FnMut(u32, [f64; 3], [f64; 3], f64)| {
+        let Some(part) = parts.get(body) else { return };
+        let points = part.surface.points();
+        for (triangle, tag) in part.surface.triangles().iter().zip(part.surface.tri_face()) {
+            if !faces(*tag) {
+                continue;
+            }
+            let [Some(a), Some(b), Some(c)] = triangle.map(|v| points.get(v as usize).copied()) else { continue };
+            let doubled = cross(sub(b, a), sub(c, a));
+            let length = dot(doubled, doubled).sqrt();
+            if !(length > 0.0 && length.is_finite()) {
+                continue;
+            }
+            let normal = doubled.map(|c| c / length);
+            for (p, q) in [(a, b), (b, c), (c, a)] {
+                visit(*tag, [0, 1, 2].map(|i| 0.5 * (p[i] + q[i])), normal, length / 6.0);
+            }
+        }
+    };
+    let mut gram = vec![0.0; n * n];
+    for (body, part) in parts.iter().enumerate() {
+        for support in part.supports {
+            let (mut energy, mut area) = ([[0.0; 6]; 6], 0.0);
+            sampled(body, &|tag| tag == support.face, &mut |_, x, _, weight| {
+                let motions = moved(body, x);
+                for i in 0..6 {
+                    for j in 0..6 {
+                        energy[i][j] += weight * (0..3).filter(|k| support.fixed[*k]).map(|k| motions[i][k] * motions[j][k]).sum::<f64>();
+                    }
+                }
+                area += weight;
+            });
+            if !(area > 0.0) {
+                continue;
+            }
+            for i in 0..6 {
+                for j in 0..6 {
+                    if let Some(slot) = gram.get_mut((6 * body + i) * n + 6 * body + j) {
+                        *slot += energy[i][j] / area;
+                    }
+                }
+            }
+        }
+    }
+    for coupling in couplings {
+        let (first, second) = (coupling.flux, coupling.other);
+        let surfaces = curved.get(first);
+        let (mut energy, mut area) = (vec![[0.0; 12]; 12], 0.0);
+        sampled(first, &|tag| coupling.faces.contains(&tag), &mut |tag, x, facet, weight| {
+            if coupling.reach.nearest(x).is_none() {
+                return;
+            }
+            let (own, other) = (moved(first, x), moved(second, x));
+            // The two bodies' motions apart: the first's, and the second's the other way.
+            let apart: [[f64; 3]; 12] = std::array::from_fn(|i| if i < 6 { own[i] } else { other[i - 6].map(|c| -c) });
+            let normal = match coupling.grip {
+                Grip::Bonded => None,
+                Grip::Sliding => Some(surfaces.and_then(|surfaces| surfaces.get(&tag)).map_or(facet, |surface| surface.normal(x, facet))),
+            };
+            for i in 0..12 {
+                for j in 0..12 {
+                    energy[i][j] += weight
+                        * match normal {
+                            None => dot(apart[i], apart[j]),
+                            Some(normal) => dot(apart[i], normal) * dot(apart[j], normal),
+                        };
+                }
+            }
+            area += weight;
+        });
+        if !(area > 0.0) {
+            continue;
+        }
+        let row = |i: usize| if i < 6 { 6 * first + i } else { 6 * second + i - 6 };
+        for i in 0..12 {
+            for j in 0..12 {
+                if let Some(slot) = gram.get_mut(row(i) * n + row(j)) {
+                    *slot += energy[i][j] / area;
+                }
+            }
+        }
+    }
+
+    // The decomposition with complete pivoting: the largest of the diagonal left is the next
+    // pivot, and when it is below the share of the first that holds, the rest is free.
+    let at = |i: usize, j: usize| i * n + j;
+    let mut order: Vec<usize> = (0..n).collect();
+    let largest = (0..n).map(|i| gram.get(at(i, i)).copied().unwrap_or(0.0)).fold(0.0, f64::max);
+    let mut rank = 0;
+    while rank < n {
+        let (mut pivot, mut value) = (rank, f64::NEG_INFINITY);
+        for i in rank..n {
+            let diagonal = gram.get(at(i, i)).copied().unwrap_or(0.0);
+            if diagonal > value {
+                (pivot, value) = (i, diagonal);
+            }
+        }
+        if !(value > HELD * largest && value.is_finite()) {
+            break;
+        }
+        if pivot != rank {
+            order.swap(pivot, rank);
+            for k in 0..n {
+                gram.swap(at(pivot, k), at(rank, k));
+            }
+            for k in 0..n {
+                gram.swap(at(k, pivot), at(k, rank));
+            }
+        }
+        let root = value.sqrt();
+        for i in rank + 1..n {
+            if let Some(slot) = gram.get_mut(at(i, rank)) {
+                *slot /= root;
+            }
+        }
+        for i in rank + 1..n {
+            let left = gram.get(at(i, rank)).copied().unwrap_or(0.0);
+            if left == 0.0 {
+                continue;
+            }
+            for j in rank + 1..n {
+                let other = gram.get(at(j, rank)).copied().unwrap_or(0.0);
+                if let Some(slot) = gram.get_mut(at(i, j)) {
+                    *slot -= left * other;
+                }
+            }
+        }
+        if let Some(slot) = gram.get_mut(at(rank, rank)) {
+            *slot = root;
+        }
+        rank += 1;
+    }
+    // One free motion for every column left: itself, with what the pivoted ones must add to it
+    // to give no energy, −L₁₁⁻ᵀ of its row of the factor.
+    let mut free = Vec::with_capacity(n - rank);
+    for column in rank..n {
+        let mut held: Vec<f64> = (0..rank).map(|k| -gram.get(at(column, k)).copied().unwrap_or(0.0)).collect();
+        for k in (0..rank).rev() {
+            let mut value = held.get(k).copied().unwrap_or(0.0);
+            for later in k + 1..rank {
+                value -= gram.get(at(later, k)).copied().unwrap_or(0.0) * held.get(later).copied().unwrap_or(0.0);
+            }
+            let pivot = gram.get(at(k, k)).copied().unwrap_or(1.0);
+            if let Some(slot) = held.get_mut(k) {
+                *slot = value / pivot;
+            }
+        }
+        let mut motion = vec![0.0; n];
+        for (k, value) in held.iter().enumerate() {
+            if let Some(slot) = order.get(k).and_then(|mode| motion.get_mut(*mode)) {
+                *slot = *value;
+            }
+        }
+        if let Some(slot) = order.get(column).and_then(|mode| motion.get_mut(*mode)) {
+            *slot = 1.0;
+        }
+        let most = motion.iter().fold(0.0f64, |most, value| most.max(value.abs()));
+        if !(most > 0.0 && most.is_finite()) {
+            return Err(broken("a free motion is not finite"));
+        }
+        let bodies = motion
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .enumerate()
+            .filter(|(_, own)| own.iter().any(|value| value.abs() > MOVES * most))
+            .map(|(body, own)| (body, [own[0], own[1], own[2]].map(|value| value / most), [own[3], own[4], own[5]].map(|value| value / most)))
+            .collect();
+        free.push(Motion { bodies });
+    }
+    Ok(free)
+}
+
+/// What a solve of bodies that can still move is refused with.
+fn refuse_free(motions: &[Motion]) -> Result<()> {
+    let Some(motion) = motions.first() else { return Ok(()) };
+    let bodies: Vec<String> = motion.bodies.iter().map(|(body, _, _)| body.to_string()).collect();
+    Err(Error::Invalid(format!(
+        "nothing holds body {} against {} of its rigid motions: a body needs supports and connections that leave it no way to slide or turn",
+        bodies.join(", "),
+        motions.len()
+    )))
 }
 
 /// The unknowns [`solve_assembly`] would solve for: the bodies' grids are built and their cells
 /// sorted, and nothing is integrated or solved. For choosing cell sizes that fit a budget
 /// before the work is done.
 pub fn assembly_unknowns(parts: &[Part], bonds: &[Bond], limits: &Limits) -> Result<usize> {
-    let Bonded { couplings, tied, held } = couplings(parts, bonds)?;
+    let Bonded { couplings, tied, held, curved } = couplings(parts, bonds)?;
     let fictitious: Vec<f64> = parts.iter().map(|part| part.options.fictitious).collect();
     let frames: Vec<OnceLock<(Grid, Tree)>> = (0..parts.len()).map(|_| OnceLock::new()).collect();
     let count = Cell::new(None);
@@ -391,6 +698,7 @@ pub fn assembly_unknowns(parts: &[Part], bonds: &[Bond], limits: &Limits) -> Res
         tied: &tied,
         held: &held,
         fictitious: &fictitious,
+        curved: &curved,
         frames: &frames,
         count: Some(&count),
         solved: RefCell::new(Vec::new()),
@@ -403,12 +711,13 @@ pub fn assembly_unknowns(parts: &[Part], bonds: &[Bond], limits: &Limits) -> Res
     }
 }
 
-/// Solve several bodies as one step, bonded where the faces a [`Bond`] names touch; the
-/// solutions come in the bodies' order. A body needs a support of its own or a bond that holds
-/// it. Refused like a single body's solve: a system above the limits, a body or a group of
-/// bodies that nothing holds.
+/// Solve several bodies as one step, joined where the faces a [`Bond`] names touch; the
+/// solutions come in the bodies' order. A body needs supports of its own or connections that
+/// hold it against every rigid motion ([`free_motions`]). Refused like a single body's solve: a
+/// system above the limits, a body or a group of bodies that can still move.
 pub fn solve_assembly(parts: &[Part], bonds: &[Bond], limits: &Limits) -> Result<Vec<Solution>> {
-    let Bonded { couplings, tied, held } = couplings(parts, bonds)?;
+    let Bonded { couplings, tied, held, curved } = couplings(parts, bonds)?;
+    refuse_free(&motions(parts, &couplings, &curved)?)?;
     // As small a fictitious stiffness as the factorization allows, as for one body: a hundred
     // times more at a time for every body, up to what its material leaves. Each step raises
     // one at least, so the loop ends.
@@ -423,6 +732,7 @@ pub fn solve_assembly(parts: &[Part], bonds: &[Bond], limits: &Limits) -> Result
             tied: &tied,
             held: &held,
             fictitious: &fictitious,
+            curved: &curved,
             frames: &frames,
             count: None,
             solved: RefCell::new(Vec::new()),
@@ -587,7 +897,12 @@ pub fn find_bonds(surfaces: &[&BoundarySurface], tolerance: f64) -> Result<Vec<T
                 }
             }
             if !faces.is_empty() {
-                let bond = Bond { first: (first, faces.into_iter().collect()), second: (second, others.into_iter().collect()), tolerance };
+                let bond = Bond {
+                    first: (first, faces.into_iter().collect()),
+                    second: (second, others.into_iter().collect()),
+                    tolerance,
+                    grip: Grip::Bonded,
+                };
                 touches.push(Touch { bond, area: total });
             }
         }
@@ -596,16 +911,22 @@ pub fn find_bonds(surfaces: &[&BoundarySurface], tolerance: f64) -> Result<Vec<T
 }
 
 /// What a bond adds between the functions of two elements, without the parameter β: the
-/// integrals over the points where the first's tied face touches the second.
+/// integrals over the points where the first's tied face touches the second and holds it one
+/// way, bonded or sliding.
 struct Pair {
-    /// ∫ t_l(v) N_b: for each of the first's unknowns, each component l of the traction, the
-    /// second's functions.
+    /// ∫ t_l(v) N_b: for each of the first's unknowns, each component l of the held traction,
+    /// the second's functions.
     flux: Vec<f64>,
-    /// ∫ N_a N_b, functions of the first by functions of the second.
+    /// ∫ N_a N_b, functions of the first by functions of the second: one number where the two
+    /// are bonded, and where they slide the six of ∫ N_a N_b n_k n_l ([`SYMMETRIC`]).
     mass: Vec<f64>,
-    /// ∫ N_b N_b′ of the second's functions.
+    /// ∫ N_b N_b′ of the second's functions, likewise.
     own: Vec<f64>,
 }
+
+/// Where the product of components k and l of the normal is kept among the six of a pair of
+/// functions.
+const SYMMETRIC: [[usize; 3]; 3] = [[0, 1, 2], [1, 3, 4], [2, 4, 5]];
 
 /// One matrix of the bodies whose `views` are ready: ordered, added up, factored and solved,
 /// with the blocks of the bonds; `partner` is the body a point of a tied face touches and the
@@ -626,7 +947,7 @@ pub(crate) fn solve_system(
     }
 
     // The bonds: the pairs of elements they couple.
-    let mut pairs: BTreeMap<(usize, usize, usize, usize), Pair> = BTreeMap::new();
+    let mut pairs: BTreeMap<(usize, usize, usize, usize, bool), Pair> = BTreeMap::new();
     for (first, view) in views.iter().enumerate() {
         (view.tied)(&mut |point: &Tied| -> Result<()> {
             let (second, y) = partner(first, point.tag, point.x).ok_or_else(|| broken("a tied point touches no body"))?;
@@ -641,12 +962,13 @@ pub(crate) fn solve_system(
             if point.tractions.len() != 9 * na {
                 return Err(broken("a tied point's tractions"));
             }
-            let pair = pairs.entry((first, point.element, second, element)).or_insert_with(|| Pair {
+            let each = if point.along.is_some() { 6 } else { 1 };
+            let pair = pairs.entry((first, point.element, second, element, point.along.is_some())).or_insert_with(|| Pair {
                 flux: vec![0.0; 9 * na * nb],
-                mass: vec![0.0; na * nb],
-                own: vec![0.0; nb * nb],
+                mass: vec![0.0; each * na * nb],
+                own: vec![0.0; each * nb * nb],
             });
-            if pair.mass.len() != na * nb || pair.own.len() != nb * nb {
+            if pair.mass.len() != each * na * nb || pair.own.len() != each * nb * nb {
                 return Err(broken("an element's functions changed"));
             }
             let w = point.weight;
@@ -664,20 +986,44 @@ pub(crate) fn solve_system(
                     }
                 }
             }
-            for (row, na_value) in pair.mass.chunks_exact_mut(nb.max(1)).zip(point.values) {
-                for (slot, value) in row.iter_mut().zip(&values) {
-                    *slot += w * na_value * value;
+            match point.along {
+                None => {
+                    for (row, na_value) in pair.mass.chunks_exact_mut(nb.max(1)).zip(point.values) {
+                        for (slot, value) in row.iter_mut().zip(&values) {
+                            *slot += w * na_value * value;
+                        }
+                    }
+                    for (row, first_value) in pair.own.chunks_exact_mut(nb.max(1)).zip(&values) {
+                        for (slot, value) in row.iter_mut().zip(&values) {
+                            *slot += w * first_value * value;
+                        }
+                    }
                 }
-            }
-            for (row, first_value) in pair.own.chunks_exact_mut(nb.max(1)).zip(&values) {
-                for (slot, value) in row.iter_mut().zip(&values) {
-                    *slot += w * first_value * value;
+                Some(n) => {
+                    let across = [w * n[0] * n[0], w * n[0] * n[1], w * n[0] * n[2], w * n[1] * n[1], w * n[1] * n[2], w * n[2] * n[2]];
+                    for (row, na_value) in pair.mass.chunks_exact_mut(6 * nb.max(1)).zip(point.values) {
+                        for (six, value) in row.as_chunks_mut::<6>().0.iter_mut().zip(&values) {
+                            for (slot, weight) in six.iter_mut().zip(across) {
+                                *slot += weight * na_value * value;
+                            }
+                        }
+                    }
+                    for (row, first_value) in pair.own.chunks_exact_mut(6 * nb.max(1)).zip(&values) {
+                        for (six, value) in row.as_chunks_mut::<6>().0.iter_mut().zip(&values) {
+                            for (slot, weight) in six.iter_mut().zip(across) {
+                                *slot += weight * first_value * value;
+                            }
+                        }
+                    }
                 }
             }
             Ok(())
         })?;
     }
 
+    // The pairs of elements the bonds couple, each once however it is held.
+    let coupled: BTreeSet<(usize, usize, usize, usize)> =
+        pairs.keys().map(|(first, element, second, other, _)| (*first, *element, *second, *other)).collect();
     // The order of elimination: one body alone is in its own already.
     let global = |body: usize, function: usize| offsets.get(body).map_or(function, |offset| offset + function);
     let place: Vec<usize> = if views.len() == 1 && pairs.is_empty() {
@@ -687,7 +1033,7 @@ pub(crate) fn solve_system(
         for (body, view) in views.iter().enumerate() {
             lists.extend(view.elements.iter().map(|functions| functions.iter().map(|function| global(body, *function)).collect()));
         }
-        for (first, element, second, other) in pairs.keys() {
+        for (first, element, second, other) in &coupled {
             let functions = |body: usize, element: usize| views.get(body).and_then(|view| view.elements.get(element)).copied().unwrap_or_default();
             lists.push(
                 functions(*first, *element)
@@ -746,12 +1092,12 @@ pub(crate) fn solve_system(
     }
     let (mut stiffness, stiffness_entries) = {
         let bodies = views.iter().enumerate().flat_map(|(body, view)| (0..view.elements.len()).map(move |element| (body, element)));
-        let coupled = pairs.keys().map(|(first, element, second, other)| {
+        let joined = coupled.iter().map(|(first, element, second, other)| {
             let mut both = placed(*first, *element);
             both.extend(placed(*second, *other));
             both
         });
-        let graph = NodeGraph::new(total, bodies.map(|(body, element)| placed(body, element)).chain(coupled));
+        let graph = NodeGraph::new(total, bodies.map(|(body, element)| placed(body, element)).chain(joined));
         let entries = graph.entries(&layout);
         if entries > MAX_MATRIX_ENTRIES {
             return Err(too_large(entries));
@@ -790,7 +1136,7 @@ pub(crate) fn solve_system(
         })?;
     }
     // The bonds' blocks, with the parameter of the cell whose traction they take.
-    for ((first, element, second, other), pair) in &pairs {
+    for ((first, element, second, other, sliding), pair) in &pairs {
         let beta = views.get(*first).map_or(0.0, |view| (view.nitsche)(*element));
         if !(beta > 0.0 && beta.is_finite()) {
             return Err(broken("a tied cell has no parameter"));
@@ -800,6 +1146,38 @@ pub(crate) fn solve_system(
         nodes.extend(others);
         let n = 3 * (na + nb);
         let mut block = vec![0.0; n * n];
+        if *sliding {
+            // Across the face alone: β multiplies ∫ N N′ n_k n_l where a bond has ∫ N N′ δ_kl.
+            for row in 0..3 * na {
+                for fb in 0..nb {
+                    for l in 0..3 {
+                        let flux = pair.flux.get((3 * row + l) * nb + fb).copied().unwrap_or(0.0);
+                        let mass = pair.mass.get(((row / 3) * nb + fb) * 6 + SYMMETRIC[row % 3][l]).copied().unwrap_or(0.0);
+                        let (value, column) = (flux - beta * mass, 3 * (na + fb) + l);
+                        if let Some(slot) = block.get_mut(row * n + column) {
+                            *slot = value;
+                        }
+                        if let Some(slot) = block.get_mut(column * n + row) {
+                            *slot = value;
+                        }
+                    }
+                }
+            }
+            for fb in 0..nb {
+                for other in 0..nb {
+                    for k in 0..3 {
+                        for l in 0..3 {
+                            let mass = pair.own.get((fb * nb + other) * 6 + SYMMETRIC[k][l]).copied().unwrap_or(0.0);
+                            if let Some(slot) = block.get_mut((3 * (na + fb) + k) * n + 3 * (na + other) + l) {
+                                *slot = beta * mass;
+                            }
+                        }
+                    }
+                }
+            }
+            add_block(&mut stiffness, &layout, &nodes, DofSet::TRANSLATIONS, &block)?;
+            continue;
+        }
         for row in 0..3 * na {
             for (fb, mass) in pair.mass.get((row / 3) * nb..(row / 3 + 1) * nb).unwrap_or_default().iter().enumerate() {
                 for l in 0..3 {

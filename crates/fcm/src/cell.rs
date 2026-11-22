@@ -85,10 +85,88 @@ pub(crate) struct Face {
     /// A pressure, pushing against the outward normal.
     pub pressure: f64,
     /// Whether the face is tied to another body where the two touch ([`crate::assembly`]): it
-    /// is then fixed in every component over the points [`Surface::touching`] keeps, and the
-    /// value prescribed there is the other body's displacement, an unknown.
+    /// is then held over the points [`Surface::touching`] keeps, in every component where the
+    /// two are bonded and across the face alone where they may slide ([`Grip`]), and the value
+    /// prescribed there is the other body's displacement, an unknown.
     pub tied: bool,
 }
+
+/// How two bodies hold each other where faces of theirs touch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Grip {
+    /// The two move together.
+    Bonded,
+    /// The two keep touching and slide along each other: only the component of the
+    /// displacement across the face is the same on both.
+    Sliding,
+}
+
+/// The curved surface a face lies on, where the triangles of the face only approximate it. A
+/// face that slides on another holds across itself, along its normal, and the triangles of a
+/// curved face have normals a round one does not: a pin held across every facet of a hole
+/// could not turn in it. With the surface named, the normal at a point of a triangle is the
+/// surface's. Points and lengths are in the unit of the body's surface.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Curved {
+    /// The cylinder about the line through `origin` along `axis`.
+    Cylinder {
+        origin: [f64; 3],
+        axis: [f64; 3],
+    },
+    Sphere {
+        centre: [f64; 3],
+    },
+    /// The cone with this apex, about `axis` (which points into the cone), opening by
+    /// `half_angle` (radians) to each side of it.
+    Cone {
+        apex: [f64; 3],
+        axis: [f64; 3],
+        half_angle: f64,
+    },
+    /// The torus whose ring, of radius `major`, lies about `axis` around `centre`.
+    Torus {
+        centre: [f64; 3],
+        axis: [f64; 3],
+        major: f64,
+    },
+}
+
+impl Curved {
+    /// The unit normal of the surface at the point of it nearest to `x`, on the side `facet`
+    /// points to (the normal of the triangle `x` is on); `facet` itself where the surface has
+    /// no normal (on its axis) or is given by numbers that are not finite.
+    pub(crate) fn normal(&self, x: [f64; 3], facet: [f64; 3]) -> [f64; 3] {
+        let unit = |v: [f64; 3]| {
+            let length = dot(v, v).sqrt();
+            (length > 0.0 && length.is_finite()).then(|| v.map(|c| c / length))
+        };
+        // The unit vector from the line through `from` along `axis` to `x`, and the axis.
+        let radial = |from: [f64; 3], axis: [f64; 3]| {
+            let axis = unit(axis)?;
+            let to = sub(x, from);
+            let along = dot(to, axis);
+            Some((unit([0, 1, 2].map(|i| to[i] - along * axis[i]))?, axis))
+        };
+        let normal = match *self {
+            Curved::Cylinder { origin, axis } => radial(origin, axis).map(|(out, _)| out),
+            Curved::Sphere { centre } => unit(sub(x, centre)),
+            Curved::Cone { apex, axis, half_angle } => {
+                radial(apex, axis).and_then(|(out, axis)| unit([0, 1, 2].map(|i| half_angle.cos() * out[i] - half_angle.sin() * axis[i])))
+            }
+            Curved::Torus { centre, axis, major } => {
+                radial(centre, axis).and_then(|(out, _)| unit([0, 1, 2].map(|i| x[i] - centre[i] - major * out[i])))
+            }
+        };
+        match normal {
+            Some(normal) if dot(normal, facet) < 0.0 => normal.map(|c| -c),
+            Some(normal) => normal,
+            None => facet,
+        }
+    }
+}
+
+/// No face of a body is curved, as far as its solve is told.
+pub(crate) static NO_CURVES: BTreeMap<u32, Curved> = BTreeMap::new();
 
 impl Face {
     pub fn supported(&self) -> bool {
@@ -109,12 +187,15 @@ pub(crate) struct Surface<'a> {
     pub faces: &'a BTreeMap<u32, Face>,
     /// Where a piece of a tied face ([`Face::tied`]) may touch the other body.
     pub touching: Option<&'a Touching<'a>>,
+    /// The curved surfaces tied faces lie on, by face: where one slides, its normal is the
+    /// surface's ([`Curved`]); a face not listed has its triangles' normals.
+    pub curved: &'a BTreeMap<u32, Curved>,
 }
 
 /// Hands the parts of a piece (a triangle) of the tied face with this tag to the caller: each
 /// part lies in one cell of the other body, whose functions are polynomials there, and comes
-/// with whether a point of it touches that body.
-pub(crate) type Touching<'a> = dyn Fn(u32, &[[f64; 3]; 3], &mut dyn FnMut(&[[f64; 3]; 3], &dyn Fn([f64; 3]) -> bool)) + Sync + 'a;
+/// with whether a point of it touches that body and how the face holds it there.
+pub(crate) type Touching<'a> = dyn Fn(u32, &[[f64; 3]; 3], &mut dyn FnMut(&[[f64; 3]; 3], &dyn Fn([f64; 3]) -> bool, Grip)) + Sync + 'a;
 
 impl Surface<'_> {
     /// The face a piece belongs to, when it carries anything, with the piece's normal.
@@ -137,18 +218,28 @@ impl Surface<'_> {
     /// Visit the quadrature points of a piece at which its face's support acts, each with its
     /// natural coordinates in the cell at `lo` of size `h` and its weight: every point of a
     /// piece of a supported face; of a tied face, the points that touch the other body, taken
-    /// part by part of the piece, each part within one of that body's cells.
+    /// part by part of the piece, each part within one of that body's cells, with how the face
+    /// holds the body there (a support's points come as [`Grip::Bonded`]).
     #[allow(clippy::too_many_arguments)]
-    fn held_points(&self, tag: u32, face: &Face, piece: &Piece, lo: [f64; 3], h: f64, rule: &[(f64, f64)], mut visit: impl FnMut([f64; 3], f64)) {
+    fn held_points(
+        &self,
+        tag: u32,
+        face: &Face,
+        piece: &Piece,
+        lo: [f64; 3],
+        h: f64,
+        rule: &[(f64, f64)],
+        mut visit: impl FnMut([f64; 3], f64, Grip),
+    ) {
         if !face.tied {
-            piece_points(piece, lo, h, rule, visit);
+            piece_points(piece, lo, h, rule, |xi, w| visit(xi, w, Grip::Bonded));
             return;
         }
         let Some(touching) = self.touching else { return };
-        touching(tag, &piece.corners, &mut |part, touches| {
+        touching(tag, &piece.corners, &mut |part, touches, grip| {
             piece_points(&Piece { corners: *part, triangle: piece.triangle }, lo, h, rule, |xi, w| {
                 if touches([0, 1, 2].map(|i| lo[i] + 0.5 * (xi[i] + 1.0) * h)) {
-                    visit(xi, w);
+                    visit(xi, w, grip);
                 }
             });
         });
@@ -313,40 +404,82 @@ fn piece_points(piece: &Piece, lo: [f64; 3], h: f64, rule: &[(f64, f64)], mut vi
     }
 }
 
-/// The traction coefficients of a surface with normal `n`: component i of the traction of a
-/// displacement with the gradient ∂u_k/∂x_c is Σ C[i][k][c] ∂u_k/∂x_c, with
-/// C[i][k][c] = λ nᵢ δ_kc + μ n_k δᵢc + μ δᵢ_k n_c, zero where component i is not fixed.
-fn traction_coefficients(n: [f64; 3], fixed: [bool; 3], lame: &Lame) -> [[[f64; 3]; 3]; 3] {
-    let mut c = [[[0.0; 3]; 3]; 3];
+/// What of a displacement or a traction a support or a tie holds: P v, with P the projector
+/// onto the held part. Of a support P keeps the fixed components, of a bond all three, and of a
+/// face that holds only across itself it is n ⊗ n. The method of the module's head is the same
+/// for each: t(u) and u become P t(u) and P u.
+type Held = [[f64; 3]; 3];
+
+/// Every component.
+const ALL: Held = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+/// The fixed components.
+fn components(fixed: [bool; 3]) -> Held {
+    let mut held = [[0.0; 3]; 3];
     for i in 0..3 {
-        if !fixed[i] {
-            continue;
+        if fixed[i] {
+            held[i][i] = 1.0;
         }
+    }
+    held
+}
+
+/// The component along the unit vector `n`.
+fn across(n: [f64; 3]) -> Held {
+    [0, 1, 2].map(|i| [0, 1, 2].map(|j| n[i] * n[j]))
+}
+
+/// The traction coefficients of a surface with normal `n`: component i of the held traction of
+/// a displacement with the gradient ∂u_k/∂x_c is Σ C[i][k][c] ∂u_k/∂x_c, with
+/// C[i][k][c] = Σⱼ Pᵢⱼ (λ nⱼ δ_kc + μ n_k δⱼc + μ δⱼ_k n_c).
+fn traction_coefficients(n: [f64; 3], held: &Held, lame: &Lame) -> [[[f64; 3]; 3]; 3] {
+    let mut whole = [[[0.0; 3]; 3]; 3];
+    for i in 0..3 {
         for k in 0..3 {
-            c[i][k][k] += lame.lambda * n[i];
-            c[i][k][i] += lame.mu * n[k];
+            whole[i][k][k] += lame.lambda * n[i];
+            whole[i][k][i] += lame.mu * n[k];
         }
         for along in 0..3 {
-            c[i][i][along] += lame.mu * n[along];
+            whole[i][i][along] += lame.mu * n[along];
+        }
+    }
+    let mut c = [[[0.0; 3]; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            if held[i][j] == 0.0 {
+                continue;
+            }
+            for k in 0..3 {
+                for along in 0..3 {
+                    c[i][k][along] += held[i][j] * whole[j][k][along];
+                }
+            }
         }
     }
     c
 }
 
-/// The traction components i of each displacement component k of a mode with gradient `d` on a
-/// surface with normal `n`: tᵢ = λ nᵢ d_k + μ n_k dᵢ + μ δᵢ_k (d · n), zero where component i is
-/// not fixed.
-fn tractions(d: [f64; 3], n: [f64; 3], fixed: [bool; 3], lame: &Lame) -> [[f64; 3]; 3] {
+/// The held traction components i of each displacement component k of a mode with gradient `d`
+/// on a surface with normal `n`: tᵢ = Σⱼ Pᵢⱼ (λ nⱼ d_k + μ n_k dⱼ + μ δⱼ_k (d · n)).
+fn tractions(d: [f64; 3], n: [f64; 3], held: &Held, lame: &Lame) -> [[f64; 3]; 3] {
     let along = dot(d, n);
+    let mut whole = [[0.0; 3]; 3];
+    for i in 0..3 {
+        for k in 0..3 {
+            whole[i][k] = lame.lambda * n[i] * d[k] + lame.mu * n[k] * d[i];
+        }
+        whole[i][i] += lame.mu * along;
+    }
     let mut t = [[0.0; 3]; 3];
     for i in 0..3 {
-        if !fixed[i] {
-            continue;
+        for j in 0..3 {
+            if held[i][j] == 0.0 {
+                continue;
+            }
+            for k in 0..3 {
+                t[i][k] += held[i][j] * whole[j][k];
+            }
         }
-        for k in 0..3 {
-            t[i][k] = lame.lambda * n[i] * d[k] + lame.mu * n[k] * d[i];
-        }
-        t[i][i] += lame.mu * along;
     }
     t
 }
@@ -372,9 +505,12 @@ struct Flat {
     normal: [f64; 3],
     face: Face,
     moments: Moments,
-    /// Of a tied face: the moments of the points its support acts at
-    /// ([`Surface::held_points`]).
+    /// Of a tied face: the moments of the points at which it is bonded to the other body
+    /// ([`Surface::held_points`]), and of those at which it slides on it. A face on a curved
+    /// surface ([`Curved`]) has no moments of the second kind: its normal changes from point to
+    /// point, and [`boundary`] sums those points one by one.
     held: Option<Moments>,
+    slid: Option<Moments>,
 }
 
 /// The flat groups of the pieces that carry something, in the order the pieces name them.
@@ -386,15 +522,24 @@ fn flats(shapes: &Shapes, lo: [f64; 3], h: f64, pieces: &[Piece], surface: &Surf
         let at = match groups.iter().position(same) {
             Some(at) => at,
             None => {
-                let held = face.tied.then(|| Moments::new(&shapes.tables));
-                groups.push(Flat { tag, normal, face: *face, moments: Moments::new(&shapes.tables), held });
+                let tied = |kept: bool| (face.tied && kept).then(|| Moments::new(&shapes.tables));
+                let (held, slid) = (tied(true), tied(!surface.curved.contains_key(&tag)));
+                groups.push(Flat { tag, normal, face: *face, moments: Moments::new(&shapes.tables), held, slid });
                 groups.len() - 1
             }
         };
         if let Some(group) = groups.get_mut(at) {
             piece_points(piece, lo, h, rule, |xi, w| group.moments.add(xi, w));
-            if let Some(held) = group.held.as_mut() {
-                surface.held_points(tag, face, piece, lo, h, rule, |xi, w| held.add(xi, w));
+            if face.tied {
+                surface.held_points(tag, face, piece, lo, h, rule, |xi, w, grip| {
+                    let moments = match grip {
+                        Grip::Bonded => group.held.as_mut(),
+                        Grip::Sliding => group.slid.as_mut(),
+                    };
+                    if let Some(moments) = moments {
+                        moments.add(xi, w);
+                    }
+                });
             }
         }
     }
@@ -427,110 +572,185 @@ pub(crate) fn boundary(
     let scale = 2.0 / h;
     let tables = &shapes.tables;
     // Of each mode pair: ∫ Nₐ N_b, ∫ ∂_c Nₐ N_b and ∫ ∂_c Nₐ ∂_d N_b over a group.
-    let (mut values, mut slopes, mut gradients) = (vec![0.0; size / 9], vec![0.0; size / 3], vec![0.0; size]);
+    let mut products = Products { values: vec![0.0; size / 9], slopes: vec![0.0; size / 3], gradients: vec![0.0; size] };
     for group in flats(shapes, lo, h, pieces, surface, rule) {
         let (face, normal) = (&group.face, group.normal);
         if group.moments.is_zero() {
             continue;
         }
-        let integrals = moments::singles(tables, &group.moments, &shapes.modes, None, scratch);
         if face.loaded() {
+            let integrals = moments::singles(tables, &group.moments, &shapes.modes, None, scratch);
             for a in 0..m {
                 for k in 0..3 {
                     out.load[3 * a + k] += integrals[a] * (face.traction[k] - face.pressure * normal[k]);
                 }
             }
         }
-        // The support acts over the whole of a face, or where a tied face touches the other body.
-        let held = group.held.as_ref().unwrap_or(&group.moments);
-        if !face.supported() || size == 0 || held.is_zero() {
+        if !face.supported() || size == 0 {
             continue;
         }
-        let integrals = if group.held.is_some() { moments::singles(tables, held, &shapes.modes, None, scratch) } else { integrals };
-        let c = traction_coefficients(normal, face.fixed, lame);
-        let g = face.value;
-        // The loads of the prescribed values: −∫ tᵢ(v) gᵢ and ∫ vᵢ gᵢ.
-        for along in 0..3 {
-            let slope = moments::singles(tables, held, &shapes.modes, Some(along), scratch);
-            for a in 0..m {
-                for k in 0..3 {
-                    out.consistency_load[3 * a + k] -= scale * slope[a] * (c[0][k][along] * g[0] + c[1][k][along] * g[1] + c[2][k][along] * g[2]);
-                }
+        // A support acts over the whole of its face, on the fixed components; a tied face where
+        // it touches the other body: on every component where the two are bonded, and across
+        // the face where they slide.
+        let holds = if face.tied {
+            [(group.held.as_ref(), ALL, [0.0; 3]), (group.slid.as_ref(), across(normal), [0.0; 3])]
+        } else {
+            [(Some(&group.moments), components(face.fixed), face.value), (None, ALL, [0.0; 3])]
+        };
+        for (held, projector, value) in holds {
+            if let Some(held) = held.filter(|held| !held.is_zero()) {
+                support(&mut out, shapes, held, &projector, value, normal, lame, scale, &mut products, scratch);
             }
         }
+    }
+    // Where a face on a curved surface slides, point by point: the normal is the surface's.
+    if size > 0 && !surface.curved.is_empty() {
+        let (mut values, mut gradients) = (vec![0.0; m], vec![[0.0; 3]; m]);
+        // Of every unknown: its displacement across the face, and the traction it pulls with
+        // across the face.
+        let (mut over, mut pull) = (vec![0.0; n], vec![0.0; n]);
+        for piece in pieces {
+            let Some((tag, face, normal)) = surface.face(piece) else { continue };
+            let Some(curved) = surface.curved.get(&tag).filter(|_| face.tied) else { continue };
+            surface.held_points(tag, face, piece, lo, h, rule, |xi, w, grip| {
+                if grip != Grip::Sliding {
+                    return;
+                }
+                let normal = curved.normal([0, 1, 2].map(|i| lo[i] + 0.5 * (xi[i] + 1.0) * h), normal);
+                eval(shapes, xi, scale, &mut values, &mut gradients);
+                for a in 0..m {
+                    let t = tractions(gradients[a], normal, &ALL, lame);
+                    for k in 0..3 {
+                        over[3 * a + k] = values[a] * normal[k];
+                        pull[3 * a + k] = normal[0] * t[0][k] + normal[1] * t[1][k] + normal[2] * t[2][k];
+                    }
+                }
+                for row in 0..n {
+                    let (over_row, pull_row) = (w * over[row], w * pull[row]);
+                    let at = row * n;
+                    for column in 0..n {
+                        out.consistency[at + column] -= pull_row * over[column] + over_row * pull[column];
+                        out.penalty[at + column] += over_row * over[column];
+                        out.traction[at + column] += pull_row * pull[column];
+                    }
+                }
+            });
+        }
+    }
+    out
+}
+
+/// The integrals of every mode pair over the points of one hold, kept between holds.
+struct Products {
+    /// ∫ Nₐ N_b.
+    values: Vec<f64>,
+    /// ∫ ∂_c Nₐ N_b.
+    slopes: Vec<f64>,
+    /// ∫ ∂_c Nₐ ∂_d N_b.
+    gradients: Vec<f64>,
+}
+
+/// Add the support matrices and loads of the points with the moments `held`, on a flat piece of
+/// surface with the normal `normal`: the part `projector` of the displacement is prescribed to
+/// be `g` there.
+#[allow(clippy::too_many_arguments)]
+fn support(
+    out: &mut Boundary,
+    shapes: &Shapes,
+    held: &Moments,
+    projector: &Held,
+    g: [f64; 3],
+    normal: [f64; 3],
+    lame: &Lame,
+    scale: f64,
+    products: &mut Products,
+    scratch: &mut Scratch,
+) {
+    let m = shapes.len();
+    let n = 3 * m;
+    let tables = &shapes.tables;
+    let Products { values, slopes, gradients } = products;
+    let c = traction_coefficients(normal, projector, lame);
+    // The loads of the prescribed values: −∫ tᵢ(v) gᵢ and ∫ (P v)ᵢ gᵢ.
+    for along in 0..3 {
+        let slope = moments::singles(tables, held, &shapes.modes, Some(along), scratch);
         for a in 0..m {
             for k in 0..3 {
-                if face.fixed[k] {
-                    out.penalty_load[3 * a + k] += integrals[a] * g[k];
-                }
+                out.consistency_load[3 * a + k] -= scale * slope[a] * (c[0][k][along] * g[0] + c[1][k][along] * g[1] + c[2][k][along] * g[2]);
             }
         }
-        // The matrices.
-        moments::pairs(tables, held, &shapes.modes, [VALUE_VALUE; 3], true, &mut values, 1, 0, scratch);
-        for along in 0..3 {
-            let mut kinds = [VALUE_VALUE; 3];
-            kinds[along] = SLOPE_VALUE;
-            moments::pairs(tables, held, &shapes.modes, kinds, false, &mut slopes, 3, along, scratch);
-            for other in 0..3 {
-                moments::pairs(tables, held, &shapes.modes, gradient_kinds(along, other), true, &mut gradients, 9, 3 * along + other, scratch);
-            }
-        }
-        // H of two displacement components k, l from the gradient products c, d:
-        // Σᵢ C[i][k][c] C[i][l][d].
-        let mut weights = [[[[0.0; 3]; 3]; 3]; 3];
+    }
+    let integrals = moments::singles(tables, held, &shapes.modes, None, scratch);
+    let prescribed = [0, 1, 2].map(|k| (0..3).filter(|l| projector[k][*l] != 0.0).map(|l| projector[k][l] * g[l]).sum::<f64>());
+    for a in 0..m {
         for k in 0..3 {
-            for l in 0..3 {
-                for along in 0..3 {
-                    for other in 0..3 {
-                        weights[k][l][along][other] =
-                            scale * scale * (c[0][k][along] * c[0][l][other] + c[1][k][along] * c[1][l][other] + c[2][k][along] * c[2][l][other]);
-                    }
+            out.penalty_load[3 * a + k] += integrals[a] * prescribed[k];
+        }
+    }
+    // The matrices.
+    moments::pairs(tables, held, &shapes.modes, [VALUE_VALUE; 3], true, values, 1, 0, scratch);
+    for along in 0..3 {
+        let mut kinds = [VALUE_VALUE; 3];
+        kinds[along] = SLOPE_VALUE;
+        moments::pairs(tables, held, &shapes.modes, kinds, false, slopes, 3, along, scratch);
+        for other in 0..3 {
+            moments::pairs(tables, held, &shapes.modes, gradient_kinds(along, other), true, gradients, 9, 3 * along + other, scratch);
+        }
+    }
+    // H of two displacement components k, l from the gradient products c, d:
+    // Σᵢ C[i][k][c] C[i][l][d].
+    let mut weights = [[[[0.0; 3]; 3]; 3]; 3];
+    for k in 0..3 {
+        for l in 0..3 {
+            for along in 0..3 {
+                for other in 0..3 {
+                    weights[k][l][along][other] =
+                        scale * scale * (c[0][k][along] * c[0][l][other] + c[1][k][along] * c[1][l][other] + c[2][k][along] * c[2][l][other]);
                 }
             }
         }
-        for a in 0..m {
-            for b in a..m {
-                let (ab, ba) = (a * m + b, b * m + a);
-                let mut products = [[0.0; 3]; 3];
-                for along in 0..3 {
-                    for other in 0..3 {
-                        // A mode with itself: symmetric but for rounding.
-                        products[along][other] = if a == b {
-                            0.5 * (gradients[ab * 9 + 3 * along + other] + gradients[ab * 9 + 3 * other + along])
-                        } else {
-                            gradients[ab * 9 + 3 * along + other]
-                        };
-                    }
+    }
+    for a in 0..m {
+        for b in a..m {
+            let (ab, ba) = (a * m + b, b * m + a);
+            let mut products = [[0.0; 3]; 3];
+            for along in 0..3 {
+                for other in 0..3 {
+                    // A mode with itself: symmetric but for rounding.
+                    products[along][other] = if a == b {
+                        0.5 * (gradients[ab * 9 + 3 * along + other] + gradients[ab * 9 + 3 * other + along])
+                    } else {
+                        gradients[ab * 9 + 3 * along + other]
+                    };
                 }
-                for k in 0..3 {
-                    for l in 0..3 {
-                        let (upper, lower) = ((3 * a + k) * n + 3 * b + l, (3 * b + l) * n + 3 * a + k);
-                        let mut traction = 0.0;
-                        let mut consistency = 0.0;
-                        for along in 0..3 {
-                            for other in 0..3 {
-                                traction += weights[k][l][along][other] * products[along][other];
-                            }
-                            // t_l of mode a's component k against N_b, and t_k of mode b's
-                            // component l against Nₐ.
-                            consistency += c[l][k][along] * slopes[ab * 3 + along] + c[k][l][along] * slopes[ba * 3 + along];
+            }
+            for k in 0..3 {
+                for l in 0..3 {
+                    let (upper, lower) = ((3 * a + k) * n + 3 * b + l, (3 * b + l) * n + 3 * a + k);
+                    let mut traction = 0.0;
+                    let mut consistency = 0.0;
+                    for along in 0..3 {
+                        for other in 0..3 {
+                            traction += weights[k][l][along][other] * products[along][other];
                         }
-                        let consistency = scale * consistency;
-                        let penalty = if k == l && face.fixed[k] { values[ab] } else { 0.0 };
-                        out.traction[upper] += traction;
-                        out.consistency[upper] -= consistency;
-                        out.penalty[upper] += penalty;
-                        if a != b {
-                            out.traction[lower] += traction;
-                            out.consistency[lower] -= consistency;
-                            out.penalty[lower] += penalty;
-                        }
+                        // t_l of mode a's component k against N_b, and t_k of mode b's
+                        // component l against Nₐ.
+                        consistency += c[l][k][along] * slopes[ab * 3 + along] + c[k][l][along] * slopes[ba * 3 + along];
+                    }
+                    let consistency = scale * consistency;
+                    let penalty = projector[k][l] * values[ab];
+                    out.traction[upper] += traction;
+                    out.consistency[upper] -= consistency;
+                    out.penalty[upper] += penalty;
+                    if a != b {
+                        out.traction[lower] += traction;
+                        out.consistency[lower] -= consistency;
+                        out.penalty[lower] += penalty;
                     }
                 }
             }
         }
     }
-    out
 }
 
 /// The Nitsche parameter β = 2Λ of a cell with stiffness `k` and traction matrix `h` (both
@@ -610,7 +830,7 @@ pub(crate) fn reaction(
             eval(shapes, xi, 2.0 / h, &mut values, &mut gradients);
             let (mut displacement, mut traction) = ([0.0; 3], [0.0; 3]);
             for a in 0..m {
-                let t = tractions(gradients[a], normal, face.fixed, lame);
+                let t = tractions(gradients[a], normal, &components(face.fixed), lame);
                 for k in 0..3 {
                     displacement[k] += values[a] * u[3 * a + k];
                     for i in 0..3 {
@@ -632,9 +852,12 @@ pub(crate) fn reaction(
 }
 
 /// The points of the tied pieces of a cell at which they touch the other body
-/// ([`Surface::held_points`]), the same points [`boundary`] sums: each with the point, its weight (an
-/// face, the point, its weight (an area), the values of the cell's modes there, and the traction
-/// of every mode's displacement component k on the piece, `tractions[a][i][k]` its component i.
+/// ([`Surface::held_points`]), the same points [`boundary`] sums: each with its face, the
+/// point, its weight (an area), the values of the cell's modes there, the held traction of
+/// every mode's displacement component k on the piece, `tractions[a][i][k]` its component i,
+/// and, where the face slides on the other body, the normal it holds along (where it is bonded,
+/// `None`: it holds every component).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(crate) fn tied_points(
     shapes: &Shapes,
     lo: [f64; 3],
@@ -643,7 +866,7 @@ pub(crate) fn tied_points(
     surface: &Surface,
     lame: &Lame,
     rule: &[(f64, f64)],
-    mut visit: impl FnMut(u32, [f64; 3], f64, &[f64], &[[[f64; 3]; 3]]),
+    mut visit: impl FnMut(u32, [f64; 3], f64, &[f64], &[[[f64; 3]; 3]], Option<[f64; 3]>),
 ) {
     let m = shapes.len();
     let (mut values, mut gradients, mut traction) = (vec![0.0; m], vec![[0.0; 3]; m], vec![[[0.0; 3]; 3]; m]);
@@ -652,13 +875,21 @@ pub(crate) fn tied_points(
         if !face.tied {
             continue;
         }
-        surface.held_points(tag, face, piece, lo, h, rule, |xi, w| {
+        let curved = surface.curved.get(&tag);
+        surface.held_points(tag, face, piece, lo, h, rule, |xi, w, grip| {
             let x = [0, 1, 2].map(|i| lo[i] + 0.5 * (xi[i] + 1.0) * h);
             eval(shapes, xi, 2.0 / h, &mut values, &mut gradients);
+            let (normal, held, along) = match grip {
+                Grip::Bonded => (normal, ALL, None),
+                Grip::Sliding => {
+                    let normal = curved.map_or(normal, |curved| curved.normal(x, normal));
+                    (normal, across(normal), Some(normal))
+                }
+            };
             for (t, gradient) in traction.iter_mut().zip(&gradients) {
-                *t = tractions(*gradient, normal, [true; 3], lame);
+                *t = tractions(*gradient, normal, &held, lame);
             }
-            visit(tag, x, w, &values, &traction);
+            visit(tag, x, w, &values, &traction, along);
         });
     }
 }
@@ -824,7 +1055,7 @@ mod tests {
             normal.map(|x| x / length)
         };
         let normals = [unit(&pieces[0]), unit(&pieces[1]), unit(&pieces[2])];
-        let surface = Surface { normals: &normals, tags: &[3, 3, 5], faces: &faces, touching: None };
+        let surface = Surface { normals: &normals, tags: &[3, 3, 5], faces: &faces, touching: None, curved: &NO_CURVES };
         let rule = gauss_legendre(2 * p + 1);
         let mut scratch = Scratch::default();
         let b = boundary(&shapes, lo, h, &pieces, &surface, &lame, &rule, &mut scratch);
@@ -836,7 +1067,7 @@ mod tests {
             let (_, face, normal) = surface.face(piece).unwrap();
             piece_points(piece, lo, h, &rule, |xi, w| {
                 eval(&shapes, xi, 2.0 / h, &mut values, &mut gradients);
-                let t: Vec<[[f64; 3]; 3]> = gradients.iter().map(|d| tractions(*d, normal, face.fixed, &lame)).collect();
+                let t: Vec<[[f64; 3]; 3]> = gradients.iter().map(|d| tractions(*d, normal, &components(face.fixed), &lame)).collect();
                 let g = face.value;
                 for a in 0..m {
                     for k in 0..3 {
@@ -879,6 +1110,125 @@ mod tests {
         close("traction", &b.traction, &traction);
     }
 
+    /// Where a tied face slides on the other body it holds across itself alone: the matrices
+    /// are the sums of the normal traction and the normal displacement over its points, with
+    /// the triangle's normal on a flat face (summed from moments) and the surface's on a curved
+    /// one (summed point by point), and the points handed to the other body carry that normal.
+    #[test]
+    fn a_sliding_face_holds_across_itself() {
+        let lame = Lame { lambda: 1.3, mu: 0.7 };
+        let (p, h, lo) = (2, 0.5, [0.1, -0.2, 0.3]);
+        let shapes = shapes(p, false);
+        let (m, n) = (shapes.len(), 3 * shapes.len());
+        let tied = Face { fixed: [true; 3], tied: true, ..Face::default() };
+        let faces = BTreeMap::from([(3u32, tied), (5u32, tied)]);
+        let at = |x: f64, y: f64, z: f64| [lo[0] + x * h, lo[1] + y * h, lo[2] + z * h];
+        let pieces = [
+            Piece { corners: [at(0.1, 0.1, 0.2), at(0.9, 0.2, 0.3), at(0.3, 0.8, 0.9)], triangle: 0 },
+            Piece { corners: [at(0.9, 0.2, 0.3), at(0.8, 0.9, 0.7), at(0.3, 0.8, 0.9)], triangle: 1 },
+            Piece { corners: [at(0.0, 0.0, 0.5), at(1.0, 0.0, 0.5), at(0.0, 1.0, 0.6)], triangle: 2 },
+        ];
+        let unit = |piece: &Piece| {
+            let normal = cross(sub(piece.corners[1], piece.corners[0]), sub(piece.corners[2], piece.corners[0]));
+            let length = dot(normal, normal).sqrt();
+            normal.map(|x| x / length)
+        };
+        let normals = [unit(&pieces[0]), unit(&pieces[1]), unit(&pieces[2])];
+        // Face 5 lies on a sphere whose centre is below the cell.
+        let sphere = Curved::Sphere { centre: at(0.3, 0.4, -2.0) };
+        let curved = BTreeMap::from([(5u32, sphere)]);
+        let everywhere = |_: u32, piece: &[[f64; 3]; 3], visit: &mut dyn FnMut(&[[f64; 3]; 3], &dyn Fn([f64; 3]) -> bool, Grip)| {
+            visit(piece, &|_| true, Grip::Sliding)
+        };
+        let surface = Surface { normals: &normals, tags: &[3, 3, 5], faces: &faces, touching: Some(&everywhere), curved: &curved };
+        let rule = gauss_legendre(2 * p + 1);
+        let mut scratch = Scratch::default();
+        let b = boundary(&shapes, lo, h, &pieces, &surface, &lame, &rule, &mut scratch);
+
+        let (mut values, mut gradients) = (vec![0.0; m], vec![[0.0; 3]; m]);
+        let (mut consistency, mut penalty, mut traction) = (vec![0.0; n * n], vec![0.0; n * n], vec![0.0; n * n]);
+        let mut points = Vec::new();
+        for piece in &pieces {
+            let (tag, _, facet) = surface.face(piece).unwrap();
+            piece_points(piece, lo, h, &rule, |xi, w| {
+                let x = [0, 1, 2].map(|i| lo[i] + 0.5 * (xi[i] + 1.0) * h);
+                let normal = if tag == 5 { sphere.normal(x, facet) } else { facet };
+                assert!(dot(normal, facet) > 0.9 && (dot(normal, normal) - 1.0).abs() < 1e-14);
+                eval(&shapes, xi, 2.0 / h, &mut values, &mut gradients);
+                // Of every unknown: the displacement across the face, and n · σ n.
+                let (mut over, mut pull) = (vec![0.0; n], vec![0.0; n]);
+                for a in 0..m {
+                    let t = tractions(gradients[a], normal, &ALL, &lame);
+                    for k in 0..3 {
+                        over[3 * a + k] = values[a] * normal[k];
+                        pull[3 * a + k] = normal[0] * t[0][k] + normal[1] * t[1][k] + normal[2] * t[2][k];
+                    }
+                }
+                for row in 0..n {
+                    for column in 0..n {
+                        consistency[row * n + column] -= w * (pull[row] * over[column] + over[row] * pull[column]);
+                        penalty[row * n + column] += w * over[row] * over[column];
+                        traction[row * n + column] += w * pull[row] * pull[column];
+                    }
+                }
+                points.push((x, w, normal, pull));
+            });
+        }
+        let close = |name: &str, got: &[f64], exact: &[f64]| {
+            assert_eq!(got.len(), exact.len(), "{name}");
+            let scale = exact.iter().fold(0.0f64, |largest, x| largest.max(x.abs()));
+            assert!(scale > 0.0, "{name} is not exercised");
+            for (value, exact) in got.iter().zip(exact) {
+                assert!((value - exact).abs() < 1e-12 * scale, "{name}: {value} vs {exact}");
+            }
+        };
+        close("consistency", &b.consistency, &consistency);
+        close("penalty", &b.penalty, &penalty);
+        close("traction", &b.traction, &traction);
+        assert!(b.consistency_load.iter().chain(&b.penalty_load).all(|x| *x == 0.0));
+
+        // The same points go to the other body, with the normal and the traction along it.
+        let mut seen = 0;
+        tied_points(&shapes, lo, h, &pieces, &surface, &lame, &rule, |_, x, w, _, held, along| {
+            let (expected, weight, normal, pull) = &points[seen];
+            assert_eq!((x, w, along), (*expected, *weight, Some(*normal)));
+            for a in 0..m {
+                for k in 0..3 {
+                    for i in 0..3 {
+                        assert!((held[a][i][k] - normal[i] * pull[3 * a + k]).abs() < 1e-12 * (lame.lambda + lame.mu) / h, "{a} {i} {k}");
+                    }
+                }
+            }
+            seen += 1;
+        });
+        assert_eq!(seen, points.len());
+    }
+
+    /// The normals of the round surfaces: on the side of the facet whichever way the surface is
+    /// given, and the facet's where the surface has none.
+    #[test]
+    fn a_curved_face_has_its_surfaces_normal() {
+        let facet = [0.6, 0.0, 0.8];
+        let near = |got: [f64; 3], exact: [f64; 3]| (0..3).all(|i| (got[i] - exact[i]).abs() < 1e-14);
+        for axis in [[0.0, 0.0, 3.0], [0.0, 0.0, -1.0]] {
+            let cylinder = Curved::Cylinder { origin: [1.0, 1.0, 5.0], axis };
+            assert!(near(cylinder.normal([4.0, 1.0, -2.0], facet), [1.0, 0.0, 0.0]));
+            // A hole's wall: its normal points to the axis.
+            assert!(near(cylinder.normal([-2.0, 1.0, 7.0], facet), [1.0, 0.0, 0.0]));
+        }
+        assert!(near(Curved::Cylinder { origin: [1.0, 1.0, 5.0], axis: [0.0, 0.0, 1.0] }.normal([1.0, 1.0, 2.0], facet), facet), "on the axis");
+        assert!(near(Curved::Cylinder { origin: [0.0; 3], axis: [0.0; 3] }.normal([1.0, 1.0, 2.0], facet), facet), "no axis");
+        assert!(near(Curved::Cylinder { origin: [f64::NAN; 3], axis: [0.0, 0.0, 1.0] }.normal([1.0, 1.0, 2.0], facet), facet), "not finite");
+        assert!(near(Curved::Sphere { centre: [1.0, 2.0, 3.0] }.normal([1.0, 2.0, 7.0], facet), [0.0, 0.0, 1.0]));
+        // A cone of 45° about z from the origin: at (1, 0, 1) its normal is (1, 0, −1)/√2.
+        let slope = std::f64::consts::FRAC_1_SQRT_2;
+        let cone = Curved::Cone { apex: [0.0; 3], axis: [0.0, 0.0, 1.0], half_angle: std::f64::consts::FRAC_PI_4 };
+        assert!(near(cone.normal([1.0, 0.0, 1.0], [1.0, 0.0, 0.0]), [slope, 0.0, -slope]));
+        // A torus about z with its ring at radius 3: above the ring the normal is z, outside it x.
+        let torus = Curved::Torus { centre: [0.0; 3], axis: [0.0, 0.0, 1.0], major: 3.0 };
+        assert!(near(torus.normal([3.0, 0.0, 1.0], facet), [0.0, 0.0, 1.0]) && near(torus.normal([4.0, 0.0, 0.0], facet), [1.0, 0.0, 0.0]));
+    }
+
     #[test]
     fn the_nitsche_parameter_scales_with_the_stiffness_over_the_cell_size() {
         // A cell fixed on its whole lower x face: Λ is a property of the cell, proportional to
@@ -886,7 +1236,7 @@ mod tests {
         let parameter = |p: usize, h: f64, lame: Lame| -> f64 {
             let shapes = shapes(p, false);
             let faces = BTreeMap::from([(7u32, Face { fixed: [true; 3], ..Face::default() })]);
-            let surface = Surface { normals: &[[-1.0, 0.0, 0.0]], tags: &[7], faces: &faces, touching: None };
+            let surface = Surface { normals: &[[-1.0, 0.0, 0.0]], tags: &[7], faces: &faces, touching: None, curved: &NO_CURVES };
             let corner = |y: f64, z: f64| [0.0, y * h, z * h];
             let pieces = [
                 Piece { corners: [corner(0.0, 0.0), corner(0.0, 1.0), corner(1.0, 1.0)], triangle: 0 },

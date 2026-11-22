@@ -7,7 +7,9 @@
 //! fictitious stiffness of the cut cells, as in `tests/patch.rs`: the bond is consistent, and
 //! the cells of the two bodies need not match.
 
-use fieldcraft_fcm::{Bond, Error, Load, Material, Options, Part, Solution, Support, assembly_unknowns, find_bonds, solve_assembly};
+use fieldcraft_fcm::{
+    Bond, Curved, Error, Grip, Load, Material, Options, Part, Solution, Support, assembly_unknowns, find_bonds, free_motions, solve_assembly,
+};
 use fieldcraft_mesh::surface::{BoundarySurface, SurfaceOptions};
 use fieldcraft_solver::Limits;
 
@@ -83,6 +85,7 @@ fn two_blocks_bonded_end_to_end_are_one_bar() {
                 supports: &held,
                 loads: &[],
                 options: Options { degree, basis, offset: [0.31, 0.62, 0.13], ..Options::new(0.4) },
+                curved: &[],
             },
             Part {
                 surface: &second,
@@ -90,12 +93,13 @@ fn two_blocks_bonded_end_to_end_are_one_bar() {
                 supports: &free,
                 loads: &pull,
                 options: Options { degree, basis, offset: [0.57, 0.11, 0.73], ..Options::new(0.55) },
+                curved: &[],
             },
         ];
         for bond in [
-            Bond { first: (0, vec![1]), second: (1, vec![0]), tolerance: 1e-6 },
+            Bond { first: (0, vec![1]), second: (1, vec![0]), tolerance: 1e-6, grip: Grip::Bonded },
             // The other way round, with a face that does not touch named as well.
-            Bond { first: (1, vec![0, 3]), second: (0, vec![1]), tolerance: 1e-6 },
+            Bond { first: (1, vec![0, 3]), second: (0, vec![1]), tolerance: 1e-6, grip: Grip::Bonded },
         ] {
             let solutions = solve_assembly(&parts, &[bond], &Limits::default()).unwrap();
             assert_eq!(solutions.len(), 2);
@@ -136,6 +140,7 @@ fn two_materials_in_series_stretch_each_by_its_own_modulus() {
             supports: &held,
             loads: &[],
             options: Options { degree: 2, offset: [0.21, 0.4, 0.33], ..Options::new(0.3) },
+            curved: &[],
         },
         Part {
             surface: &second,
@@ -143,9 +148,12 @@ fn two_materials_in_series_stretch_each_by_its_own_modulus() {
             supports: &free,
             loads: &pull,
             options: Options { degree: 2, offset: [0.6, 0.15, 0.5], ..Options::new(0.25) },
+            curved: &[],
         },
     ];
-    let solutions = solve_assembly(&parts, &[Bond { first: (0, vec![1]), second: (1, vec![0]), tolerance: 1e-6 }], &Limits::default()).unwrap();
+    let solutions =
+        solve_assembly(&parts, &[Bond { first: (0, vec![1]), second: (1, vec![0]), tolerance: 1e-6, grip: Grip::Bonded }], &Limits::default())
+            .unwrap();
     let elongation = STRESS * (0.7 / stiff.young + 0.9 / soft.young);
     let (a, b) = (
         errors(&solutions[0], [0.0; 3], [0.7, 0.5, 0.5], |x| [STRESS * x[0] / stiff.young, 0.0, 0.0], elongation, STRESS),
@@ -180,6 +188,7 @@ fn a_block_on_a_plate_is_held_through_its_foot() {
             supports: &clamp,
             loads: &[],
             options: Options { degree: 2, offset: [0.37, 0.21, 0.43], ..Options::new(0.25) },
+            curved: &[],
         },
         Part {
             surface: &post,
@@ -187,9 +196,10 @@ fn a_block_on_a_plate_is_held_through_its_foot() {
             supports: &[],
             loads: &push,
             options: Options { degree: 2, offset: [0.17, 0.41, 0.29], ..Options::new(0.2) },
+            curved: &[],
         },
     ];
-    let bond = Bond { first: (0, vec![5]), second: (1, vec![4]), tolerance: 1e-6 };
+    let bond = Bond { first: (0, vec![5]), second: (1, vec![4]), tolerance: 1e-6, grip: Grip::Bonded };
     let solutions = solve_assembly(&parts, std::slice::from_ref(&bond), &Limits::default()).unwrap();
     let reaction = solutions[0].reactions.iter().find(|r| r.face == 4).unwrap().force;
     let applied = [3.0e5, 1.0e5, -2.0e5];
@@ -213,9 +223,11 @@ fn a_block_on_a_plate_is_held_through_its_foot() {
     assert!(largest > 2.0 * solutions[1].displacement([0.85, 0.7, 0.3]).unwrap()[0].abs());
     // Without the bond nothing holds the post.
     assert!(matches!(solve_assembly(&parts, &[], &Limits::default()), Err(Error::Invalid(_))));
-    // With faces that do not touch, nothing holds it either: singular, not a wrong answer.
-    let apart = Bond { first: (0, vec![5]), second: (1, vec![5]), tolerance: 1e-6 };
-    assert!(matches!(solve_assembly(&parts, &[apart], &Limits::default()), Err(Error::Singular(_))));
+    // With faces that do not touch, nothing holds it either: refused, not a wrong answer.
+    let apart = Bond { first: (0, vec![5]), second: (1, vec![5]), tolerance: 1e-6, grip: Grip::Bonded };
+    assert_eq!(free_motions(&parts, std::slice::from_ref(&apart)).unwrap().len(), 6);
+    assert!(matches!(solve_assembly(&parts, &[apart], &Limits::default()), Err(Error::Invalid(_))));
+    assert!(free_motions(&parts, std::slice::from_ref(&bond)).unwrap().is_empty());
 }
 
 /// One body with no bond is the body's own solve, bit for bit, and what cannot be an assembly
@@ -226,22 +238,22 @@ fn one_body_and_hostile_assemblies() {
     let supports = sliding(true);
     let loads = [Load::Traction { face: 1, traction: [1e6, 0.0, 0.0] }];
     let options = Options { degree: 2, offset: [0.31, 0.62, 0.13], ..Options::new(0.3) };
-    let part = Part { surface: &bar, material: STEEL, supports: &supports, loads: &loads, options };
+    let part = Part { surface: &bar, material: STEEL, supports: &supports, loads: &loads, options, curved: &[] };
     let alone = fieldcraft_fcm::solve(&bar, &STEEL, &supports, &loads, &options, &Limits::default()).unwrap();
     let one = solve_assembly(&[part], &[], &Limits::default()).unwrap();
     assert_eq!(one[0].strain_energy.to_bits(), alone.strain_energy.to_bits());
     let limits = Limits::default();
     let refused = |bonds: &[Bond]| matches!(solve_assembly(&[part, part], bonds, &limits), Err(Error::Invalid(_)));
     assert!(matches!(solve_assembly(&[], &[], &limits), Err(Error::Invalid(_))));
-    assert!(refused(&[Bond { first: (0, vec![1]), second: (0, vec![0]), tolerance: 1e-6 }]), "a body bonded to itself");
-    assert!(refused(&[Bond { first: (0, vec![1]), second: (7, vec![0]), tolerance: 1e-6 }]), "a body that is not there");
-    assert!(refused(&[Bond { first: (0, vec![99]), second: (1, vec![0]), tolerance: 1e-6 }]), "a face that is not there");
-    assert!(refused(&[Bond { first: (0, vec![]), second: (1, vec![0]), tolerance: 1e-6 }]), "no face");
+    assert!(refused(&[Bond { first: (0, vec![1]), second: (0, vec![0]), tolerance: 1e-6, grip: Grip::Bonded }]), "a body bonded to itself");
+    assert!(refused(&[Bond { first: (0, vec![1]), second: (7, vec![0]), tolerance: 1e-6, grip: Grip::Bonded }]), "a body that is not there");
+    assert!(refused(&[Bond { first: (0, vec![99]), second: (1, vec![0]), tolerance: 1e-6, grip: Grip::Bonded }]), "a face that is not there");
+    assert!(refused(&[Bond { first: (0, vec![]), second: (1, vec![0]), tolerance: 1e-6, grip: Grip::Bonded }]), "no face");
     for tolerance in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-        assert!(refused(&[Bond { first: (0, vec![1]), second: (1, vec![0]), tolerance }]), "tolerance {tolerance}");
+        assert!(refused(&[Bond { first: (0, vec![1]), second: (1, vec![0]), tolerance, grip: Grip::Bonded }]), "tolerance {tolerance}");
     }
     // A face that is supported and bonded.
-    assert!(refused(&[Bond { first: (0, vec![0]), second: (1, vec![0]), tolerance: 1e-6 }]));
+    assert!(refused(&[Bond { first: (0, vec![0]), second: (1, vec![0]), tolerance: 1e-6, grip: Grip::Bonded }]));
 }
 
 /// The bond is consistent whatever the two grids: where the cells of both bodies end on the
@@ -273,6 +285,7 @@ fn the_bond_passes_the_patch_test_on_any_two_grids() {
                 supports: &held,
                 loads: &[],
                 options: Options { degree: 2, offset: offsets[0], ..Options::new(cells[0]) },
+                curved: &[],
             },
             Part {
                 surface: &second,
@@ -280,9 +293,12 @@ fn the_bond_passes_the_patch_test_on_any_two_grids() {
                 supports: &free,
                 loads: &pull,
                 options: Options { degree: 2, offset: offsets[1], ..Options::new(cells[1]) },
+                curved: &[],
             },
         ];
-        let solutions = solve_assembly(&parts, &[Bond { first: (0, vec![1]), second: (1, vec![0]), tolerance: 1e-6 }], &Limits::default()).unwrap();
+        let solutions =
+            solve_assembly(&parts, &[Bond { first: (0, vec![1]), second: (1, vec![0]), tolerance: 1e-6, grip: Grip::Bonded }], &Limits::default())
+                .unwrap();
         let elongation = STRESS * size[0] / STEEL.young;
         let (a, b) = (
             errors(&solutions[0], [0.0; 3], [1.0, size[1], size[2]], exact, elongation, STRESS),
@@ -389,6 +405,7 @@ fn a_pin_bonded_in_a_hole_carries_its_pull() {
             supports: &[],
             loads: &pull,
             options: Options { degree: 2, offset: [0.37, 0.21, 0.43], ..Options::new(0.15) },
+            curved: &[],
         },
         Part {
             surface: &sleeve,
@@ -396,6 +413,7 @@ fn a_pin_bonded_in_a_hole_carries_its_pull() {
             supports: &clamp,
             loads: &[],
             options: Options { degree: 2, offset: [0.17, 0.41, 0.29], ..Options::new(0.2) },
+            curved: &[],
         },
     ];
     let bonds: Vec<Bond> = find_bonds(&[&pin, &sleeve], 0.01 * 0.2).unwrap().into_iter().map(|touch| touch.bond).collect();
@@ -410,4 +428,225 @@ fn a_pin_bonded_in_a_hole_carries_its_pull() {
     let (inside, around) = (solutions[0].displacement([0.19, 0.0, 0.3]).unwrap(), solutions[1].displacement([0.21, 0.0, 0.3]).unwrap());
     println!("the pin's top {top:?}; in the hole the pin {inside:?}, the sleeve {around:?}");
     assert!((inside[2] - around[2]).abs() < 0.2 * top[2], "{inside:?} {around:?}");
+}
+
+/// Two blocks of two materials, one on the other and free to slide on it, pressed together:
+/// each is in uniaxial compression and widens by its own Poisson's ratio, so they slip where
+/// they touch. The fields are linear, and a sliding connection that is consistent finds them
+/// like the bond finds a constant stress; bonded, the two could not slip and would shear.
+#[test]
+fn two_blocks_that_slide_are_pressed_without_shear() {
+    const PRESSURE: f64 = 80e6;
+    let soft = Material { young: 70e9, poisson: 0.2, density: 2700.0 };
+    let (below, above) = (block([0.0; 3], [1.0, 0.8, 0.5]), block([0.0, 0.0, 0.5], [1.0, 0.8, 1.2]));
+    // Each keeps its faces at x = 0 and y = 0 in their planes; the lower one stands on z = 0,
+    // and the upper one is held along z by the sliding connection alone.
+    let sides = |standing: bool| {
+        let mut supports = vec![
+            Support { face: 0, fixed: [true, false, false], value: [0.0; 3] },
+            Support { face: 2, fixed: [false, true, false], value: [0.0; 3] },
+        ];
+        if standing {
+            supports.push(Support { face: 4, fixed: [false, false, true], value: [0.0; 3] });
+        }
+        supports
+    };
+    let (standing, lying) = (sides(true), sides(false));
+    let press = [Load::Pressure { face: 5, pressure: PRESSURE }];
+    let exact = |x: [f64; 3]| {
+        if x[2] <= 0.5 {
+            [STEEL.poisson * PRESSURE * x[0] / STEEL.young, STEEL.poisson * PRESSURE * x[1] / STEEL.young, -PRESSURE * x[2] / STEEL.young]
+        } else {
+            [
+                soft.poisson * PRESSURE * x[0] / soft.young,
+                soft.poisson * PRESSURE * x[1] / soft.young,
+                -PRESSURE * 0.5 / STEEL.young - PRESSURE * (x[2] - 0.5) / soft.young,
+            ]
+        }
+    };
+    let scale = PRESSURE * (0.5 / STEEL.young + 0.7 / soft.young);
+    for (degree, basis) in [(2, fieldcraft_fcm::Basis::Tensor), (3, fieldcraft_fcm::Basis::Trunk)] {
+        let parts = [
+            Part {
+                surface: &below,
+                material: STEEL,
+                supports: &standing,
+                loads: &[],
+                options: Options { degree, basis, offset: [0.31, 0.62, 0.13], ..Options::new(0.4) },
+                curved: &[],
+            },
+            Part {
+                surface: &above,
+                material: soft,
+                supports: &lying,
+                loads: &press,
+                options: Options { degree, basis, offset: [0.57, 0.11, 0.73], ..Options::new(0.3) },
+                curved: &[],
+            },
+        ];
+        // The traction is taken from the first body named, the faces being equal: both ways.
+        for bond in [
+            Bond { first: (0, vec![5]), second: (1, vec![4]), tolerance: 1e-6, grip: Grip::Sliding },
+            Bond { first: (1, vec![4]), second: (0, vec![5]), tolerance: 1e-6, grip: Grip::Sliding },
+        ] {
+            assert!(free_motions(&parts, std::slice::from_ref(&bond)).unwrap().is_empty());
+            let solutions = solve_assembly(&parts, &[bond], &Limits::default()).unwrap();
+            let (mut displacement, mut stress) = (0.0f64, 0.0f64);
+            for (solution, from, to) in [(&solutions[0], 0.0, 0.5), (&solutions[1], 0.5, 1.2)] {
+                for fx in [0.03, 0.4, 0.97] {
+                    for fy in [0.05, 0.6, 0.95] {
+                        for fz in [0.02, 0.5, 0.98] {
+                            let x = [fx, 0.8 * fy, from + fz * (to - from)];
+                            let (u, s, expected) = (solution.displacement(x).unwrap(), solution.stress(x).unwrap(), exact(x));
+                            for i in 0..3 {
+                                displacement = displacement.max((u[i] - expected[i]).abs() / scale);
+                            }
+                            stress = stress.max((s[2] + PRESSURE).abs() / PRESSURE);
+                            for component in [s[0], s[1], s[3], s[4], s[5]] {
+                                stress = stress.max(component.abs() / PRESSURE);
+                            }
+                        }
+                    }
+                }
+            }
+            println!("degree {degree}, {basis:?}: displacement {displacement:.3e}, stress {stress:.3e}");
+            assert!(displacement < 5e-6 && stress < 2e-4, "degree {degree}, {basis:?}: displacement {displacement:.3e}, stress {stress:.3e}");
+            // They slip: at the far edge of the faces that touch, by the difference of what the
+            // two widen by.
+            let at = [0.97, 0.4, 0.5];
+            let slip = solutions[1].displacement(at).unwrap()[0] - solutions[0].displacement(at).unwrap()[0];
+            let expected = 0.97 * PRESSURE * (soft.poisson / soft.young - STEEL.poisson / STEEL.young);
+            assert!((slip - expected).abs() < 1e-4 * expected.abs(), "slip {slip:.6e} against {expected:.6e}");
+            // The stand carries the pressure, and the sides nothing.
+            let reaction = |solution: &Solution, face: u32| solution.reactions.iter().find(|r| r.face == face).unwrap().force;
+            assert!((reaction(&solutions[0], 4)[2] - PRESSURE * 0.8).abs() < 1e-6 * PRESSURE, "{:?}", reaction(&solutions[0], 4));
+            for solution in &solutions {
+                assert!(reaction(solution, 0)[0].abs() < 1e-6 * PRESSURE && reaction(solution, 2)[1].abs() < 1e-6 * PRESSURE);
+            }
+        }
+    }
+}
+
+/// A pin in the hole of a clamped sleeve, free to slide in it. Nothing but the pin's own
+/// support keeps it from sliding along the hole and turning in it, which is found before any
+/// solve; with the normals of the facets in place of the cylinder's, the hole's facets would
+/// keep it from turning. Held at its lower end and pulled, the pin stretches as a bar on its
+/// own (no Poisson's ratio: it does not widen), and the sleeve carries nothing along the hole.
+#[test]
+fn a_pin_slides_and_turns_in_its_hole() {
+    const PULL: f64 = 1.0e5;
+    let (pin, sleeve) = (prism(24, 0.2, 0.0, -0.1, 0.9), prism(40, 0.5, 0.2, 0.0, 0.6));
+    let slender = Material { poisson: 0.0, ..STEEL };
+    let round =
+        [(0u32, Curved::Cylinder { origin: [0.0; 3], axis: [0.0, 0.0, 1.0] }), (3u32, Curved::Cylinder { origin: [0.0; 3], axis: [0.0, 0.0, 2.0] })];
+    let clamp = [Support { face: 0, fixed: [true; 3], value: [0.0; 3] }];
+    let foot = [Support { face: 1, fixed: [true; 3], value: [0.0; 3] }];
+    let bonds: Vec<Bond> =
+        find_bonds(&[&pin, &sleeve], 0.01 * 0.2).unwrap().into_iter().map(|touch| Bond { grip: Grip::Sliding, ..touch.bond }).collect();
+    assert_eq!(bonds.len(), 1);
+    let assembly = |held: bool, loads: &[Load], curved: bool| -> (Vec<fieldcraft_fcm::Motion>, Result<Vec<Solution>, Error>) {
+        let parts = [
+            Part {
+                surface: &pin,
+                material: slender,
+                supports: if held { &foot } else { &[] },
+                loads,
+                options: Options { degree: 2, offset: [0.37, 0.21, 0.43], ..Options::new(0.15) },
+                curved: if curved { &round } else { &[] },
+            },
+            Part {
+                surface: &sleeve,
+                material: STEEL,
+                supports: &clamp,
+                loads: &[],
+                options: Options { degree: 2, offset: [0.17, 0.41, 0.29], ..Options::new(0.2) },
+                curved: if curved { &round } else { &[] },
+            },
+        ];
+        (free_motions(&parts, &bonds).unwrap(), solve_assembly(&parts, &bonds, &Limits::default()))
+    };
+    // Free: the pin alone moves, along the hole and about its axis, and the solve is refused.
+    let (free, refused) = assembly(false, &[], true);
+    assert!(matches!(refused, Err(Error::Invalid(_))));
+    assert_eq!(free.len(), 2, "{free:?}");
+    let unit = |v: [f64; 3]| v.iter().fold(0.0f64, |m, c| m.max(c.abs()));
+    for motion in &free {
+        let [(0, slide, turn)] = motion.bodies[..] else { panic!("{motion:?}") };
+        // Along z or about z, and nothing else.
+        assert!(slide[0].abs() < 1e-9 && slide[1].abs() < 1e-9 && turn[0].abs() < 1e-9 && turn[1].abs() < 1e-9, "{motion:?}");
+        assert!((unit(slide) - 1.0).abs() < 1e-9 || (unit(turn) - 1.0).abs() < 1e-9, "{motion:?}");
+    }
+    assert!(free.iter().any(|motion| motion.bodies[0].2[2].abs() > 0.5) && free.iter().any(|motion| motion.bodies[0].1[2].abs() > 0.5), "{free:?}");
+    // On the facets' normals the pin could slide but not turn.
+    assert_eq!(assembly(false, &[], false).0.len(), 1);
+
+    // Pulled along the hole: a bar, F L / (E A) at its top, A the area of its 24 sides.
+    let pull = [Load::Force { face: 2, force: [0.0, 0.0, PULL] }];
+    let (free, solutions) = assembly(true, &pull, true);
+    assert!(free.is_empty(), "{free:?}");
+    let solutions = solutions.unwrap();
+    let area = 0.5 * 24.0 * 0.2 * 0.2 * (2.0 * std::f64::consts::PI / 24.0).sin();
+    let (top, expected) = (solutions[0].displacement([0.05, 0.02, 0.9]).unwrap(), PULL * 1.0 / (slender.young * area));
+    println!("the pin's top {top:?} against {expected:.6e}");
+    assert!((top[2] - expected).abs() < 1e-5 * expected && top[0].abs() < 1e-5 * expected, "{top:?} against {expected:.6e}");
+    let around = solutions[1].displacement([0.25, 0.05, 0.3]).unwrap();
+    assert!(unit(around) < 1e-5 * expected, "the sleeve moves: {around:?}");
+    assert!(solutions[1].strain_energy.abs() < 1e-8 * solutions[0].strain_energy, "{} of {}", solutions[1].strain_energy, solutions[0].strain_energy);
+
+    // Pushed sideways as well: the sleeve takes its share across the hole and nothing along it.
+    let push = [Load::Force { face: 2, force: [2.0e4, 0.0, PULL] }];
+    let solutions = assembly(true, &push, true).1.unwrap();
+    let (on_sleeve, on_pin) =
+        (solutions[1].reactions.iter().find(|r| r.face == 0).unwrap().force, solutions[0].reactions.iter().find(|r| r.face == 1).unwrap().force);
+    println!("the sleeve's clamp {on_sleeve:?}, the pin's foot {on_pin:?}");
+    assert!(on_sleeve[2].abs() < 1e-6 * PULL, "{on_sleeve:?}");
+    assert!((on_pin[2] + PULL).abs() < 1e-6 * PULL && (on_pin[0] + on_sleeve[0] + 2.0e4).abs() < 1e-6 * PULL, "{on_pin:?} {on_sleeve:?}");
+    assert!(on_sleeve[0].abs() > 0.1 * 2.0e4, "the sleeve carries none of the push: {on_sleeve:?}");
+}
+
+/// A block standing on a clamped plate and free to slide on it can still slide two ways and
+/// turn about the plate's normal: found and refused. Held against those by its sides, it is
+/// solved, and the plate carries what presses it down.
+#[test]
+fn a_body_a_sliding_connection_leaves_free_is_refused() {
+    let (plate, post) = (block([0.0; 3], [2.0, 1.5, 0.3]), block([0.6, 0.5, 0.3], [1.1, 0.9, 1.0]));
+    let clamp = [Support { face: 4, fixed: [true; 3], value: [0.0; 3] }];
+    let guides =
+        [Support { face: 0, fixed: [true, false, false], value: [0.0; 3] }, Support { face: 2, fixed: [false, true, false], value: [0.0; 3] }];
+    let press = [Load::Force { face: 5, force: [0.0, 0.0, -2.0e5] }];
+    let bond = Bond { first: (0, vec![5]), second: (1, vec![4]), tolerance: 1e-6, grip: Grip::Sliding };
+    let assembly = |guided: bool| {
+        let parts = [
+            Part {
+                surface: &plate,
+                material: STEEL,
+                supports: &clamp,
+                loads: &[],
+                options: Options { degree: 2, offset: [0.37, 0.21, 0.43], ..Options::new(0.25) },
+                curved: &[],
+            },
+            Part {
+                surface: &post,
+                material: STEEL,
+                supports: if guided { &guides } else { &[] },
+                loads: &press,
+                options: Options { degree: 2, offset: [0.17, 0.41, 0.29], ..Options::new(0.2) },
+                curved: &[],
+            },
+        ];
+        (free_motions(&parts, std::slice::from_ref(&bond)).unwrap(), solve_assembly(&parts, std::slice::from_ref(&bond), &Limits::default()))
+    };
+    let (free, refused) = assembly(false);
+    assert!(matches!(&refused, Err(Error::Invalid(why)) if why.contains("body 1")), "{:?}", refused.err());
+    assert_eq!(free.len(), 3, "{free:?}");
+    for motion in &free {
+        let [(1, slide, turn)] = motion.bodies[..] else { panic!("{motion:?}") };
+        // In the plane of the plate, or about its normal.
+        assert!(slide[2].abs() < 1e-9 && turn[0].abs() < 1e-9 && turn[1].abs() < 1e-9, "{motion:?}");
+    }
+    let (free, solutions) = assembly(true);
+    assert!(free.is_empty(), "{free:?}");
+    let solutions = solutions.unwrap();
+    let reaction = solutions[0].reactions.iter().find(|r| r.face == 4).unwrap().force;
+    assert!((reaction[2] - 2.0e5).abs() < 1e-6 * 2.0e5 && reaction[0].abs() < 1e-6 * 2.0e5 && reaction[1].abs() < 1e-6 * 2.0e5, "{reaction:?}");
 }

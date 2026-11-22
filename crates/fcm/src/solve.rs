@@ -574,17 +574,20 @@ impl Place<'_> {
 
 /// How a body is tied to others ([`crate::assembly`]).
 pub(crate) struct Ties<'a> {
-    /// The faces that are fixed to another body where they touch it.
+    /// The faces that are held to another body where they touch it.
     pub faces: &'a BTreeSet<u32>,
-    /// Where a piece of such a face may touch the other body ([`cell::Touching`]).
+    /// Where a piece of such a face may touch the other body, and how it holds it there
+    /// ([`cell::Touching`]).
     pub touching: &'a cell::Touching<'a>,
+    /// The curved surfaces such faces lie on, for the normals of those that slide.
+    pub curved: &'a BTreeMap<u32, cell::Curved>,
     /// Whether another body's tied face holds this one: it needs no support of its own then.
     pub held: bool,
 }
 
 /// A point where a tied face touches the other body: the element it is in, the face, the point,
-/// its weight (an area), the values of the element's functions there and the traction of each
-/// of their unknowns on the face, `tractions[3 n i + 3 f + k]` component i of function f's
+/// its weight (an area), the values of the element's functions there and the held traction of
+/// each of their unknowns on the face, `tractions[3 n i + 3 f + k]` component i of function f's
 /// component k, of n functions.
 pub(crate) struct Tied<'a> {
     pub element: usize,
@@ -593,6 +596,9 @@ pub(crate) struct Tied<'a> {
     pub weight: f64,
     pub values: &'a [f64],
     pub tractions: &'a [f64],
+    /// Where the face slides on the other body: the unit normal it holds along. `None` where
+    /// the two are bonded.
+    pub along: Option<[f64; 3]>,
 }
 
 /// What a body hands over when its cells are ready, before their matrices are added up: enough
@@ -971,12 +977,12 @@ fn conditions(
             }
         }
     }
-    // A face tied to another body is fixed to it, in every component, where the two touch.
+    // A face tied to another body is held to it where the two touch.
     for tag in ties.into_iter().flat_map(|ties| ties.faces) {
         area(*tag)?;
         let face = faces.entry(*tag).or_default();
         if face.supported() {
-            return Err(Error::Invalid(format!("face {tag} is supported and bonded to another body: one or the other")));
+            return Err(Error::Invalid(format!("face {tag} is supported and connected to another body: one or the other")));
         }
         face.fixed = [true; 3];
         face.tied = true;
@@ -1431,7 +1437,13 @@ fn solve_at(
         *areas.entry(*tag).or_insert(0.0) += 0.5 * length;
     }
     let (faces, body) = conditions(supports, loads, &areas, material.density, ties)?;
-    let on_surface = Surface { normals: &normals, tags: &tags, faces: &faces, touching: ties.map(|ties| ties.touching) };
+    let on_surface = Surface {
+        normals: &normals,
+        tags: &tags,
+        faces: &faces,
+        touching: ties.map(|ties| ties.touching),
+        curved: ties.map_or(&cell::NO_CURVES, |ties| ties.curved),
+    };
     let feature = grid::feature_flags(surface);
     let on_grid = Triangles { corners: &triangles, normals: &normals, across: surface.neighbors(), feature: &feature };
 
@@ -1848,7 +1860,7 @@ fn solve_at(
             let (corner, size) = (grid.fine_lo(level, cell.position()), grid.step(level));
             let functions = space.functions(element).len();
             let mut failed = None;
-            cell::tied_points(&shapes, corner, size, &owned, &on_surface, &lame, &surface_rule, |tag, x, weight, values, tractions| {
+            cell::tied_points(&shapes, corner, size, &owned, &on_surface, &lame, &surface_rule, |tag, x, weight, values, tractions, along| {
                 if failed.is_some() {
                     return;
                 }
@@ -1862,7 +1874,7 @@ fn solve_at(
                         None => all.extend(of_modes),
                     }
                 }
-                if let Err(e) = visit(&Tied { element, tag, x, weight, values: &values, tractions: &all }) {
+                if let Err(e) = visit(&Tied { element, tag, x, weight, values: &values, tractions: &all, along }) {
                     failed = Some(e);
                 }
             });
