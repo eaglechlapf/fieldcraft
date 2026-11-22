@@ -7,58 +7,65 @@
 //! memory is the matrix's; what it needs is a count of rounds that does not grow with the grid.
 //!
 //! # The method
-//! Conjugate gradients (M. R. Hestenes, E. Stiefel, *Methods of conjugate gradients for solving
-//! linear systems*, J. Res. Natl. Bur. Stand. 49(6):409–436, 1952), preconditioned by an
-//! additive Schwarz method of two levels (A. Toselli, O. Widlund, *Domain Decomposition
-//! Methods: Algorithms and Theory*, Springer 2005, ch. 2 and 3): the approximate inverse is the
-//! sum of exact inverses on overlapping pieces of the unknowns,
+//! The system is S, the stiffness with the unknowns every cell has to itself taken out
+//! ([`crate::condense`]). It is solved by conjugate gradients (M. R. Hestenes, E. Stiefel,
+//! *Methods of conjugate gradients for solving linear systems*, J. Res. Natl. Bur. Stand.
+//! 49(6):409–436, 1952), preconditioned by an additive Schwarz method of two levels
+//! (A. Toselli, O. Widlund, *Domain Decomposition Methods: Algorithms and Theory*, Springer
+//! 2005, ch. 2 and 3): the approximate inverse is the sum of exact inverses on overlapping
+//! pieces of the unknowns,
 //!
-//! M⁻¹ = R₀ᵀ K₀⁻¹ R₀ + Σₑ W Rₑᵀ Kₑ⁻¹ Rₑ W, each K = R K Rᵀ.
+//! M⁻¹ = R₀ᵀ S₀⁻¹ R₀ + Σ w² Rᵀ (R S Rᵀ)⁻¹ R, S₀ = R₀ S R₀ᵀ.
 //!
 //! **The coarse level** (index 0) is the linear shape functions of every level of the grid: the
 //! trilinear finite elements of the refined grid, a thirtieth of the unknowns at degree 3. The
-//! basis is hierarchic, so they are a subset of the unknowns and their matrix a part of the
-//! stiffness; it is factored ([`Factor`]). They carry what is smooth over many cells from one
-//! end of the part to the other in one step, which is what keeps the count of rounds from
-//! growing with the number of cells (for shape functions of high degree: L. F. Pavarino,
-//! *Additive Schwarz methods for the p-version finite element method*, Numer. Math.
-//! 66:493–516, 1993).
+//! basis is hierarchic, so they are a subset of the unknowns and their matrix a part of S; it
+//! is factored ([`Factor`]). They carry what is smooth over many cells from one end of the part
+//! to the other in one step, which is what keeps the count of rounds from growing with the
+//! number of cells.
 //!
-//! **The local level** is one block for every element: all the unknowns of the functions that
-//! reach it, the higher ones of its own cell with those it shares with the cells around. Each
-//! block's matrix is factored densely. An unknown is in as many blocks as cells share its
-//! function, and the blocks' answers for it are summed: W, diagonal, weights each unknown by
-//! one over the root of that number on the way in and on the way out, so that the sum is their
-//! mean and M⁻¹ stays symmetric (measured: a third to a half fewer rounds than unweighted). In
-//! a cell the surface cuts, the functions are nearly dependent on the little material the
-//! cell holds, which is what makes the stiffness of a cut grid ill-conditioned (F. de Prenter,
-//! C. V. Verhoosel, G. J. van Zwieten, E. H. van Brummelen, *Condition number analysis and
-//! preconditioning of the finite cell method*, Comput. Methods Appl. Mech. Engrg.
-//! 316:297–327, 2017); within the cell's block that is solved exactly, and the iteration does
-//! not see it (an additive Schwarz method on the cells of a refined grid: J. N. Jomo,
-//! F. de Prenter, M. Elhaddad, D. D'Angella, C. V. Verhoosel, S. Kollmannsberger,
-//! J. S. Kirschke, V. Nübel, E. H. van Brummelen, E. Rank, *Robust and parallel scalable
-//! iterative solutions for large-scale finite cell analyses*, Finite Elem. Anal. Des.
-//! 163:14–30, 2019).
+//! **The local level** is one block for every vertex of the grid: the functions that reach no
+//! cell but the eight around it, which are the vertex's own linear function and those of the
+//! edges and faces that meet there. Each block's matrix is factored densely (additive Schwarz
+//! methods for shape functions of high degree: L. F. Pavarino, *Additive Schwarz methods for
+//! the p-version finite element method*, Numer. Math. 66:493–516, 1993). An unknown is in the
+//! blocks of several vertices and their answers for it are summed; a block's answer is
+//! weighted by w², the mean over its unknowns of one over the blocks each is in (one weight
+//! for a block: its answer is scaled, not bent, which a block that holds a cut cell does not
+//! stand).
+//!
+//! Blocks of one cell each, all the functions that reach it, take three times the rounds on a
+//! compact part and ten times on a thin one: where cells hold little material, a function they
+//! share is nearly a sum of functions of the cells around it on the material there is, which
+//! is what makes the stiffness of a cut grid ill-conditioned (F. de Prenter, C. V. Verhoosel,
+//! G. J. van Zwieten, E. H. van Brummelen, *Condition number analysis and preconditioning of
+//! the finite cell method*, Comput. Methods Appl. Mech. Engrg. 316:297–327, 2017), and a block
+//! must hold the function with all of them to solve that exactly. Measured at degree 3 on the
+//! oracle's bracket, 8 mm thick with holes through it, on cells of 2.2, 4.4 and 8 mm: 124, 268
+//! and 390 rounds with a block for every cell, 39, 39 and 36 with one for every vertex; on a
+//! solid block 105 and 31. The blocks around the vertices take three quarters of the memory of
+//! those of the cells.
+//!
+//! Two bodies that a connection holds together are coupled stiffly across it: every two cells
+//! it couples are a block too, with the functions of both.
 //!
 //! # What it is not good at
-//! The count of rounds does not grow with the grid, but it does with what the two levels do
-//! not see: a material that hardly changes its volume (Poisson's ratio near one half), whose
+//! **Divided cells.** A function of a cell that is divided reaches all the cells it is
+//! divided into, and a block of everything within its reach has thousands of unknowns. So the
+//! blocks around vertices are those of functions that reach eight cells at most
+//! ([`AROUND`]), and every cell that a farther-reaching function reaches is a block as well,
+//! which holds that function with the cell's. That is not all it takes: the bracket above
+//! with its cells divided once at its fillet and holes takes 117 rounds at degree 3 and 174 at
+//! degree 4, divided twice 233 (J. N. Jomo, F. de Prenter, M. Elhaddad, D. D'Angella,
+//! C. V. Verhoosel, S. Kollmannsberger, J. S. Kirschke, V. Nübel, E. H. van Brummelen,
+//! E. Rank, *Robust and parallel scalable iterative solutions for large-scale finite cell
+//! analyses*, Finite Elem. Anal. Des. 163:14–30, 2019, iterate on such grids with blocks of
+//! cells).
+//!
+//! **A material that hardly changes its volume** (Poisson's ratio near one half), whose
 //! stiffness against that one kind of strain dwarfs the rest. Such a system, and any other the
 //! iteration does not settle in [`MOST`] rounds, is left to the factorization
-//! ([`crate::assembly`]).
-//!
-//! So does a thin part on cells as large as its walls are thick. The oracle's bracket, 8 mm
-//! thick with holes through it, takes 124 rounds on cells of 2.2 mm at degree 3, 268 on cells
-//! of 4.4 mm and 390 on cells of 8 mm, and 1120 at degree 4 with the cells at its fillet and
-//! holes divided once; a compact part takes about a hundred on any cells. What is left after a
-//! few hundred rounds sits at the rims of the holes, in shape functions shared by cells that
-//! each hold little material: a block of one cell does not hold what such a function has in
-//! common with the functions of the other cells. Blocks of all the functions around every
-//! shared one (the cells around a vertex, each with its neighbours) settle the same systems in 60 rounds at
-//! degree 3, at several times the memory of the cells' blocks; they are not built here. A thin
-//! part's factor is small, so it is factored instead, at far more unknowns than a compact
-//! part; one too large for that is iterated for up to [`MOST_ALONE`] rounds.
+//! ([`crate::assembly`]); one too large for that is iterated for up to [`MOST_ALONE`] rounds.
 //!
 //! # Determinism
 //! Every sum runs in a fixed order: the products of the matrix as [`Blocked`] has them; the
@@ -71,6 +78,7 @@ use fieldcraft_solver::cholesky::{Factor, UpperColumns};
 use fieldcraft_solver::sparse::Csr;
 
 use crate::blocked::Blocked;
+use crate::packed;
 use crate::{Error, Result};
 
 /// The residual at which the iteration is done, relative to the load: the unknowns are then
@@ -82,17 +90,23 @@ pub(crate) const SETTLED: f64 = 1e-9; // unit-factors: a ratio of two forces
 /// tolerance, and no further round brings the residual under it.
 const ROUNDING: f64 = 10.0;
 
-/// Rounds after which a system is left to the factorization: three times what a system the
-/// two levels suit takes at the tolerance (about a hundred).
+/// Rounds after which a system is left to the factorization: about ten times what a system
+/// the two levels suit takes at the tolerance (30 to 40).
 pub(crate) const MOST: usize = 400;
 
 /// Rounds for a system the factorization cannot take, its factor or its rows above their
-/// limits: five times as many. What the two levels suit poorly still settles, slowly (the
-/// module's head: 1120 rounds measured there).
+/// limits: five times as many.
 pub(crate) const MOST_ALONE: usize = 5 * MOST;
 
 /// Rounds between two looks at whether the caller has cancelled.
 const LOOK: usize = 8;
+
+/// The cells around a vertex of a grid: what a function may reach to be the middle of a block
+/// ([`patches`]).
+const AROUND: usize = 8;
+
+/// Sets of cells a task of [`patches`] takes.
+const GRAIN: usize = 64;
 
 /// A solved system.
 pub(crate) struct Outcome {
@@ -106,52 +120,85 @@ pub(crate) struct Outcome {
     pub coarse_entries: usize,
 }
 
+/// The blocks of the local level: the nodes of each, rising. `lists` has the nodes of every
+/// cell, the first `cells` of them, and then of every two cells a connection couples; `own`
+/// says which nodes were taken out of the system, and are in no block. Every other node of a
+/// list is in one block at least.
+pub(crate) fn patches(lists: &[Vec<usize>], cells: usize, own: &[bool]) -> Vec<Vec<usize>> {
+    let kept = |node: &usize| own.get(*node) == Some(&false);
+    let tidy = |mut nodes: Vec<usize>| {
+        nodes.sort_unstable();
+        nodes.dedup();
+        nodes
+    };
+    // The cells each node that is left reaches, rising.
+    let mut reach: Vec<Vec<u32>> = vec![Vec::new(); own.len()];
+    for (cell, list) in lists.iter().take(cells).enumerate() {
+        let Ok(cell) = u32::try_from(cell) else { break };
+        for node in list.iter().filter(|node| kept(node)) {
+            if let Some(reach) = reach.get_mut(*node)
+                && reach.last() != Some(&cell)
+            {
+                reach.push(cell);
+            }
+        }
+    }
+    let reach_of = |node: usize| reach.get(node).map(Vec::as_slice).unwrap_or_default();
+    // The sets of cells that are all a node reaches, of no more than a vertex has around it:
+    // each once.
+    let near = |node: usize| (2..=AROUND).contains(&reach_of(node).len());
+    let mut sets: Vec<&[u32]> = (0..own.len()).filter(|node| near(*node)).map(reach_of).collect();
+    sets.sort_unstable();
+    sets.dedup();
+    let within = |small: &[u32], large: &[u32]| small.iter().all(|cell| large.binary_search(cell).is_ok());
+    // A set that is not part of a larger one has a block: the nodes that reach no cell
+    // outside it. A larger set is that of a node of any of the set's cells: of the first.
+    let around: Vec<Vec<usize>> = parallel::map_grained(sets.len(), GRAIN, |at| {
+        let set = sets.get(at).copied().unwrap_or_default();
+        let first = set.first().and_then(|cell| lists.get(*cell as usize)).map(Vec::as_slice).unwrap_or_default();
+        if first.iter().any(|node| near(*node) && reach_of(*node).len() > set.len() && within(set, reach_of(*node))) {
+            return Vec::new();
+        }
+        let mut nodes = tidy(set.iter().filter_map(|cell| lists.get(*cell as usize)).flatten().copied().collect());
+        nodes.retain(|node| kept(node) && within(reach_of(*node), set));
+        nodes
+    });
+    let mut blocks: Vec<Vec<usize>> = around.into_iter().filter(|nodes| !nodes.is_empty()).collect();
+    // A cell with a node no such block holds (one that reaches farther, where cells are
+    // divided; a cell that shares nothing) is a block itself.
+    let mut held = vec![false; own.len()];
+    for node in blocks.iter().flatten() {
+        if let Some(flag) = held.get_mut(*node) {
+            *flag = true;
+        }
+    }
+    for list in lists.iter().take(cells) {
+        if list.iter().any(|node| kept(node) && held.get(*node) == Some(&false)) {
+            blocks.push(tidy(list.iter().copied().filter(|node| kept(node)).collect()));
+        }
+    }
+    // And every two cells a connection couples.
+    blocks.extend(
+        lists.iter().skip(cells).map(|list| tidy(list.iter().copied().filter(|node| kept(node)).collect())).filter(|nodes| !nodes.is_empty()),
+    );
+    blocks
+}
+
 /// One block of the local level: its unknowns in rising order, and the Cholesky factor of
-/// their matrix, the lower triangle row by row.
+/// their matrix ([`packed`]).
 struct Block {
     unknowns: Vec<usize>,
     factor: Vec<f64>,
 }
 
 impl Block {
-    /// The block of the nodes `nodes` (three unknowns each) of `matrix`. None when there is no
-    /// memory for its factor.
+    /// The block of the nodes `nodes` (rising, each once; three unknowns each) of `matrix`.
+    /// None when there is no memory for its factor.
     fn new(matrix: &Blocked, nodes: &[usize]) -> Option<Block> {
-        let mut own = nodes.to_vec();
-        own.sort_unstable();
-        own.dedup();
-        let unknowns: Vec<usize> = own.iter().flat_map(|node| [3 * node, 3 * node + 1, 3 * node + 2]).collect();
+        let unknowns: Vec<usize> = nodes.iter().flat_map(|node| 3 * node..3 * node + 3).collect();
         let n = unknowns.len();
-        // The lower triangle, row by row: row i starts at i (i + 1) / 2.
-        let mut factor = Vec::new();
-        factor.try_reserve_exact(n * (n + 1) / 2).ok()?;
-        factor.resize(n * (n + 1) / 2, 0.0);
-        for (i, node) in own.iter().enumerate() {
-            let (others, blocks) = matrix.row(*node);
-            // Both lists rise: one pass over them.
-            let mut j = 0;
-            for (other, block) in others.iter().zip(blocks) {
-                let other = *other as usize;
-                while own.get(j).is_some_and(|node| *node < other) {
-                    j += 1;
-                }
-                if j > i {
-                    break;
-                }
-                if own.get(j) != Some(&other) {
-                    continue;
-                }
-                for (r, entries) in block.as_chunks::<3>().0.iter().enumerate() {
-                    let row = 3 * i + r;
-                    for (column, value) in (3 * j..=row.min(3 * j + 2)).zip(entries) {
-                        if let Some(slot) = factor.get_mut(row * (row + 1) / 2 + column) {
-                            *slot = *value;
-                        }
-                    }
-                }
-            }
-        }
-        if !cholesky(&mut factor, n) {
+        let mut factor = packed::lower(matrix, nodes)?;
+        if !packed::cholesky(&mut factor, n) {
             // A block that is not positive to working precision (a sliver of material on its
             // fictitious stiffness): its diagonal alone, which is.
             for (i, unknown) in unknowns.iter().enumerate() {
@@ -168,63 +215,13 @@ impl Block {
         Some(Block { unknowns, factor })
     }
 
-    /// `out` = K_block⁻¹ of the block's part of `r`.
+    /// `out` = the inverse of the block's matrix times the block's part of `r`.
     fn solve(&self, r: &[f64], out: &mut Vec<f64>) {
-        let n = self.unknowns.len();
         out.clear();
         out.extend(self.unknowns.iter().map(|unknown| r.get(*unknown).copied().unwrap_or(0.0)));
-        let l = &self.factor;
-        // L y = r, row by row.
-        for i in 0..n {
-            let row = i * (i + 1) / 2;
-            let (Some(entries), Some((done, rest))) = (l.get(row..row + i + 1), out.split_at_mut_checked(i)) else { return };
-            let Some((diagonal, before)) = entries.split_last() else { return };
-            let sum: f64 = before.iter().zip(done.iter()).map(|(a, b)| a * b).sum();
-            if let Some(slot) = rest.first_mut() {
-                *slot = (*slot - sum) / diagonal;
-            }
-        }
-        // Lᵀ x = y: the last unknown first, each taken out of those before it.
-        for i in (0..n).rev() {
-            let row = i * (i + 1) / 2;
-            let (Some(entries), Some((before, rest))) = (l.get(row..row + i + 1), out.split_at_mut_checked(i)) else { return };
-            let (Some((diagonal, above)), Some(slot)) = (entries.split_last(), rest.first_mut()) else { return };
-            *slot /= diagonal;
-            let x = *slot;
-            for (target, a) in before.iter_mut().zip(above) {
-                *target -= a * x;
-            }
-        }
+        packed::forward(&self.factor, out);
+        packed::backward(&self.factor, out);
     }
-}
-
-/// Factor the symmetric positive definite matrix whose lower triangle is `a`, row by row, in
-/// place: A = L Lᵀ. False when a pivot is not positive.
-fn cholesky(a: &mut [f64], n: usize) -> bool {
-    if a.len() != n * (n + 1) / 2 {
-        return false;
-    }
-    for i in 0..n {
-        let row = i * (i + 1) / 2;
-        let (done, rest) = a.split_at_mut(row);
-        let Some(own) = rest.get_mut(..i + 1) else { return false };
-        for j in 0..i {
-            let other = j * (j + 1) / 2;
-            let Some(entries) = done.get(other..other + j + 1) else { return false };
-            let Some((diagonal, before)) = entries.split_last() else { return false };
-            let sum: f64 = before.iter().zip(own.iter()).map(|(x, y)| x * y).sum();
-            if let Some(slot) = own.get_mut(j) {
-                *slot = (*slot - sum) / diagonal;
-            }
-        }
-        let Some((diagonal, before)) = own.split_last_mut() else { return false };
-        let pivot = *diagonal - before.iter().map(|x| x * x).sum::<f64>();
-        if !(pivot > 0.0) || !pivot.is_finite() {
-            return false;
-        }
-        *diagonal = pivot.sqrt();
-    }
-    true
 }
 
 /// The sum of the products of two lists, from the first to the last.
@@ -232,17 +229,20 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
-/// Solve `matrix` u = `load` by the iteration of the module's head, to the residual `settled`
-/// of the load in at most `most` rounds. `linear` says which nodes (three unknowns each) carry
-/// a linear shape function, and `blocks` lists the nodes of every block of the local level
-/// (every node in one at least), with whether its answer is taken `whole`. `Ok(None)` when the rounds did not settle it, or a step broke
-/// down: the system is then the factorization's.
+/// Solve `matrix` u = `load` on the nodes that are not `own` to a cell (three unknowns each;
+/// the others' rows and columns are left out, and `load` is zero there) by the iteration of
+/// the module's head, to the residual `settled` of `scale`, the size of the whole load, in at
+/// most `most` rounds. `linear` says which nodes carry a linear shape function, and `blocks`
+/// lists the nodes of every block of the local level ([`patches`]). `Ok(None)` when the rounds
+/// did not settle it, or a step broke down: the system is then the factorization's.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn solve(
     matrix: &Blocked,
+    own: &[bool],
     load: &[f64],
+    scale: f64,
     linear: &[bool],
     blocks: &[Vec<usize>],
-    whole: &[bool],
     limits: &Limits,
     settled: f64,
     most: usize,
@@ -252,16 +252,16 @@ pub(crate) fn solve(
     if load.len() != n || linear.len() != matrix.nodes() {
         return Err(Error::Internal("the iteration's system and its load differ in size".into()));
     }
-    let scale = dot(load, load).sqrt();
-    if !(scale > 0.0) || !scale.is_finite() {
+    if !(scale > 0.0) || !scale.is_finite() || load.iter().all(|entry| *entry == 0.0) {
         // No load: nothing moves.
         return Ok(scale.is_finite().then(|| Outcome { u: vec![0.0; n], iterations: 0, residual: 0.0, coarse_entries: 0 }));
     }
+    let taken = |node: usize| own.get(node).copied().unwrap_or(false);
 
     // The coarse level: the linear functions' part of the matrix, factored.
     let mut place = vec![usize::MAX; matrix.nodes()];
     let mut coarse = Vec::new();
-    for (node, _) in linear.iter().enumerate().filter(|(_, linear)| **linear) {
+    for (node, _) in linear.iter().enumerate().filter(|(node, linear)| **linear && !taken(*node)) {
         if let Some(slot) = place.get_mut(node) {
             *slot = coarse.len() / 3;
         }
@@ -292,37 +292,29 @@ pub(crate) fn solve(
         return Err(Error::Internal("cancelled".into()));
     }
 
-    // The local level, and each unknown's weight: one over the root of the blocks it is in.
+    // The local level, and each block's weight: the mean over its unknowns of one over the
+    // blocks each is in.
     let blocks: Option<Vec<Block>> =
         parallel::map(blocks.len(), |block| Block::new(matrix, blocks.get(block).map(Vec::as_slice).unwrap_or_default())).into_iter().collect();
     let Some(blocks) = blocks else {
         return Err(Error::Limit("no memory for the blocks the iteration solves the cells in (use a larger cell size or a lower degree)".into()));
     };
-    let mut weight = vec![0.0f64; n];
+    let mut shared = vec![0.0f64; n];
     for unknown in blocks.iter().flat_map(|block| &block.unknowns) {
-        if let Some(count) = weight.get_mut(*unknown) {
+        if let Some(count) = shared.get_mut(*unknown) {
             *count += 1.0;
         }
     }
-    for w in &mut weight {
-        *w = if *w > 0.0 { 1.0 / w.sqrt() } else { 1.0 };
-    }
-    // A block that is taken whole has one weight for all its unknowns, the mean of theirs: its
-    // answer is scaled, not bent.
-    let even: Vec<Option<f64>> = blocks
+    let weights: Vec<f64> = blocks
         .iter()
-        .enumerate()
-        .map(|(at, block)| {
-            if !whole.get(at).copied().unwrap_or(false) {
-                return None;
-            }
-            let sum: f64 = block.unknowns.iter().map(|unknown| weight.get(*unknown).map_or(1.0, |w| w * w)).sum();
-            Some((sum / block.unknowns.len().max(1) as f64).sqrt())
+        .map(|block| {
+            let sum: f64 = block.unknowns.iter().map(|unknown| shared.get(*unknown).map_or(1.0, |count| 1.0 / count.max(1.0))).sum();
+            sum / block.unknowns.len().max(1) as f64
         })
         .collect();
+    drop(shared);
     let mut locals: Vec<Vec<f64>> = vec![Vec::new(); blocks.len()];
     let mut held = Vec::with_capacity(coarse.len());
-    let mut weighted = vec![0.0; n];
     // z = M⁻¹ r.
     let mut apply = |r: &[f64], z: &mut [f64]| -> Result<()> {
         z.fill(0.0);
@@ -336,26 +328,15 @@ pub(crate) fn solve(
                 }
             }
         }
-        for ((scaled, residual), w) in weighted.iter_mut().zip(r).zip(&weight) {
-            *scaled = residual * w;
-        }
-        let scaled = &weighted;
         parallel::for_each_mut(&mut locals, |block, out| {
             if let Some(found) = blocks.get(block) {
-                match even.get(block).copied().flatten() {
-                    Some(_) => found.solve(r, out),
-                    None => found.solve(scaled, out),
-                }
+                found.solve(r, out);
             }
         });
-        for ((block, local), even) in blocks.iter().zip(&locals).zip(&even) {
+        for ((block, local), weight) in blocks.iter().zip(&locals).zip(&weights) {
             for (unknown, value) in block.unknowns.iter().zip(local) {
-                if let (Some(slot), Some(w)) = (z.get_mut(*unknown), weight.get(*unknown)) {
-                    *slot += match even {
-                        // In and out: the weight twice.
-                        Some(even) => even * even * value,
-                        None => w * value,
-                    };
+                if let Some(slot) = z.get_mut(*unknown) {
+                    *slot += weight * value;
                 }
             }
         }
@@ -374,7 +355,7 @@ pub(crate) fn solve(
         if iteration % LOOK == 0 && cancelled() {
             return Err(Error::Internal("cancelled".into()));
         }
-        matrix.mul(&p, &mut ap);
+        matrix.mul_kept(own, &p, &mut ap);
         let curvature = dot(&p, &ap);
         // A direction with no stiffness, or a number that is none: not this method's system.
         if !(curvature > 0.0 && rz > 0.0) || !curvature.is_finite() || !rz.is_finite() {
@@ -392,7 +373,7 @@ pub(crate) fn solve(
         if residual <= settled {
             // The residual of the recurrence drifts from the true one over many rounds: the
             // true one decides.
-            matrix.mul(&u, &mut ap);
+            matrix.mul_kept(own, &u, &mut ap);
             for ((res, b), a) in r.iter_mut().zip(load).zip(&ap) {
                 *res = b - a;
             }
@@ -459,6 +440,10 @@ mod tests {
         (Csr { n, ptr, idx, val }, load)
     }
 
+    fn size(load: &[f64]) -> f64 {
+        dot(load, load).sqrt()
+    }
+
     #[test]
     fn the_iteration_solves_what_the_factorization_does() {
         let nodes = 60;
@@ -468,7 +453,10 @@ mod tests {
         // overlap by one.
         let linear: Vec<bool> = (0..nodes).map(|node| node % 4 == 0).collect();
         let blocks: Vec<Vec<usize>> = (0..nodes).step_by(4).map(|first| (first..(first + 5).min(nodes)).collect()).collect();
-        let solved = solve(&matrix, &load, &linear, &blocks, &[], &Limits::default(), SETTLED, MOST, &|| false).unwrap().expect("settled");
+        let run = |matrix: &Blocked, load: &[f64], linear: &[bool], most: usize, cancelled: bool| {
+            solve(matrix, &[], load, size(load), linear, &blocks, &Limits::default(), SETTLED, most, &|| cancelled)
+        };
+        let solved = run(&matrix, &load, &linear, MOST, false).unwrap().expect("settled");
         let mut direct = load.clone();
         Factor::new(&UpperColumns::from_symmetric(&rows), usize::MAX).unwrap().solve(&mut direct).unwrap();
         let largest = direct.iter().fold(0.0f64, |m, x| m.max(x.abs()));
@@ -478,27 +466,23 @@ mod tests {
         assert!(solved.iterations > 0 && solved.iterations < 60 && solved.residual <= SETTLED, "{} rounds, {}", solved.iterations, solved.residual);
         assert!(solved.coarse_entries > 0);
         // The same to the bit on one thread and on many.
-        let one = parallel::with_threads(1, || solve(&matrix, &load, &linear, &blocks, &[], &Limits::default(), SETTLED, MOST, &|| false))
-            .unwrap()
-            .unwrap();
+        let one = parallel::with_threads(1, || run(&matrix, &load, &linear, MOST, false)).unwrap().unwrap();
         assert!(one.u.iter().zip(&solved.u).all(|(a, b)| a.to_bits() == b.to_bits()) && one.iterations == solved.iterations);
 
         // No load moves nothing; too few rounds, and a matrix that is not positive, are the
         // factorization's; a caller that cancels ends it.
-        let still = solve(&matrix, &vec![0.0; 3 * nodes], &linear, &blocks, &[], &Limits::default(), SETTLED, MOST, &|| false).unwrap().unwrap();
+        let still = run(&matrix, &vec![0.0; 3 * nodes], &linear, MOST, false).unwrap().unwrap();
         assert!(still.iterations == 0 && still.u.iter().all(|x| *x == 0.0));
-        assert!(solve(&matrix, &load, &linear, &blocks, &[], &Limits::default(), SETTLED, 2, &|| false).unwrap().is_none());
+        assert!(run(&matrix, &load, &linear, 2, false).unwrap().is_none());
         let mut indefinite = rows.clone();
         for value in &mut indefinite.val {
             *value = -*value;
         }
-        let indefinite = Blocked::from_rows(&indefinite);
-        assert!(solve(&indefinite, &load, &linear, &blocks, &[], &Limits::default(), SETTLED, MOST, &|| false).unwrap().is_none());
-        assert!(solve(&matrix, &load, &linear, &blocks, &[], &Limits::default(), SETTLED, MOST, &|| true).is_err());
-        assert!(solve(&matrix, &load[1..], &linear, &blocks, &[], &Limits::default(), SETTLED, MOST, &|| false).is_err());
+        assert!(run(&Blocked::from_rows(&indefinite), &load, &linear, MOST, false).unwrap().is_none());
+        assert!(run(&matrix, &load, &linear, MOST, true).is_err());
+        assert!(run(&matrix, &load[1..], &linear, MOST, false).is_err());
         // Without a coarse level the blocks alone still solve it.
-        let none = vec![false; nodes];
-        let alone = solve(&matrix, &load, &none, &blocks, &[], &Limits::default(), SETTLED, MOST, &|| false).unwrap().expect("settled");
+        let alone = run(&matrix, &load, &vec![false; nodes], MOST, false).unwrap().expect("settled");
         assert!(alone.coarse_entries == 0 && alone.residual <= SETTLED);
         for (a, b) in alone.u.iter().zip(&direct) {
             assert!((a - b).abs() < 1e-7 * largest, "{a} against {b}");
@@ -506,16 +490,116 @@ mod tests {
     }
 
     #[test]
+    fn nodes_taken_out_are_left_alone() {
+        // Every third node taken out, its rows and columns with it: the others solve the
+        // system of their own rows, and the nodes taken out stay at zero.
+        let nodes = 30;
+        let (rows, mut load) = chain(nodes);
+        let matrix = Blocked::from_rows(&rows);
+        let own: Vec<bool> = (0..nodes).map(|node| node % 3 == 1).collect();
+        for (node, _) in own.iter().enumerate().filter(|(_, own)| **own) {
+            load[3 * node..3 * node + 3].fill(0.0);
+        }
+        let linear: Vec<bool> = (0..nodes).map(|node| node % 6 == 0).collect();
+        let blocks: Vec<Vec<usize>> =
+            (0..nodes).step_by(3).map(|first| (first..(first + 4).min(nodes)).filter(|node| !own[*node]).collect()).collect();
+        let solved =
+            solve(&matrix, &own, &load, size(&load), &linear, &blocks, &Limits::default(), SETTLED, MOST, &|| false).unwrap().expect("settled");
+        let kept = matrix.rows_kept(&own);
+        let mut direct: Vec<f64> = load.as_chunks::<3>().0.iter().zip(&own).filter(|(_, own)| !**own).flat_map(|(entries, _)| *entries).collect();
+        Factor::new(&UpperColumns::from_symmetric(&kept), usize::MAX).unwrap().solve(&mut direct).unwrap();
+        let found: Vec<f64> = solved.u.as_chunks::<3>().0.iter().zip(&own).filter(|(_, own)| !**own).flat_map(|(entries, _)| *entries).collect();
+        let largest = direct.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+        for (a, b) in found.iter().zip(&direct) {
+            assert!((a - b).abs() < 1e-7 * largest, "{a} against {b}");
+        }
+        assert!(solved.u.as_chunks::<3>().0.iter().zip(&own).all(|(entries, own)| !own || entries == &[0.0; 3]));
+    }
+
+    /// The nodes of the cells of a grid of `nx` by `ny` squares: a node for every vertex, then
+    /// one for every edge, then one for every square (its own). Returns the lists and the
+    /// number of vertices and edges.
+    fn squares(nx: usize, ny: usize) -> (Vec<Vec<usize>>, usize, usize) {
+        let vertex = |i: usize, j: usize| i + (nx + 1) * j;
+        let vertices = (nx + 1) * (ny + 1);
+        // Edges along x, then along y.
+        let along_x = |i: usize, j: usize| vertices + i + nx * j;
+        let along_y = |i: usize, j: usize| vertices + nx * (ny + 1) + i + (nx + 1) * j;
+        let edges = nx * (ny + 1) + (nx + 1) * ny;
+        let mut lists = Vec::new();
+        for j in 0..ny {
+            for i in 0..nx {
+                lists.push(vec![
+                    vertex(i, j),
+                    vertex(i + 1, j),
+                    vertex(i, j + 1),
+                    vertex(i + 1, j + 1),
+                    along_x(i, j),
+                    along_x(i, j + 1),
+                    along_y(i, j),
+                    along_y(i + 1, j),
+                    vertices + edges + i + nx * j,
+                ]);
+            }
+        }
+        (lists, vertices, edges)
+    }
+
+    #[test]
+    fn the_blocks_are_those_around_the_vertices() {
+        let (lists, vertices, edges) = squares(3, 3);
+        let nodes = vertices + edges + 9;
+        let mut count = vec![0; nodes];
+        for node in lists.iter().flatten() {
+            count[*node] += 1;
+        }
+        // What one cell alone has is taken out: the squares' own nodes and the outer edges.
+        // (The four corners are in one cell too; they are kept here, to be found in a block.)
+        let own: Vec<bool> = (0..nodes).map(|node| count[node] == 1 && node >= vertices).collect();
+        let blocks = patches(&lists, lists.len(), &own);
+        // One block for each of the four inner vertices: the vertex, the four edges that meet
+        // there, and the vertices at the rim that reach none but its cells.
+        assert_eq!(blocks.len(), 4);
+        for block in &blocks {
+            assert!(block.windows(2).all(|pair| pair[0] < pair[1]));
+            assert_eq!(block.iter().filter(|node| (vertices..vertices + edges).contains(*node)).count(), 4);
+            assert_eq!(block.iter().filter(|node| **node < vertices && count[**node] == 4).count(), 1);
+        }
+        let mut held = vec![false; nodes];
+        for node in blocks.iter().flatten() {
+            held[*node] = true;
+        }
+        assert!((0..nodes).all(|node| held[node] != own[node]), "every node that is left, and no other");
+
+        // A node that reaches more cells than a vertex has around it is in no block around a
+        // vertex: every cell it reaches is a block. Two coupled cells are one more.
+        let mut far = lists.clone();
+        let wide = nodes;
+        for list in &mut far {
+            list.push(wide);
+        }
+        far.push(vec![0, 1, 40]);
+        let mut own_far = own.clone();
+        own_far.push(false);
+        let blocks = patches(&far, 9, &own_far);
+        assert_eq!(blocks.len(), 4 + 9 + 1);
+        assert!(blocks[4..13].iter().all(|block| block.contains(&wide)) && blocks[..4].iter().all(|block| !block.contains(&wide)));
+        assert_eq!(blocks[13], [0, 1]);
+        // A cell alone, and no lists at all.
+        assert_eq!(patches(&[vec![2, 0, 1, 1]], 1, &[false, false, true]), [vec![0, 1]]);
+        assert!(patches(&[], 0, &[]).is_empty());
+    }
+
+    #[test]
     fn a_block_is_solved_by_its_own_factor() {
         let (rows, _) = chain(6);
-        let block = Block::new(&Blocked::from_rows(&rows), &[4, 1, 2]).expect("small");
+        let block = Block::new(&Blocked::from_rows(&rows), &[1, 2, 4]).expect("small");
         assert_eq!(block.unknowns, [3, 4, 5, 6, 7, 8, 12, 13, 14]);
         // K_block x = r for a known x.
         let x: Vec<f64> = (0..9).map(|i| 0.5 + i as f64).collect();
         let mut r = vec![0.0; rows.n];
-        for (i, unknown) in block.unknowns.iter().enumerate() {
+        for unknown in &block.unknowns {
             let (columns, values) = rows.row(*unknown);
-            let _ = i;
             for (column, value) in columns.iter().zip(values) {
                 if let Ok(j) = block.unknowns.binary_search(column) {
                     r[*unknown] += value * x[j];
@@ -527,7 +611,5 @@ mod tests {
         for (a, b) in out.iter().zip(&x) {
             assert!((a - b).abs() < 1e-12, "{a} against {b}");
         }
-        assert!(!cholesky(&mut [1.0, 2.0, 1.0], 2), "not positive");
-        assert!(!cholesky(&mut [1.0], 2), "the wrong size");
     }
 }

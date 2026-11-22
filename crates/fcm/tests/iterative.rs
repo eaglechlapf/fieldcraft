@@ -83,7 +83,7 @@ fn a_block_by_iteration_is_the_block_by_factorization() {
         let direct = solve(&surface, &STEEL, &supports, &loads, &options(Solver::Direct), &Limits::default()).unwrap();
         let iterated = solve(&surface, &STEEL, &supports, &loads, &options(Solver::Iterative), &Limits::default()).unwrap();
         assert_eq!((direct.stats.iterations, direct.stats.residual), (0, 0.0));
-        assert!(iterated.stats.iterations > 5 && iterated.stats.iterations < 150, "degree {degree}, {basis:?}: {} rounds", iterated.stats.iterations);
+        assert!(iterated.stats.iterations > 5 && iterated.stats.iterations < 60, "degree {degree}, {basis:?}: {} rounds", iterated.stats.iterations);
         assert!(iterated.stats.residual > 0.0 && iterated.stats.residual <= 1e-9, "{}", iterated.stats.residual);
         // The coarse level's factor is a small part of the whole one.
         assert!(iterated.stats.factor_entries > 0 && iterated.stats.factor_entries * 10 < direct.stats.factor_entries);
@@ -123,9 +123,9 @@ fn a_block_by_iteration_is_the_block_by_factorization() {
 
 /// A thick tube under pressure in its bore, its cells divided where the surface is curved: the
 /// coarse level is the linear functions of every level, and the iteration settles on a grid of
-/// several levels as on one. Nearly every cell of so coarse a grid is cut by the curved
-/// surface, which is the iteration's hardest ground: it takes three times the rounds of a
-/// grid whose cells are mostly whole.
+/// several levels. Nearly every cell of so coarse a grid is cut by the curved surface, which
+/// costs no rounds; cells of two sizes side by side do (the functions of a divided cell reach
+/// farther than a block around a vertex holds), three or four times as many.
 #[test]
 fn divided_cells_are_iterated_like_the_grids_own() {
     let surface = tube(48, 1.0, 0.5, 0.6);
@@ -146,9 +146,37 @@ fn divided_cells_are_iterated_like_the_grids_own() {
             direct.stats.unknowns,
             iterated.stats.iterations
         );
-        assert!(iterated.stats.iterations > 0 && iterated.stats.iterations < 390, "{refine} levels: {} rounds", iterated.stats.iterations);
+        // One level, and two with every cell divided, are grids of one size; three are not.
+        let most = if refine < 2 { 60 } else { 200 };
+        assert!(iterated.stats.iterations > 0 && iterated.stats.iterations < most, "{refine} levels: {} rounds", iterated.stats.iterations);
         assert!(du < 1e-7 && ds < 1e-6, "{refine} levels: displacement {du:.2e}, stress {ds:.2e}");
         assert!(refine == 0 || direct.stats.levels[refine] > 0, "no cell of level {refine}");
+    }
+}
+
+/// A thin part with a hole on cells twice as large as it is thick: a washer, clamped by its rim
+/// and pressed on its face. Around the hole and through the thickness every cell holds a
+/// little material only, and the functions they share are nearly sums of the functions each
+/// has to itself there: blocks of one cell each took ten times the rounds of a compact part
+/// on such a grid. With every cell's own unknowns taken out and blocks around the vertices it
+/// takes no more than a compact one.
+#[test]
+fn a_thin_part_with_a_hole_is_iterated_like_a_compact_one() {
+    let surface = tube(48, 1.0, 0.3, 0.12);
+    let supports = [Support { face: 0, fixed: [true; 3], value: [0.0; 3] }];
+    let loads = [Load::Pressure { face: 2, pressure: 1.0e5 }];
+    let points = [[0.6, 0.0, 0.06], [0.0, 0.35, 0.1], [-0.52, 0.3, 0.02], [0.33, 0.1, 0.06]];
+    for degree in [3, 4] {
+        let options = |solver: Solver| Options { degree, solver, offset: [0.37, 0.21, 0.43], ..Options::new(0.25) };
+        let direct = solve(&surface, &STEEL, &supports, &loads, &options(Solver::Direct), &Limits::default()).unwrap();
+        let iterated = solve(&surface, &STEEL, &supports, &loads, &options(Solver::Iterative), &Limits::default()).unwrap();
+        let (du, ds) = apart(&iterated, &direct, &points);
+        println!(
+            "degree {degree}: {} unknowns, {} rounds; displacement {du:.1e}, stress {ds:.1e} apart",
+            direct.stats.unknowns, iterated.stats.iterations
+        );
+        assert!(iterated.stats.iterations > 0 && iterated.stats.iterations < 60, "degree {degree}: {} rounds", iterated.stats.iterations);
+        assert!(du < 1e-7 && ds < 1e-6, "degree {degree}: displacement {du:.2e}, stress {ds:.2e}");
     }
 }
 
@@ -179,7 +207,7 @@ fn connected_bodies_by_iteration_are_those_by_factorization() {
         let (direct, iterated) = (run(Solver::Direct), run(Solver::Iterative));
         let rounds = iterated[0].stats.iterations;
         // Every body's solution counts the rounds of the one system.
-        assert!(iterated.iter().all(|s| s.stats.iterations == rounds) && rounds > 0 && rounds < 300, "{grip:?}: {rounds} rounds");
+        assert!(iterated.iter().all(|s| s.stats.iterations == rounds) && rounds > 0 && rounds < 100, "{grip:?}: {rounds} rounds");
         for (body, at) in points.iter().enumerate() {
             let (du, ds) = apart(&iterated[body], &direct[body], at);
             println!("{grip:?}, body {body}: {rounds} rounds; displacement {du:.1e}, stress {ds:.1e} apart");
@@ -193,18 +221,27 @@ fn connected_bodies_by_iteration_are_those_by_factorization() {
     }
 }
 
-/// A material that hardly changes its volume is not the iteration's: asked for, the rounds do
-/// not settle it and the factorization solves it after all, to the bit.
+/// A material that hardly changes its volume at all is not the iteration's (at a Poisson's ratio
+/// of 0.4999 it still settles, in a hundred rounds): asked for, the rounds do not settle it and
+/// the factorization solves it after all, of what the cells' own unknowns left of the system.
+/// So ill-conditioned a system is solved to five digits either way, not to the same bits.
 #[test]
 fn what_the_iteration_does_not_settle_is_factored() {
     let surface = block([0.0; 3], [1.0, 0.5, 0.5]);
-    let rubber = Material { young: 1.0e7, poisson: 0.4999, density: 1000.0 };
+    let rubber = Material { young: 1.0e7, poisson: 0.499_999, density: 1000.0 };
     let supports = [Support { face: 0, fixed: [true; 3], value: [0.0; 3] }];
     let loads = [Load::Traction { face: 1, traction: [1.0e4, 0.0, 2.0e3] }];
     let options = |solver: Solver| Options { degree: 3, solver, offset: [0.31, 0.62, 0.13], ..Options::new(0.25) };
     let direct = solve(&surface, &rubber, &supports, &loads, &options(Solver::Direct), &Limits::default()).unwrap();
     let asked = solve(&surface, &rubber, &supports, &loads, &options(Solver::Iterative), &Limits::default()).unwrap();
-    assert_eq!((asked.stats.iterations, asked.strain_energy.to_bits()), (0, direct.strain_energy.to_bits()));
+    assert_eq!(asked.stats.iterations, 0);
+    assert!(
+        (asked.strain_energy - direct.strain_energy).abs() < 1e-4 * direct.strain_energy,
+        "{} against {}",
+        asked.strain_energy,
+        direct.strain_energy
+    );
+    assert!(asked.stats.factor_entries > 0 && asked.stats.factor_entries < direct.stats.factor_entries, "fewer unknowns are factored");
     // Where the factor may not be had either, the refusal says both.
     let none = Limits { max_factor_entries: 1000, ..Limits::default() };
     let refused = solve(&surface, &rubber, &supports, &loads, &options(Solver::Iterative), &none);

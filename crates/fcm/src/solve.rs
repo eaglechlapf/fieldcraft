@@ -649,9 +649,6 @@ pub(crate) struct View<'a> {
     pub at: &'a dyn Fn([f64; 3], [f64; 3]) -> Option<(usize, Vec<f64>)>,
     /// The Nitsche parameter of an element's cell, once its matrices were handed over.
     pub nitsche: &'a dyn Fn(usize) -> f64,
-    /// The fraction of an element's cell that holds its material, once its matrices were handed
-    /// over: 1 for a cell wholly inside the part.
-    pub fraction: &'a dyn Fn(usize) -> f64,
     /// Which functions are linear shape functions ([`crate::space::Space::linear`]).
     pub linear: &'a [bool],
     /// How the body asks for its unknowns to be solved, and its Poisson's ratio, which decides
@@ -1965,7 +1962,6 @@ fn solve_at(
         [0, 1, 2].map(|a| grid.origin[a] + 0.5 * grid.spacing * at[a])
     };
     let nitsche_of = |element: usize| tally.try_borrow().ok().and_then(|tally| tally.nitsche.get(element).copied()).unwrap_or(0.0);
-    let fraction_of = |element: usize| tally.try_borrow().ok().and_then(|tally| tally.fractions.get(element).copied()).unwrap_or(1.0);
     let view = View {
         grid,
         tree: &tree,
@@ -1976,7 +1972,6 @@ fn solve_at(
         tied: &tied,
         at: &at,
         nitsche: &nitsche_of,
-        fraction: &fraction_of,
         linear: &space.linear,
         solver: options.solver,
         poisson: material.poisson,

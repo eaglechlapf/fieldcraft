@@ -100,6 +100,7 @@
 pub mod assembly;
 mod blocked;
 mod cell;
+mod condense;
 mod dense;
 pub mod exact;
 pub mod gauss;
@@ -109,6 +110,7 @@ pub mod islands;
 mod iterative;
 pub mod legendre;
 mod moments;
+mod packed;
 mod refine;
 mod solve;
 mod space;

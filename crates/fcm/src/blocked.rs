@@ -107,40 +107,92 @@ impl Blocked {
     }
 
     /// y = A x: the nodes in parallel, each row's sum over its blocks in order.
+    #[cfg(test)]
     pub(crate) fn mul(&self, x: &[f64], y: &mut [f64]) {
+        self.mul_kept(&[], x, y);
+    }
+
+    /// y = A x on the nodes that are not `left` out: their rows, and in them their columns. A
+    /// row that is left out gets zeros; its blocks are not read.
+    pub(crate) fn mul_kept(&self, left: &[bool], x: &[f64], y: &mut [f64]) {
+        let out_of = |node: usize| left.get(node).copied().unwrap_or(false);
         parallel::chunks_mut(y, 3 * ROWS, |task, out| {
             for (i, sums) in out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
-                let (others, blocks) = self.row(task * ROWS + i);
                 let mut sum = [0.0f64; 3];
-                for (other, a) in others.iter().zip(blocks) {
-                    let at = 3 * *other as usize;
-                    let Some(&[x0, x1, x2]) = x.get(at..at + 3).and_then(|x| x.first_chunk::<3>()) else { continue };
-                    sum[0] += a[0] * x0 + a[1] * x1 + a[2] * x2;
-                    sum[1] += a[3] * x0 + a[4] * x1 + a[5] * x2;
-                    sum[2] += a[6] * x0 + a[7] * x1 + a[8] * x2;
+                if !out_of(task * ROWS + i) {
+                    let (others, blocks) = self.row(task * ROWS + i);
+                    for (other, a) in others.iter().zip(blocks) {
+                        let at = 3 * *other as usize;
+                        if out_of(*other as usize) {
+                            continue;
+                        }
+                        let Some(&[x0, x1, x2]) = x.get(at..at + 3).and_then(|x| x.first_chunk::<3>()) else { continue };
+                        sum[0] += a[0] * x0 + a[1] * x1 + a[2] * x2;
+                        sum[1] += a[3] * x0 + a[4] * x1 + a[5] * x2;
+                        sum[2] += a[6] * x0 + a[7] * x1 + a[8] * x2;
+                    }
                 }
                 *sums = sum;
             }
         });
     }
 
+    /// Hand every node's blocks to `each` to be changed, with the node and the nodes its
+    /// blocks are for: the nodes in parallel, each by one task.
+    pub(crate) fn change_rows(&mut self, each: impl Fn(usize, &[u32], &mut [[f64; 9]]) + Sync + Send) {
+        let (start, others) = (&self.start, &self.node);
+        let first = |node: usize| start.get(node).copied().unwrap_or(0);
+        // Each task's part of the blocks.
+        let mut parts = Vec::new();
+        let mut left = self.value.as_mut_slice();
+        for range in parallel::blocks(start.len().saturating_sub(1), ROWS) {
+            let length = first(range.end).saturating_sub(first(range.start));
+            let Some((own, rest)) = std::mem::take(&mut left).split_at_mut_checked(length) else { break };
+            left = rest;
+            parts.push((range, own));
+        }
+        parallel::for_each_mut(&mut parts, |_, (range, blocks)| {
+            let base = first(range.start);
+            for node in range.clone() {
+                let (from, to) = (first(node), first(node + 1));
+                if let (Some(others), Some(blocks)) = (others.get(from..to), blocks.get_mut(from.saturating_sub(base)..to.saturating_sub(base))) {
+                    each(node, others, blocks);
+                }
+            }
+        });
+    }
+
     /// The matrix by rows of entries, each with its column: what the factorization reads.
+    #[cfg(test)]
     pub(crate) fn rows(&self) -> Csr {
-        let (n, entries) = (3 * self.nodes(), self.entries());
-        let (mut ptr, mut idx, mut val) = (Vec::with_capacity(n + 1), Vec::with_capacity(entries), Vec::with_capacity(entries));
-        ptr.push(0);
+        self.rows_kept(&[])
+    }
+
+    /// The rows of the nodes that are not `left` out, with the columns of those nodes alone,
+    /// numbered in their order.
+    pub(crate) fn rows_kept(&self, left: &[bool]) -> Csr {
+        let out_of = |node: usize| left.get(node).copied().unwrap_or(false);
+        // Where each node that is kept goes.
+        let mut place = Vec::with_capacity(self.nodes());
+        let mut kept = 0usize;
         for node in 0..self.nodes() {
+            place.push(kept);
+            kept += usize::from(!out_of(node));
+        }
+        let (mut ptr, mut idx, mut val) = (Vec::with_capacity(3 * kept + 1), Vec::new(), Vec::new());
+        ptr.push(0);
+        for node in (0..self.nodes()).filter(|node| !out_of(*node)) {
             let (others, blocks) = self.row(node);
             for i in 0..3 {
-                for (other, block) in others.iter().zip(blocks) {
-                    let first = 3 * *other as usize;
+                for (other, block) in others.iter().zip(blocks).filter(|(other, _)| !out_of(**other as usize)) {
+                    let first = 3 * place.get(*other as usize).copied().unwrap_or(0);
                     idx.extend(first..first + 3);
                     val.extend_from_slice(block.get(3 * i..3 * i + 3).unwrap_or_default());
                 }
                 ptr.push(idx.len());
             }
         }
-        Csr { n, ptr, idx, val }
+        Csr { n: 3 * kept, ptr, idx, val }
     }
 
     /// The matrix `rows` by blocks (three unknowns to a node), with a zero where a block has
@@ -232,6 +284,41 @@ mod tests {
         }
         parallel::with_threads(1, || blocked.mul(&x, &mut one));
         assert!(one.iter().zip(&by_blocks).all(|(a, b)| a.to_bits() == b.to_bits()));
+
+        // Rows changed in parallel are changed once each, with their own nodes.
+        let before = blocked.rows();
+        blocked.change_rows(|node, others, blocks| {
+            assert_eq!(others.len(), blocks.len());
+            for (other, block) in others.iter().zip(blocks) {
+                block[0] += (node * 1000 + *other as usize) as f64;
+            }
+        });
+        let after = blocked.rows();
+        for row in (0..after.n).step_by(3) {
+            let ((columns, was), (_, is)) = (before.row(row), after.row(row));
+            for ((column, was), is) in columns.iter().zip(was).zip(is).step_by(3) {
+                assert!((is - was - (row / 3 * 1000 + column / 3) as f64).abs() < 1e-9, "{was} to {is}");
+            }
+        }
+        // Without the nodes left out: their rows and columns are gone, the others renumbered.
+        let left: Vec<bool> = (0..nodes).map(|node| node % 3 == 1).collect();
+        let place: Vec<usize> = (0..nodes).filter(|node| !left[*node]).collect();
+        let some = blocked.rows_kept(&left);
+        assert_eq!(some.n, 3 * place.len());
+        for (r, node) in place.iter().enumerate() {
+            let (columns, values) = some.row(3 * r);
+            let (all_columns, all_values) = after.row(3 * node);
+            let expected: Vec<(usize, f64)> = all_columns
+                .iter()
+                .zip(all_values)
+                .filter(|(c, _)| !left[**c / 3])
+                .map(|(c, v)| (3 * place.binary_search(&(c / 3)).unwrap() + c % 3, *v))
+                .collect();
+            assert_eq!(columns.iter().copied().zip(values.iter().copied()).collect::<Vec<_>>(), expected);
+        }
+        let mut some_product = vec![1.0; rows.n];
+        blocked.mul_kept(&left, &x, &mut some_product);
+        assert!(some_product.as_chunks::<3>().0.iter().zip(&left).all(|(y, out)| !out || y == &[0.0; 3]));
     }
 
     #[test]

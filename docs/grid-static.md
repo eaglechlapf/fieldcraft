@@ -317,8 +317,8 @@ fillet of 6 mm:
 
 Too large to factor on this part: degree 4 with one level at the default cell size (339 000
 unknowns, a stiffness of 228 million entries against the 180 million a factorization takes).
-It is solved by iteration, slowly for a part this thin (1120 rounds, 49 s: see
-[How large a model](#how-large-a-model)), and gives about 219 MPa (+3 %). Two levels at the default cell
+It is solved by iteration (174 rounds, 9 s: see [How large a model](#how-large-a-model)), and
+gives about 219 MPa (+3 %). Two levels at the default cell
 size (cells of 1.1 mm at the fillet, 367 000 unknowns) take 13 s and give 211.2 MPa (−0.8 %). The
 largest displacement is 0.1549 to 0.1550 mm on every grid of the table but the three of 8 mm
 cells with no levels (0.1499, 0.1538 and 0.1546 mm), and the clamped face carries the 2 kN on
@@ -347,43 +347,54 @@ The unknowns are solved all at once, in one of two ways, and the command chooses
   digits on every machine. Its time grows with the square of the unknowns for a compact part
   and its memory a little faster than the unknowns; a thin part, whose cells lie side by side
   in a sheet, costs far less.
-- **By iteration** (`"iterative"`): conjugate gradients, each round made effective by solving
-  two simpler problems exactly, the part on linear shape functions alone and every cell on
-  its own. Its time and memory grow with the unknowns, and the rounds do not grow with the
-  grid (about a hundred). The result is right to a residual of 10⁻⁹ of the load, which is
-  displacements to about nine digits and reactions that balance the loads to as many.
+- **By iteration** (`"iterative"`). First the unknowns every cell has to itself are taken
+  out exactly (an eighth of them inside a part, up to half where it is thin). The rest is solved by conjugate gradients, each
+  round made effective by solving two kinds of simpler problem exactly: the part on linear
+  shape functions alone, and the shape functions around every vertex of the grid on their
+  own. Its time and memory grow with the unknowns, and the rounds do not grow with the grid
+  (30 to 40 where no cell is divided). The result is right to a residual of 10⁻⁹ of the load,
+  which is displacements to about nine digits and reactions that balance the loads to as
+  many.
 
-Left to the command, a system under 100,000 unknowns is factored, and so is a larger one
-whose factorization is predicted to be the less work (a thin part); the others are iterated,
-and so is any whose factor would not fit `max_factor_entries` or whose stiffness has more
-than 180 million entries. The choice is made from the grid, before the stiffness is added
-up, because the two ways keep it differently. What the iteration does not settle in 400
-rounds, such as a nearly incompressible material (Poisson's ratio towards one half), is
-factored after all; a system too large to factor is iterated for up to 2000 rounds. The
-reply's `solver` says which it was, with the `iterations`.
+Left to the command, a system under 50,000 unknowns is factored, and so is a larger one
+whose factorization is predicted to be the less work (a thin part whose cells are divided,
+of moderate size); the others are iterated, and so is any whose factor would not fit
+`max_factor_entries` or whose stiffness has more than 180 million entries. The choice is
+made from the grid, before the stiffness is added up, because the two ways keep it
+differently. What the iteration does not settle in 400 rounds, such as a material that
+hardly changes its volume at all (it settles at a Poisson's ratio of 0.4999, in five times
+the rounds), is factored after all; a system too large to factor is iterated for up to 2000
+rounds. The reply's `solver` says which it was, with the `iterations`.
 
 Measured at degree 3 on a desktop processor with 24 threads (i7-13700KF), the whole solve:
 
 | Part | Unknowns | Factorization | Iteration | Chosen |
 |---|---|---|---|---|
-| A solid block, 14 cells along its longest side | 220,000 | 7.4 s, 2.1 GB of factor | 2.9 s, 106 rounds | iteration |
-| The same, 18 cells | 416,000 | 23 s, 5.1 GB | 5.7 s, 106 rounds | iteration |
-| The same, 24 cells | 974,000 | too large | 14.7 s, 105 rounds | iteration |
-| The same, 36 cells | 3,050,000 | too large | 53 s, 104 rounds | iteration |
-| A thick tube, curved, 20 cells across | 340,000 | 10.8 s, 3.1 GB | 4.4 s, 103 rounds | iteration |
-| Three blocks bonded together | 188,000 | 7.6 s, 1.7 GB | 5.5 s, 137 rounds | iteration |
-| A plate one cell thick, 40 cells along | 167,000 | 1.7 s, 0.5 GB | 2.2 s, 96 rounds | factorization |
+| A solid block, 14 cells along its longest side | 220,000 | 7.4 s, 2.1 GB of factor | 1.5 s, 32 rounds | iteration |
+| The same, 18 cells | 416,000 | 23 s, 5.1 GB | 3.0 s, 31 rounds | iteration |
+| The same, 24 cells | 974,000 | too large | 6.7 s, 31 rounds | iteration |
+| The same, 36 cells | 3,050,000 | too large | 26 s, 31 rounds | iteration |
+| A thick tube, curved, 20 cells across | 340,000 | 10.8 s, 3.1 GB | 2.5 s, 32 rounds | iteration |
+| Three blocks bonded together | 188,000 | 7.6 s, 1.7 GB | 4.4 s, 85 rounds | iteration |
+| A plate one cell thick, 40 cells along | 167,000 | 1.7 s, 0.5 GB | 0.9 s, 29 rounds | iteration |
+| The 8 mm bracket above, 4.4 mm cells, none divided | 68,000 | 1.0 s | 0.5 s, 39 rounds | iteration |
+| The same, cells divided once | 145,000 | 2.6 s | 2.2 s, 117 rounds | factorization |
+| The same on 8 mm cells divided twice | 145,000 | 2.9 s | 4.3 s, 233 rounds | factorization |
 
 The iteration keeps the stiffness by blocks of three by three, one for every two shape
 functions that couple (76 bytes for nine entries, where the factorization's rows take 144),
-and one small factor per cell: 2.0 GB in all for the block of 416,000 unknowns, 4.7 GB for
-974,000 and 15 GB for 3 million, about 5 GB for every million unknowns of degree 3. Its time
-grows with the unknowns: 15 to 18 s for every million on that processor.
+and one small factor for every vertex: 1.9 GB in all for the block of 416,000 unknowns,
+4.6 GB for 974,000 and 15 GB for 3 million, about 5 GB for every million unknowns of degree
+3. Its time grows with the unknowns: 7 to 9 s for every million on that processor.
 
-The rounds stay near a hundred for a compact part on any grid. They grow for a thin part
-on cells as large as its walls are thick: the 8 mm bracket above takes 124 rounds on cells
-of 2.2 mm, 268 on cells of 4.4 mm and 390 on cells of 8 mm at degree 3, and more at degree
-4. Such a part is factored, which is cheap for it, unless it is too large for that.
+A thin part takes no more rounds than a compact one, and cut cells none: the bracket takes
+36 to 39 rounds at degree 3 on cells of 2.2, 4.4 and 8 mm, and 40 at degree 4. What takes
+more are cells of two sizes side by side, where a cell is divided and the one beside it is
+not: the functions of the larger cell reach farther than the shape functions around a
+vertex. The bracket with its cells divided once at its fillet and holes takes 117 rounds at
+degree 3 and 174 at degree 4, divided twice 233; a grid whose cells are all divided is a
+grid of one size again. Bodies held together by connections take two to three times the
+rounds of one (85 for three bonded blocks, 78 where they slide).
 
 Two limits stop a solve before it takes the machine's memory. `max_factor_entries` (8 bytes
 an entry; the default of 400 million is 3.2 GB) caps the factor of the factorization, and a
