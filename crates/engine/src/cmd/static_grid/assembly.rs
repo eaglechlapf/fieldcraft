@@ -6,6 +6,27 @@ use std::collections::BTreeSet;
 
 use super::*;
 
+/// How often a solve too large for a limit is run again on larger cells, when the cell sizes
+/// were left to the command: each time with half the cells.
+const ENLARGE: usize = 3;
+
+/// How often the unknowns are counted to fit the default cells to their budget: a count shows
+/// how far the cells are from it, and the next ones are that much larger.
+const FIT: usize = 4;
+
+/// The least a round of fitting enlarges the cells by: what the cells cut by the surfaces, whose
+/// number falls more slowly than the others', leave over of the step before.
+const FIT_STEP: f64 = 1.03;
+
+/// The unknowns a compact body has at the default cell size: a cube's, with cells
+/// [`DEFAULT_RELATIVE_CELL`] of its diagonal across, (1/(√3 · that))³ of them, each with
+/// 3 · degree³. The default cells of several bodies are made larger together until the bodies
+/// have no more than these between them, so that an assembly costs what one part does however
+/// many bodies it has.
+fn compact_unknowns(degree: usize) -> f64 {
+    3.0 * (degree as f64).powi(3) * (1.0 / (3f64.sqrt() * DEFAULT_RELATIVE_CELL)).powi(3)
+}
+
 /// One body, ready for the solver.
 struct Prepared<'a> {
     shape: &'a Shape,
@@ -20,6 +41,17 @@ struct Prepared<'a> {
     tolerance: f64,
     sample_size: f64,
     thin: bool,
+    /// The body's volume and the area of its surface.
+    volume: f64,
+    skin: f64,
+}
+
+/// The bodies as the solver takes them.
+fn parts_of<'a>(prepared: &'a [Prepared]) -> Vec<Part<'a>> {
+    prepared
+        .iter()
+        .map(|body| Part { surface: &body.surface, material: body.material, supports: &body.supports, loads: &body.loads, options: body.options })
+        .collect()
 }
 
 /// The step on every body of the design: what [`super::run`] does for one body, for each, with
@@ -68,18 +100,26 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let mut warnings = Vec::new();
     let shown = |v: f64| crate::units::shown(s.units(), crate::units::si(), Quantity::Length, v);
 
-    let mut prepared: Vec<Prepared> = Vec::with_capacity(shapes.len());
-    let mut least = 0.0;
-    for shape in shapes {
-        let (material, material_name) = material(model, &shape.name, &mut warnings)?;
-        let supports = supports(model, shape, step, &mut warnings, false)?;
-        // Sizes: the geometry is in millimetres, the model and the solver in SI.
+    // Sizes: the geometry is in millimetres, the model and the solver in SI.
+    let mut sizes = Vec::with_capacity(shapes.len());
+    for shape in &shapes {
         let measure = shape.measure()?;
         let (lo, hi) = (crate::units::geometry_point(measure.bbox_min), crate::units::geometry_point(measure.bbox_max));
         let diagonal = magnitude([hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]]);
         if !(diagonal > 0.0 && diagonal.is_finite()) {
             return Err(EngineError::Params(format!("body `{}` has no size", short(&shape.name))));
         }
+        let volume = crate::units::geometry().to_si(Quantity::Volume, measure.volume).unwrap_or(f64::NAN);
+        let skin = crate::units::geometry().to_si(Quantity::Area, measure.area).unwrap_or(f64::NAN);
+        sizes.push((diagonal, volume, skin));
+    }
+    let default_cells = p.get("cell_size").is_none();
+
+    let mut prepared: Vec<Prepared> = Vec::with_capacity(shapes.len());
+    let mut least = 0.0;
+    for (shape, (diagonal, volume, skin)) in shapes.into_iter().zip(sizes) {
+        let (material, material_name) = material(model, &shape.name, &mut warnings)?;
+        let supports = supports(model, shape, step, &mut warnings, false)?;
         let length = |key: &str, default: f64, range: std::ops::RangeInclusive<f64>, why: &str| -> Result<f64> {
             let v = super::super::optional_number(p, key, default)?;
             if range.contains(&v) {
@@ -95,10 +135,8 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
             "cell_size",
             DEFAULT_RELATIVE_CELL * diagonal,
             MIN_RELATIVE_CELL * diagonal..=MAX_RELATIVE_CELL * diagonal,
-            "1e-3 of the body's bounding-box diagonal to twice it; leave it out and each body takes a twentieth of its own",
+            "1e-3 of the body's bounding-box diagonal to twice it; leave it out and each body takes a twentieth of its own, or more when the bodies are many",
         )?;
-        let volume = crate::units::geometry().to_si(Quantity::Volume, measure.volume).unwrap_or(f64::NAN);
-        let skin = crate::units::geometry().to_si(Quantity::Area, measure.area).unwrap_or(f64::NAN);
         let thin = skin > 0.0 && cell_size * skin > THIN * 2.0 * volume;
         let basis = asked_basis.unwrap_or(if thin { Basis::Trunk } else { Basis::Tensor });
         let smallest_cell = cell_size / (1u64 << levels.min(MAX_REFINE as usize)) as f64;
@@ -131,9 +169,25 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
             offset: OFFSET,
             ..Options::new(cell_size)
         };
-        prepared.push(Prepared { shape, material, material_name, supports, loads, applied, surface, options, tolerance, sample_size, thin });
+        prepared.push(Prepared {
+            shape,
+            material,
+            material_name,
+            supports,
+            loads,
+            applied,
+            surface,
+            options,
+            tolerance,
+            sample_size,
+            thin,
+            volume,
+            skin,
+        });
     }
-    if least > limits.max_dofs as f64 {
+    // Cells of a size that was asked for are refused before anything is built on them; ours
+    // are few (the bodies share a compact body's), and a solve too large is run again below.
+    if least > limits.max_dofs as f64 && !default_cells {
         return Err(EngineError::Solver(fieldcraft_solver::Error::Limit(format!(
             "about {least:.0} unknowns or more at these cell sizes and this degree; the limit is {} (use a larger cell size or a lower degree)",
             limits.max_dofs
@@ -186,14 +240,63 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
 
     fieldcraft_model::progress::stage("grid solve", None, "");
     fieldcraft_model::progress::check()?;
-    let parts: Vec<Part> = prepared
-        .iter()
-        .map(|body| Part { surface: &body.surface, material: body.material, supports: &body.supports, loads: &body.loads, options: body.options })
-        .collect();
     let bonds: Vec<Bond> = touches.iter().map(|touch| touch.bond.clone()).collect();
+    // Cells that grow take the samples with them, and a body can become thin for them.
+    let own_samples = p.get("sample_size").is_none();
+    let grow = |prepared: &mut [Prepared], by: f64| {
+        for body in prepared {
+            body.options.cell_size *= by;
+            if own_samples {
+                body.sample_size *= by;
+            }
+            body.thin = body.skin > 0.0 && body.options.cell_size * body.skin > THIN * 2.0 * body.volume;
+            if asked_basis.is_none() && body.thin {
+                body.options.basis = Basis::Trunk;
+            }
+        }
+    };
+    // The default cells: a twentieth of each body's own diagonal, and all of them larger by one
+    // factor when the bodies would have more unknowns between them than one compact body has.
+    // The unknowns are counted on the bodies' grids, with nothing integrated.
+    if default_cells {
+        let budget = compact_unknowns(degree);
+        // Counted against the solver's own limit: a lower one refuses the solve below, which
+        // then says that it made the cells larger.
+        let countable = Limits { max_dofs: Limits::MAX_DOFS, ..limits };
+        for _ in 0..FIT {
+            fieldcraft_model::progress::check()?;
+            let parts = parts_of(&prepared);
+            let by = match with_threads(threads, || assembly_unknowns(&parts, &bonds, &countable)) {
+                Ok(unknowns) if unknowns as f64 <= budget => break,
+                Ok(unknowns) => (unknowns as f64 / budget).cbrt().max(FIT_STEP),
+                Err(fieldcraft_fcm::Error::Limit(_)) => 2f64.cbrt(),
+                Err(e) => return Err(grid_error(e)),
+            };
+            grow(&mut prepared, by);
+        }
+    }
+    // A solve still too large for a limit is run again with half the cells, when the sizes are
+    // ours to choose: an assembly is solved on the first click, coarser, and says so.
+    let (mut enlarged, mut refused_at) = (0, None);
+    let solutions = loop {
+        let parts = parts_of(&prepared);
+        match with_threads(threads, || solve_assembly(&parts, &bonds, &limits)) {
+            Err(fieldcraft_fcm::Error::Limit(limit)) if default_cells && enlarged < ENLARGE && fieldcraft_model::progress::check().is_ok() => {
+                enlarged += 1;
+                grow(&mut prepared, 2f64.cbrt());
+                refused_at = Some(limit);
+            }
+            other => break other.map_err(grid_error)?,
+        }
+    };
+    if let Some(limit) = refused_at {
+        warnings.push(format!(
+            "the cells are {:.2} times larger than the command chose at first, to fit a limit ({limit}): give `cell_size`, a lower `degree` or fewer levels of `refine` to choose what is given up instead",
+            2f64.powf(enlarged as f64 / 3.0)
+        ));
+    }
     let most = MAX_SAMPLES / prepared.len().max(1);
     let (solutions, sampled) = with_threads(threads, || -> Result<_> {
-        let solutions = solve_assembly(&parts, &bonds, &limits).map_err(grid_error)?;
         fieldcraft_model::progress::stage("results", None, "");
         fieldcraft_model::progress::check()?;
         let sampled: Vec<(Sampled, Vec<Option<([f64; 3], [f64; 6])>>)> = prepared

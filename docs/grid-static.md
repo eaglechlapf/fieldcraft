@@ -429,9 +429,23 @@ that is welded after bending wants.
 ## Several bodies: an assembly
 
 Leave **Body** empty in a design of several bodies and all of them are solved in one step. Each
-body has its own grid, with its own cell size (a twentieth of its own diagonal unless
-`cell_size` is given, so a small part gets small cells) and the material of its own section.
-Two bodies share no unknown, however close they are: what joins them is a *connection*.
+body has its own grid, with its own cell size and the material of its own section. Two bodies
+share no unknown, however close they are: what joins them is a *connection*.
+
+**Cell sizes.** With `cell_size` left out each body's cells are a fraction of its own diagonal,
+so a small part gets small cells: a twentieth, as for one body, or more when the bodies are
+many. The bodies together are given the unknowns one compact body has at a twentieth (a cube:
+125,000 at degree 3), and their cells are all made larger by one factor until they fit. The
+unknowns are counted on the grids before anything is integrated, so this costs a fraction of a
+second, and an assembly takes the time of one part however many bodies it has. The reply gives
+each body's `cell_size`. A `cell_size` that is given is the cell of every body, and is not
+changed: a solve too large for a limit is then refused, where one on cells of the command's
+choosing is run again on larger cells and says so in a warning.
+
+A base plate of 100 × 60 × 5 mm with two clamp blocks of 20 × 10 × 8 mm standing on it, each
+with a bore and a load on its top: cells of 11.4 mm in the plate and 2.3 mm in the blocks
+(halved around the bores), 130,000 unknowns, 7 s, the reactions equal to the loads to eleven
+digits.
 
 **Connections are found, not drawn.** Where faces of two bodies lie on each other, facing each
 other, the two are *bonded* there: they move together, as if glued or welded over that area.
@@ -459,6 +473,14 @@ degrees of fill on the two sides are all the same to it: two blocks end to end a
 the accuracy of one body's cells, on any two grids, and two materials in series stretch each by
 its own modulus (`crates/fcm/tests/assembly.rs`). The unknowns of all bodies are ordered and
 factored together.
+
+**The stress at the edge of a bond.** Where the side of one body meets the face of the other
+at the edge of a bonded area, the two form a sharp inside corner, and the stress of the elastic
+solution has no finite value there, as at any sharp inside corner of one part. The largest von
+Mises stress of an assembly is often at such an edge, and it rises with every refinement
+(27 to 39 MPa in the example above between coarse and fine cells, while the deflection of the
+clamps' tops moves by 2 %). Read the stress a cell away from the edge, or model the fillet or
+the weld that is there in the part.
 
 **Not yet:** the rounds that follow the solution and **Check convergence** (solve the body
 that matters on its own for them, with `body`); connections other than bonded, which are the
