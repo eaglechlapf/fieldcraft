@@ -2,6 +2,7 @@
 
 mod block;
 mod cells;
+pub(crate) mod connection;
 mod contact;
 pub(crate) mod datum;
 pub(crate) mod deck;
@@ -185,6 +186,10 @@ pub static ALL: &[CommandSpec] = &[
     contact::TIE,
     contact::TIE_EDIT,
     contact::TIE_DELETE,
+    connection::CONNECTION,
+    connection::EDIT,
+    connection::DELETE,
+    connection::FIND,
     contact::RIGID_WALL,
     contact::RIGID_WALL_EDIT,
     contact::RIGID_WALL_DELETE,

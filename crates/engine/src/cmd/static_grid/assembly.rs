@@ -1,6 +1,8 @@
 //! `solve.static.grid` on several bodies: every body of the design in one solve, each on a grid
-//! of its own, bonded where the faces of two of them touch. The faces are found, not named
-//! (`fieldcraft_fcm::find_bonds`), and the reply lists them as connections.
+//! of its own, joined by the model's connections ([`fieldcraft_model::connections`]): bonded or
+//! sliding where the faces of two of them touch. A model that was never searched for them is
+//! searched first (`fieldcraft_fcm::find_bonds`), every two bodies that touch are bonded, and
+//! the connections are left in the model for the user to change (`interaction.connection*`).
 
 use std::collections::BTreeSet;
 
@@ -86,9 +88,134 @@ fn parts_of<'a>(prepared: &'a [Prepared]) -> Vec<Part<'a>> {
         .collect()
 }
 
+/// The model's connections as the solver's bonds, in their order: each body by its place among
+/// `shapes`, each face by its tag. A free connection comes as a bond too, for its area; the
+/// solver is given none of those.
+fn joints(connections: &[(&str, &Connection)], shapes: &[&Shape], reach: f64) -> Result<Vec<Bond>> {
+    let fix = "change the connection or delete it (interaction.connection.edit, interaction.connection.delete)";
+    let side = |name: &str, faces: &[GeometryRef]| -> Result<(usize, Vec<u32>)> {
+        let body = faces.first().map_or("", |face| face.body.as_str());
+        let missing =
+            || EngineError::Params(format!("connection `{}` names body `{}`, which the open design does not have: {fix}", short(name), short(body)));
+        let index = shapes.iter().position(|shape| shape.name == body).ok_or_else(missing)?;
+        let shape = shapes.get(index).ok_or_else(missing)?;
+        let mut tags = Vec::with_capacity(faces.len());
+        for face in faces {
+            let named = face.entity.name().unwrap_or_default();
+            tags.push(shape.face_index(named).ok_or_else(|| {
+                EngineError::Params(format!(
+                    "connection `{}` names face `{}` of body `{}`, which the body does not have: {fix}",
+                    short(name),
+                    short(named),
+                    short(body)
+                ))
+            })?);
+        }
+        Ok((index, tags))
+    };
+    let mut bonds = Vec::with_capacity(connections.len());
+    for (name, connection) in connections {
+        let grip = if connection.kind == ConnectionKind::Sliding { Grip::Sliding } else { Grip::Bonded };
+        bonds.push(Bond { first: side(name, &connection.first)?, second: side(name, &connection.second)?, tolerance: reach, grip });
+    }
+    // Two connections that join the same two faces say the same twice, or contradict each other.
+    for (at, (name, connection)) in connections.iter().enumerate() {
+        for (other_name, other) in connections.iter().skip(at + 1) {
+            let (bodies, others) = (connection.bodies(), other.bodies());
+            if bodies != others && bodies != [others[1], others[0]] {
+                continue;
+            }
+            let twice = connection.first.iter().find_map(|a| connection.second.iter().find(|b| other.joins(a, b)).map(|b| (a, b)));
+            if let Some((a, b)) = twice {
+                return Err(EngineError::Params(format!(
+                    "connections `{}` and `{}` both join {a} to {b}: delete one of them, or take the face out of one",
+                    short(name),
+                    short(other_name)
+                )));
+            }
+        }
+    }
+    Ok(bonds)
+}
+
+/// A direction for a message: of unit length, its largest component positive, to two places.
+fn direction(v: [f64; 3]) -> String {
+    let length = magnitude(v);
+    let mut unit = v.map(|c| if length > 0.0 { c / length } else { 0.0 });
+    let largest = unit.iter().map(|c| c.abs()).fold(0.0, f64::max);
+    if unit.iter().find(|c| c.abs() == largest).is_some_and(|c| *c < 0.0) {
+        unit = unit.map(|c| -c);
+    }
+    // To two places, without the zeros at the end: 1, 0.71, 0.
+    let shown = |c: f64| {
+        let text = format!("{c:.2}");
+        let text = text.trim_end_matches('0').trim_end_matches('.');
+        if text.is_empty() || text == "-0" || text == "-" { "0".to_string() } else { text.to_string() }
+    };
+    format!("({}, {}, {})", shown(unit[0]), shown(unit[1]), shown(unit[2]))
+}
+
+/// Why bodies that can still move are not solved, in their names: `hint` adds what is known
+/// about a body that moves on its own.
+fn loose(motions: &[Motion], names: &[&str], step: &str, hint: &dyn Fn(usize) -> String) -> EngineError {
+    let name = |body: usize| short(names.get(body).copied().unwrap_or("?"));
+    let mut alone: BTreeMap<usize, Vec<&Motion>> = BTreeMap::new();
+    let mut together: BTreeSet<Vec<usize>> = BTreeSet::new();
+    for motion in motions {
+        match motion.bodies.as_slice() {
+            [(body, _, _)] => alone.entry(*body).or_default().push(motion),
+            several => {
+                together.insert(several.iter().map(|(body, _, _)| *body).collect());
+            }
+        }
+    }
+    let mut said = Vec::new();
+    for (body, own) in &alone {
+        // All six: neither a support nor a connection touches it.
+        if own.len() >= 6 {
+            said.push(format!(
+                "nothing holds `{}`: no boundary condition of step `{}` supports a face of it, and no connection joins it to another body{}",
+                name(*body),
+                short(step),
+                hint(*body)
+            ));
+            continue;
+        }
+        // The ways it can slide, then those it can turn.
+        let mut ways: Vec<(bool, String)> = own
+            .iter()
+            .filter_map(|motion| motion.bodies.first())
+            .map(|(_, slide, turn)| {
+                // A turn about an axis off the body's middle moves the middle too.
+                if magnitude(*turn) > f64::EPSILON.sqrt() * magnitude(*slide) {
+                    (true, format!("turn about an axis along {}", direction(*turn)))
+                } else {
+                    (false, format!("slide along {}", direction(*slide)))
+                }
+            })
+            .collect();
+        ways.sort();
+        let ways: Vec<String> = ways.into_iter().map(|(_, way)| way).collect();
+        let ways = match ways.split_last() {
+            Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+            _ => ways.join(""),
+        };
+        said.push(format!("`{}` can still {ways}{}", name(*body), hint(*body)));
+    }
+    for group in &together {
+        let moving: Vec<String> = group.iter().take(NAMED).map(|body| format!("`{}`", name(*body))).collect();
+        said.push(format!("{} can still move together", moving.join(", ")));
+    }
+    said.truncate(NAMED);
+    EngineError::Params(format!(
+        "{}. A static solve needs every body held against sliding and turning: a sliding connection holds only across its faces, so add a boundary condition, or make a connection bonded (interaction.connection.edit)",
+        said.join("; ")
+    ))
+}
+
 /// The step on every body of the design: what [`super::run`] does for one body, for each, with
-/// the bodies bonded where they touch (`"connections": "bonded"`, the default) or free of each
-/// other (`"none"`).
+/// the bodies joined by the model's connections (`"connections": "model"`, the default) or free
+/// of each other (`"none"`).
 pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let started = crate::usage::now_ms();
     fieldcraft_model::progress::check()?;
@@ -120,10 +247,10 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
         Some("joined") => false,
         Some(other) => return Err(EngineError::invalid("gaps", format!("`{}` is neither \"open\" nor \"joined\"", short(other)))),
     };
-    let bonded = match opt::<String>(p, "connections")?.as_deref() {
-        None | Some("bonded") => true,
+    let joined = match opt::<String>(p, "connections")?.as_deref() {
+        None | Some("model") => true,
         Some("none") => false,
-        Some(other) => return Err(EngineError::invalid("connections", format!("`{}` is neither \"bonded\" nor \"none\"", short(other)))),
+        Some(other) => return Err(EngineError::invalid("connections", format!("`{}` is neither \"model\" nor \"none\"", short(other)))),
     };
     let shapes = bodies(s, p)?;
     let model = &s.model;
@@ -184,11 +311,7 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
 
         fieldcraft_model::progress::stage(&format!("{}: surface", shape.name), None, "");
         fieldcraft_model::progress::check()?;
-        let mesh = shape.tessellate(crate::units::to_geometry_length(tolerance))?;
-        let positions: Vec<[f64; 3]> = mesh.positions.iter().map(|p| crate::units::geometry_point(*p)).collect();
-        let options = SurfaceOptions { weld_distance: crate::units::geometry_length(mesh.weld_distance), ..SurfaceOptions::default() };
-        let surface = BoundarySurface::new(&positions, &mesh.triangles, &mesh.tri_face, &options)
-            .map_err(|e| EngineError::context(format!("body `{}`: its surface cannot bound a solid", short(&shape.name)), e))?;
+        let surface = surface(shape, tolerance)?;
         let areas = face_areas(&surface);
         let (loads, applied) = loads(model, shape, step, &areas, material.density, material_name, false)?;
         least += 3.0 * (degree as f64).powi(3) * volume / cell_size.powi(3);
@@ -234,36 +357,84 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
         )));
     }
 
-    // The connections: the faces of two bodies that touch. Two triangulations of one curved
-    // face lie each within its own tolerance of it.
+    // The connections: the model's. A model that was never searched for them is searched now,
+    // and every two bodies whose faces touch are bonded there: an assembly is solved on the
+    // first click, and what joined it is in the model afterwards, to change.
     fieldcraft_model::progress::stage("connections", None, "");
     fieldcraft_model::progress::check()?;
+    // Two triangulations of one curved face lie each within its own tolerance of it.
     let reach = 2.0 * prepared.iter().map(|body| body.tolerance).fold(0.0, f64::max);
     let surfaces: Vec<&BoundarySurface> = prepared.iter().map(|body| &body.surface).collect();
-    let touches = if bonded { find_bonds(&surfaces, reach).map_err(grid_error)? } else { Vec::new() };
-    // A body must be held: supported, or bonded to one that is held.
-    let mut held: BTreeSet<usize> = prepared.iter().enumerate().filter(|(_, body)| !body.supports.is_empty()).map(|(index, _)| index).collect();
-    // Every pass holds one body more, or is the last.
-    for _ in 0..prepared.len() {
-        let before = held.len();
-        for touch in &touches {
-            let (a, b) = (touch.bond.first.0, touch.bond.second.0);
-            if held.contains(&a) || held.contains(&b) {
-                held.extend([a, b]);
-            }
+    let shapes: Vec<&Shape> = prepared.iter().map(|body| body.shape).collect();
+    let names: Vec<&str> = shapes.iter().map(|shape| shape.name.as_str()).collect();
+    let searched = joined && !model.connections_found();
+    let found = if searched {
+        let touches = find_bonds(&surfaces, reach).map_err(grid_error)?;
+        super::super::connection::new_connections(model, &shapes, &touches, ConnectionKind::Bonded)?
+    } else {
+        Vec::new()
+    };
+    let connections: Vec<(&str, &Connection)> = if joined {
+        let kept = model.connections().iter().map(|(name, connection)| (name.as_str(), connection));
+        kept.chain(found.iter().map(|(name, connection)| (name.as_str(), connection))).collect()
+    } else {
+        Vec::new()
+    };
+    let joints = joints(&connections, &shapes, reach)?;
+    let touching = bond_areas(&parts_of(&prepared), &joints).map_err(grid_error)?;
+    // What the solver joins: not what is free, and not faces that do not touch.
+    let mut bonds: Vec<Bond> = Vec::new();
+    for (((name, connection), bond), area) in connections.iter().zip(&joints).zip(&touching) {
+        if connection.kind == ConnectionKind::Free {
+            continue;
         }
-        if held.len() == before {
-            break;
+        if *area > 0.0 {
+            bonds.push(bond.clone());
+        } else {
+            let [first, second] = connection.bodies();
+            warnings.push(format!(
+                "connection `{}` joins nothing: the faces it names of `{}` and `{}` do not touch (they are more than {} apart)",
+                short(name),
+                short(first),
+                short(second),
+                shown(reach)
+            ));
         }
     }
-    let loose: Vec<&str> = prepared.iter().enumerate().filter(|(index, _)| !held.contains(index)).map(|(_, body)| body.shape.name.as_str()).collect();
-    if !loose.is_empty() {
-        return Err(EngineError::Params(format!(
-            "nothing holds {}: no boundary condition of step `{}` supports a face of it, and it touches no body that is held{}",
-            listed(loose.into_iter()),
-            short(&step.name),
-            if bonded { "" } else { " (with `\"connections\": \"none\"` every body needs a support of its own)" }
-        )));
+    // Every body must be held against every way it can move as a rigid piece: by supports, and
+    // by connections to bodies that are held.
+    let free = free_motions(&parts_of(&prepared), &bonds).map_err(grid_error)?;
+    if !free.is_empty() {
+        // What a body that moves touches without being held by it.
+        let touches = if joined { find_bonds(&surfaces, reach).unwrap_or_default() } else { Vec::new() };
+        let hint = |body: usize| -> String {
+            if !joined {
+                return " (with `\"connections\": \"none\"` every body needs supports of its own)".into();
+            }
+            let own = names.get(body).copied().unwrap_or_default();
+            for touch in &touches {
+                let other = match (touch.bond.first.0, touch.bond.second.0) {
+                    (a, b) if a == body => b,
+                    (a, b) if b == body => a,
+                    _ => continue,
+                };
+                let other = names.get(other).copied().unwrap_or_default();
+                let between = |connection: &Connection| connection.bodies() == [own, other] || connection.bodies() == [other, own];
+                let mut joining = connections.iter().zip(&touching).filter(|((_, connection), _)| between(connection));
+                if joining.clone().any(|((_, connection), area)| connection.kind != ConnectionKind::Free && *area > 0.0) {
+                    continue;
+                }
+                return match joining.find(|((_, connection), _)| connection.kind == ConnectionKind::Free) {
+                    Some(((name, _), _)) => format!(" (it touches `{}`, and their connection `{}` is free)", short(other), short(name)),
+                    None => format!(
+                        " (it touches `{}`, and no connection joins the two: interaction.connection.find adds the connections that are missing)",
+                        short(other)
+                    ),
+                };
+            }
+            String::new()
+        };
+        return Err(loose(&free, &names, &step.name, &hint));
     }
     if prepared.iter().all(|body| body.loads.is_empty())
         && prepared.iter().flat_map(|body| &body.supports).all(|s| s.value.iter().zip(s.fixed).all(|(v, fixed)| !fixed || *v == 0.0))
@@ -273,7 +444,6 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
 
     fieldcraft_model::progress::stage("grid solve", None, "");
     fieldcraft_model::progress::check()?;
-    let bonds: Vec<Bond> = touches.iter().map(|touch| touch.bond.clone()).collect();
     // Cells that grow take the samples with them, and a body can become thin for them.
     let own_samples = p.get("sample_size").is_none();
     let grow = |prepared: &mut [Prepared], by: f64| {
@@ -388,8 +558,8 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
             ));
         }
     }
-    if bonded && touches.is_empty() {
-        warnings.push("no two bodies touch: each is solved on its own supports".into());
+    if joined && bonds.is_empty() {
+        warnings.push("no connection joins two bodies: each is solved on its own supports".into());
     }
 
     // The resultants. Gravity loads the volume the solver integrated.
@@ -421,7 +591,6 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let nodes: Vec<u32> = (0..values.len()).map(|v| GRID_LABELS.saturating_add(u32::try_from(v).unwrap_or(u32::MAX))).collect();
     let stress: Vec<[f64; 6]> = values.iter().map(|v| v.map_or([f64::NAN; 6], |(_, s)| s)).collect();
     let (shown_mesh, tri_face) = display(&all);
-    let names: Vec<&str> = prepared.iter().map(|body| body.shape.name.as_str()).collect();
     let result = GridResult {
         body: names.join(", "),
         result: fieldcraft_solver::StepResult::Static(StaticResult {
@@ -457,10 +626,6 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let displacement: Vec<f64> = sampled_values.displacement.iter().map(|u| magnitude(*u)).collect();
     let seconds = started.zip(crate::usage::now_ms()).map(|(from, to)| (to - from) / crate::usage::MS_PER_SECOND);
-    let face_names = |body: usize, tags: &[u32]| -> Vec<String> {
-        let faces = prepared.get(body).map(|body| body.shape.faces()).unwrap_or_default();
-        tags.iter().map(|tag| faces.get(*tag as usize).map_or_else(|| tag.to_string(), |f| f.name.clone())).collect()
-    };
     let summary = json!({
         "step": step.name,
         "bodies": prepared.iter().zip(&solutions).map(|(body, solution)| {
@@ -480,15 +645,14 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
                 "strain_energy": solution.strain_energy,
             })
         }).collect::<Vec<_>>(),
-        "connections": touches.iter().map(|touch| {
-            let (a, b) = (&touch.bond.first, &touch.bond.second);
-            json!({
-                "kind": "bonded",
-                "bodies": [names.get(a.0), names.get(b.0)],
-                "faces": [face_names(a.0, &a.1), face_names(b.0, &b.1)],
-                "area": touch.area,
-            })
+        "connections": connections.iter().zip(&touching).map(|((name, connection), area)| {
+            let mut listed = super::super::connection::listed(name, connection);
+            if let Some(listed) = listed.as_object_mut() {
+                listed.insert("area".into(), json!(area));
+            }
+            listed
         }).collect::<Vec<_>>(),
+        "connections_added": found.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(),
         "degree": degree,
         "refine": levels,
         "gaps": if open_gaps { "open" } else { "joined" },
@@ -503,6 +667,13 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
         "strain_energy": solutions.iter().map(|solution| solution.strain_energy).sum::<f64>(),
         "warnings": warnings,
     });
+    // The connections the search found are the model's from here on, and the result is of them.
+    if searched {
+        for (name, connection) in found {
+            s.model.add_connection(&name, connection)?;
+        }
+        s.model.set_connections_found(true);
+    }
     s.store_result(StepResult::Grid(Box::new(result)));
     Ok(summary)
 }

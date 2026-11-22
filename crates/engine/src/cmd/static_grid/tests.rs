@@ -608,6 +608,7 @@ fn bodies_that_touch_are_solved_together() {
     assert_eq!(connections.len(), 1, "{connections:?}");
     assert_eq!(connections[0]["bodies"], json!(["First", "Second"]));
     assert_eq!(connections[0]["kind"], "bonded");
+    assert_eq!((connections[0]["name"].as_str(), r["connections_added"].clone()), (Some("First-Second"), json!(["First-Second"])));
     assert!(close(connections[0]["area"].as_f64().unwrap(), 100.0, 1e-9), "{}", connections[0]["area"]);
     assert_eq!(connections[0]["faces"][0], json!([face("First", [20.0, 5.0, 5.0])["face"]]));
     assert!(close(r["max_von_mises"]["value"].as_f64().unwrap(), PULL, STRESS), "{}", r["max_von_mises"]);
@@ -650,7 +651,7 @@ fn bodies_that_touch_are_solved_together() {
     // Free of each other, nothing holds the second block along x; what is not run for several
     // bodies yet is refused, and one body can still be solved on its own.
     let e = s.execute("solve.static.grid", &json!({"cell_size": 5, "degree": 2, "connections": "none"})).unwrap_err().to_string();
-    assert!(e.contains("singular") || e.contains("holds"), "{e}");
+    assert!(e.contains("`Second` can still slide along (1, 0, 0)"), "{e}");
     for (params, word) in
         [(json!({"adapt": 2}), "adapt"), (json!({"check_convergence": true}), "check_convergence"), (json!({"connections": "welded"}), "connections")]
     {

@@ -471,7 +471,7 @@ pub const STEP_ACTIVATE: CommandSpec = CommandSpec {
 pub const RENAME: CommandSpec = CommandSpec {
     id: "model.rename",
     label: "Rename",
-    params: r#"{"kind": "set" | "material" | "section" | "step" | "boundary_condition" | "load" | "reference_point" | "coupling" | "contact" | "tie" | "point_mass" | "spring" | "fluid_domain" | "datum", "from": "end", "to": "Tip"} — renames the definition and every reference to it (sets in sections, couplings, contacts, ties, discrete elements, boundary conditions, loads and explicit steps; materials in sections and fluid domains; reference points; boundary conditions and loads in the steps they are active in; steps in imperfections; fluid domains in fluid steps; datum planes in partitions). A name already taken is refused; the viewport's hidden items follow the new name"#,
+    params: r#"{"kind": "set" | "material" | "section" | "step" | "boundary_condition" | "load" | "reference_point" | "coupling" | "contact" | "tie" | "connection" | "point_mass" | "spring" | "fluid_domain" | "datum", "from": "end", "to": "Tip"} — renames the definition and every reference to it (sets in sections, couplings, contacts, ties, discrete elements, boundary conditions, loads and explicit steps; materials in sections and fluid domains; reference points; boundary conditions and loads in the steps they are active in; steps in imperfections; fluid domains in fluid steps; datum planes in partitions). A name already taken is refused; the viewport's hidden items follow the new name"#,
     form: Some(super::forms::RENAME),
     kind: CommandKind::Model,
     requires: &[],
@@ -490,6 +490,7 @@ pub const RENAME_KINDS: &[(&str, RenameKind)] = &[
     ("coupling", RenameKind::Coupling),
     ("contact", RenameKind::Contact),
     ("tie", RenameKind::Tie),
+    ("connection", RenameKind::Connection),
     ("point_mass", RenameKind::PointMass),
     ("spring", RenameKind::Spring),
     ("fluid_domain", RenameKind::FluidDomain),

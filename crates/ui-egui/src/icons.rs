@@ -56,6 +56,8 @@ pub const ALIASES: &[(&str, &str, &str)] = &[
     ("assembly.instance", "component", ""),
     ("interaction.contact.general", "contact_all", ""),
     ("interaction.contact.pair", "contact_new", ""),
+    ("interaction.connection", "as_built", ""),
+    ("interaction.connection.find", "contact_sets", ""),
     ("interaction.bolt", "fastener", ""),
     ("interaction.connector", "joint", ""),
     ("deck.read", "import", ""),

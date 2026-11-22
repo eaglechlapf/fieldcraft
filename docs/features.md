@@ -6,7 +6,7 @@ Every entry is a toolbar button. **Ready** entries run their command; **coming s
 shown greyed with the roadmap milestone that brings them (ROADMAP.md). Scripts, the command line,
 the control channel and AI agents over MCP (docs/mcp.md) run the same commands.
 
-98 ready, 27 coming soon.
+100 ready, 27 coming soon.
 
 ## Geometry
 
@@ -118,6 +118,8 @@ the control channel and AI agents over MCP (docs/mcp.md) run the same commands.
 | Constraints | Reference Point — A reference point for couplings, loads and boundary conditions | ready | `model.reference_point.create`, `model.reference_point.edit`, `model.reference_point.delete` |
 | Constraints | Coupling — Kinematic or distributing coupling of a set to a reference point | ready | `model.coupling.create`, `model.coupling.edit`, `model.coupling.delete` |
 | Constraints | Tie — Tie non-matching meshes together (dual mortar constraints) | ready | `interaction.tie`, `interaction.tie.edit`, `interaction.tie.delete` |
+| Connections | Find Connections — Find the faces of the design's bodies that touch and connect them: bonded, sliding or free, for a solve of several bodies on a grid | ready | `interaction.connection.find` |
+| Connections | Connection — Connect faces of two bodies yourself: bonded, sliding or free | ready | `interaction.connection`, `interaction.connection.edit`, `interaction.connection.delete` |
 | Contact | General Contact — Contact between everything that may touch, or self contact of a surface, with friction (explicit dynamics and nonlinear static steps) | ready | `interaction.contact.general`, `interaction.contact.edit`, `interaction.contact.delete` |
 | Contact | Contact Pair — Contact between two surfaces: with friction in explicit dynamics, mortar contact with friction in nonlinear static steps | ready | `interaction.contact.pair` |
 | Contact | Find Contacts — Find the parts of the mesh that touch, and make contact pairs of them | ready | `interaction.contact.find` |
@@ -139,7 +141,7 @@ the control channel and AI agents over MCP (docs/mcp.md) run the same commands.
 | Decks | LS-DYNA Deck — Write an LS-DYNA keyword file | ready | `deck.write {"format":"lsdyna"}` |
 | Decks | Read Deck — Read an Abaqus input deck's model data and the current writer's linear history: mesh, sets, materials, sections, static/frequency/buckling steps, boundary conditions and concentrated loads; unread keywords are listed, not kept | ready | `deck.read` |
 | Implicit | Static — Linear static (or coupled temperature–displacement) solve of a step with FieldCraft's own solver; nonlinear static, buckling and heat transfer in the drop-down | ready | `solve.static`, `solve.nonlinear`, `solve.buckle`, `solve.heat` |
-| Implicit | Grid Static — Linear static solve with no mesh, of one body or of every body of the design bonded where they touch: each surface in a grid of high-order cells (the finite cell method) | ready | `solve.static.grid` |
+| Implicit | Grid Static — Linear static solve with no mesh, of one body or of every body of the design, held together by its connections: each surface in a grid of high-order cells (the finite cell method) | ready | `solve.static.grid` |
 | Implicit | Frequency — Natural frequencies and mode shapes of a frequency step | ready | `solve.frequency` |
 | Explicit | Explicit — Transient dynamics of an explicit step by central differences (contact and erosion coming in M10) | ready | `solve.explicit` |
 | Explicit | Blast & Impact — EOS-driven fluids with fluid–structure contact (ALE or SPH) | coming soon (M14) |  |

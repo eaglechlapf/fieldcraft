@@ -78,7 +78,7 @@ mesh; each solve replaces the step's result.
 |---|---|---|
 | `step` | the only static step | The step to solve. |
 | `body` | every body | A body of the open design to solve on its own. Left out: every body of the design, solved together ([Several bodies](#several-bodies-an-assembly)). |
-| `connections` | `"bonded"` | With several bodies. `"bonded"`: where faces of two bodies lie on each other they are joined; the faces are found from the geometry and listed in the reply. `"none"`: no body holds another. |
+| `connections` | `"model"` | With several bodies. `"model"`: the bodies hold each other by the model's connections, bonded, sliding or free; a model never searched for them is searched first, and what touches is bonded ([Several bodies](#several-bodies-an-assembly)). `"none"`: no body holds another. |
 | `cell_size` | 1/20 of the bounding-box diagonal | The size of the grid's cubic cells (a length). |
 | `degree` | 3 | The polynomial degree of the shape functions, 1 to 8. |
 | `basis` | `"auto"` | The shape functions of a cell. `"tensor"`: every product of the polynomials along the three axes up to the degree. `"trunk"`: only those of total degree up to it, half the unknowns a cell at degree 3. `"auto"`: the trunk space for a body that is thin for the grid, the tensor product otherwise. The reply's `basis` names the one used. See [Rounds that follow the solution](#rounds-that-follow-the-solution). |
@@ -95,7 +95,7 @@ mesh; each solve replaces the step's result.
 
 ## What it solves, and what it refuses
 
-It solves one body, or several bonded where they touch: linear elastic, isotropic, static.
+It solves one body, or several that are bonded or slide where they touch: linear elastic, isotropic, static.
 
 | | Solved | Refused, with the reason |
 |---|---|---|
@@ -447,20 +447,63 @@ with a bore and a load on its top: cells of 11.4 mm in the plate and 2.3 mm in t
 (halved around the bores), 130,000 unknowns, 7 s, the reactions equal to the loads to eleven
 digits.
 
-**Connections are found, not drawn.** Where faces of two bodies lie on each other, facing each
-other, the two are *bonded* there: they move together, as if glued or welded over that area.
-Flat faces touch to rounding; curved ones (a pin in a hole) within the triangulations'
-tolerance. Faces that overlap in part are bonded over the part. An edge or a corner resting on
-a face is no connection. The reply lists what was found:
+**Connections.** A connection names faces of one body and faces of another, and says how the
+two hold each other where those faces touch:
+
+| Kind | What the two bodies do there | For |
+|---|---|---|
+| `bonded` | move together | glued, welded, pressed or bolted tight over the area |
+| `sliding` | keep touching and slide along each other without friction | a part in a pocket, a pin or a shaft in its hole, a key in its slot |
+| `free` | nothing: they do not hold each other | faces that only look as if they touched |
+
+Whole faces are named; where they touch is found by the solve. Flat faces touch to rounding,
+curved ones (a pin in a hole) within the triangulations' tolerance, and faces that overlap in
+part are connected over the part.
+
+**They are found for you, once.** The first solve of a design with several bodies looks for
+the faces of every two bodies that lie on each other, facing each other (an edge or a corner
+resting on a face is none), bonds them, and leaves the connections in the model, named after
+the two bodies. The reply lists them, and `connections_added` names those this solve found:
 
 ```json
-"connections": [{"kind": "bonded", "bodies": ["Base", "Post"], "faces": [["F1:+z"], ["F2:-z"]], "area": 2000.0}]
+"connections": [{"name": "Base-Post", "kind": "bonded", "bodies": ["Base", "Post"], "faces": [["F1:+z"], ["F2:-z"]], "area": 2000.0}],
+"connections_added": ["Base-Post"]
 ```
 
-Read that list before the results: a connection that is missing (two parts that should touch
-and are modelled a hair apart) leaves a body held by less than intended, and one that nothing
-holds at all is refused by name. `"connections": "none"` solves the bodies free of each other,
-each on its own supports.
+From then on the list is yours, under **Interactions** in the browser, and a solve joins the
+bodies by exactly what it holds:
+
+| To | Do | Command |
+|---|---|---|
+| let two bodies slide, or part them | open the connection and change its **Kind** | `interaction.connection.edit {"name": "Base-Post", "kind": "sliding"}` |
+| take a connection out | delete it; it stays deleted | `interaction.connection.delete` |
+| connect faces yourself | pick the faces of the two bodies in the view, **Connection**, **Use selection** | `interaction.connection {"name", "kind", "first": [{"body", "face"}], "second": […]}` |
+| look again, after the design changed or to get a deleted one back | **Find Connections**: adds one for touching faces that none joins yet, and changes none that is there | `interaction.connection.find` |
+
+Read the list before the results: a connection that is missing (two parts that should touch
+and are modelled a hair apart) leaves a body held by less than intended. A connection whose
+faces do not touch joins nothing, and the reply says so in a warning. `"connections": "none"`
+solves the bodies free of each other, each on its own supports, and leaves the model as it is.
+
+**Every body must be held.** A static solve has no answer for a body that can still move as a
+rigid piece. Before anything is solved, the motions that no boundary condition and no
+connection resists are found, and the solve is refused with the body and the way it can move:
+
+> `Pin` can still slide along (0, 0, 1) and turn about an axis along (0, 0, 1). A static solve
+> needs every body held against sliding and turning: a sliding connection holds only across
+> its faces, so add a boundary condition, or make a connection bonded
+
+A sliding connection holds a body only across its faces: a block standing on a plate can
+still slide two ways and turn about the plate's normal, and a pin in a hole can slide along
+the hole and turn in it. Give such a body what holds it in the machine (the shoulder it
+stands on, the key that keeps it from turning) as a boundary condition or a second
+connection. A body that touches another with no connection between them is told so, with the
+command that finds the connection.
+
+**Sliding is not contact.** The solve is linear: two bodies that slide keep touching, so a
+sliding connection pulls as well as it pushes, and where the real parts would lift off each
+other it holds them together. Check the sign of what crosses it; contact that opens needs the
+nonlinear step and is not here yet.
 
 **Supports and loads** are the step's, as for one body, and a set may name faces of several
 bodies. A body needs a boundary condition of its own or a connection to a body that is held. A
@@ -474,6 +517,20 @@ the accuracy of one body's cells, on any two grids, and two materials in series 
 its own modulus (`crates/fcm/tests/assembly.rs`). The unknowns of all bodies are ordered and
 factored together.
 
+A sliding connection is the same method with the traction and the jump of the displacement
+replaced by their parts along the face's normal (the frictionless case of Annavarapu,
+Hautefeuille and Dolbow's sliding interface, 2014, for bodies that do not part). It is as
+consistent as the bond: two blocks of different materials pressed together, each widening by
+its own Poisson's ratio and slipping on the other, are found to 10⁻⁶ of the exact
+displacement on any two grids. On a curved face the normal is that of the cylinder, cone,
+sphere or torus the face lies on, not of the triangles that stand for it: held across every
+facet of its hole a pin could not turn, and with the surface's normal it slides and turns
+freely, carrying nothing along the hole (2 · 10⁻¹⁵ of the pull in the test). A curved face of
+any other kind keeps its triangles' normals, which is exact for a face swept along a line and
+somewhat too stiff otherwise. The bodies that can still move are the null space of the
+restraints on the six rigid motions of each body, found by a Cholesky decomposition with
+complete pivoting (Higham 1990).
+
 **The stress at the edge of a bond.** Where the side of one body meets the face of the other
 at the edge of a bonded area, the two form a sharp inside corner, and the stress of the elastic
 solution has no finite value there, as at any sharp inside corner of one part. The largest von
@@ -483,20 +540,18 @@ clamps' tops moves by 2 %). Read the stress a cell away from the edge, or model 
 the weld that is there in the part.
 
 **Not yet:** the rounds that follow the solution and **Check convergence** (solve the body
-that matters on its own for them, with `body`); connections other than bonded, which are the
-plan below.
+that matters on its own for them, with `body`); bolts, welds and contact, which are the plan
+below. The solvers on a mesh do not read connections: they join element faces by ties and
+contacts.
 
 ### What comes next
 
-Bonded is the first kind of connection. The others are found from the geometry the same way,
-and the list is where they will be switched:
+Bonded, sliding and free are the kinds a linear solve can have between faces. The others are
+found from the geometry the same way, and join the same list:
 
-1. **Sliding and free.** A connection that carries the normal component alone (a part resting
-   in a pocket), and one switched off, per connection, before the solve: the engineer reviews
-   the list instead of building one.
-2. **Holes in line.** Coaxial holes through bodies that touch are bolt candidates
+1. **Holes in line.** Coaxial holes through bodies that touch are bolt candidates
    (`interaction.bolt` of the roadmap's M7): a beam with the bolt's section, its head and nut
    bearing on the annuli around the holes.
-3. **Edges that end on a face.** A plate standing on another is a weld seam candidate
+2. **Edges that end on a face.** A plate standing on another is a weld seam candidate
    (`interaction.weld`).
-4. **Contact**, which needs the nonlinear step.
+3. **Contact**, which needs the nonlinear step.

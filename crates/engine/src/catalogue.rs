@@ -657,6 +657,22 @@ pub static CATALOGUE: &[Capability] = &[
         &["interaction.tie.edit", "interaction.tie.delete"],
     ),
     ready_more(
+        "interaction.connection.find",
+        "Find Connections",
+        Interactions,
+        "Connections",
+        "Find the faces of the design's bodies that touch and connect them: bonded, sliding or free, for a solve of several bodies on a grid",
+        &[],
+    ),
+    ready_more(
+        "interaction.connection",
+        "Connection",
+        Interactions,
+        "Connections",
+        "Connect faces of two bodies yourself: bonded, sliding or free",
+        &["interaction.connection.edit", "interaction.connection.delete"],
+    ),
+    ready_more(
         "interaction.contact.general",
         "General Contact",
         Interactions,
@@ -732,7 +748,7 @@ pub static CATALOGUE: &[Capability] = &[
         "Grid Static",
         Solve,
         "Implicit",
-        "Linear static solve with no mesh, of one body or of every body of the design bonded where they touch: each surface in a grid of high-order cells (the finite cell method)",
+        "Linear static solve with no mesh, of one body or of every body of the design, held together by its connections: each surface in a grid of high-order cells (the finite cell method)",
     ),
     ready("solve.frequency", "Frequency", Solve, "Implicit", "Natural frequencies and mode shapes of a frequency step"),
     ready(

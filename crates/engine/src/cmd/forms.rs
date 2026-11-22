@@ -50,6 +50,7 @@ pub const LOAD_DELETE: &[Field] = existing!("Load", C::Load);
 pub const FLUID_DOMAIN_DELETE: &[Field] = existing!("Fluid domain", C::FluidDomain);
 pub const CONTACT_DELETE: &[Field] = existing!("Contact", C::Contact);
 pub const TIE_DELETE: &[Field] = existing!("Tie", C::Tie);
+pub const CONNECTION_DELETE: &[Field] = existing!("Connection", C::Connection);
 pub const STEP_DELETE: &[Field] = existing!("Step", C::Step);
 pub const SET_RESOLVE: &[Field] = existing!("Set", C::Set);
 
@@ -1484,6 +1485,27 @@ pub const TIE_EDIT: &[Field] = &[
         .help("Secondary nodes farther than this from the main surface are left untied.")
         .hint("half the main element's thickness"),
 ];
+const CONNECTION_KINDS: &[(&str, &str)] = &[("bonded", "Bonded"), ("sliding", "Sliding"), ("free", "Free")];
+const CONNECTION_KIND: Field = choice("kind", "Kind", CONNECTION_KINDS).help(
+    "Bonded: the two bodies move together where the faces touch, as if glued or welded there. Sliding: they keep touching and slide along each other without friction (a part in a pocket, a pin in a hole): nothing is carried along the faces. Free: they do not hold each other.",
+);
+const CONNECTION_FACES: &[Field] = &[
+    reference("body", "Body", C::Body).help("A body of the open design.").req(),
+    topology("face", "Face", Side3::Face, "body").help("A persistent face name of the body (e.g. F3).").hint("persistent face name").req(),
+];
+const CONNECTION_FIRST: Field = rows("first", "Faces of body 1", CONNECTION_FACES).help(
+    "Faces of one body that touch the other body. Whole faces: where they touch is found. Use selection takes the picked faces of the two bodies.",
+);
+const CONNECTION_SECOND: Field = rows("second", "Faces of body 2", CONNECTION_FACES).help("The faces of the other body that touch the first one's.");
+pub const CONNECTION: &[Field] = &[NAME, CONNECTION_KIND.def("\"bonded\""), CONNECTION_FIRST.req(), CONNECTION_SECOND.req()];
+pub const CONNECTION_EDIT: &[Field] =
+    &[reference("name", "Connection", C::Connection).help("The connection to change.").req(), CONNECTION_KIND, CONNECTION_FIRST, CONNECTION_SECOND];
+pub const CONNECTION_FIND: &[Field] = &[
+    positive("tolerance", "Tolerance", D::Length)
+        .help("Faces closer than this count as touching. Curved faces are triangulated within half of it.")
+        .hint("1/5000 of the largest body's diagonal"),
+    CONNECTION_KIND.def("\"bonded\""),
+];
 pub const CONTACT_FIND: &[Field] = &[
     positive("tolerance", "Tolerance", D::Length).help("Faces closer than this count as touching.").hint("a tenth of the mean face size"),
     flag("create", "Create pairs").help("Also create a contact for each touching pair found.").def("false"),
@@ -2778,9 +2800,9 @@ pub const SOLVE_STATIC_GRID: &[Field] = &[
     reference("body", "Body", C::Body)
         .help("A body of the design to solve on its own. Empty: every body of the design, bonded where two of them touch.")
         .hint("every body"),
-    choice("connections", "Bodies that touch", &[("bonded", "Bonded"), ("none", "Free")])
-        .help("Several bodies are solved together. Bonded: where faces of two bodies lie on each other they are joined, found from the geometry and listed in the reply. Free: no body holds another, and each needs a support of its own.")
-        .def("\"bonded\""),
+    choice("connections", "Connections", &[("model", "The model's"), ("none", "None")])
+        .help("Several bodies are solved together. The model's: the bodies hold each other by the model's connections (bonded, sliding or free); a model that was never searched for them is searched first, and every two bodies whose faces touch are bonded there. None: no body holds another, and each needs supports of its own.")
+        .def("\"model\""),
     positive("cell_size", "Cell size", D::Length)
         .help("The size of the grid's cubic cells, the same everywhere. For a stress peak at a hole or a fillet within about 1 %: two cells per radius of the smallest stressed feature at degree 4, or four at degree 3. Displacements and reactions need far less.")
         .hint("1/20 of the diagonal"),
