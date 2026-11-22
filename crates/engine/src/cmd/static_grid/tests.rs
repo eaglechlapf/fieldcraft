@@ -550,10 +550,90 @@ fn a_change_of_the_geometry_makes_the_result_stale() {
     assert!(s.result("Pull").is_none() && s.latest_result("Pull").is_some(), "the body was cut in two");
     let bodies: Vec<String> = s.design.as_ref().unwrap().bodies.iter().map(|b| b.name.clone()).collect();
     assert_eq!(bodies.len(), 2, "{bodies:?}");
+    // Both cells together are refused as each is: a partition's cells are no assembly.
     let e = s.execute("solve.static.grid", &json!({"cell_size": 5, "degree": 2})).unwrap_err().to_string();
-    assert!(e.contains("name the body"), "{e}");
+    assert!(e.contains("is a cell of the partitioned body `Block`"), "{e}");
     let e = s.execute("solve.static.grid", &json!({"body": bodies[0], "cell_size": 5, "degree": 2})).unwrap_err().to_string();
     assert!(e.contains("is a cell of the partitioned body `Block`"), "{e}");
     s.execute("edit.undo", &json!({})).unwrap();
     assert!(s.result("Pull").is_some(), "the body is whole again");
+}
+
+/// Two blocks end to end, 20 and 15 mm long: bodies `First` and `Second`.
+const TWO: &str = r#"{"commands": [
+    {"command": "solid.box", "params": {"corner": [0, 0, 0], "length": 20, "width": 10, "height": 10, "body_name": "First"}},
+    {"command": "solid.box", "params": {"corner": [20, 0, 0], "length": 15, "width": 10, "height": 10, "body_name": "Second"}}
+]}"#;
+
+/// Several bodies are solved together, bonded where they touch, without anyone naming the
+/// faces: two blocks end to end, held on three sides as by symmetry planes and pulled, are one
+/// bar. The connection is found and listed, the stress is uniform in both, the far end moves by
+/// σ L / E of the two lengths together, and the held end carries the pull. Sets may name faces
+/// of both bodies.
+#[test]
+fn bodies_that_touch_are_solved_together() {
+    let bytes = fieldcraft_geometry::script_design(TWO).unwrap();
+    let (_dir, path) = crate::tests::design_file(&bytes);
+    let mut s = Session { limits: SessionLimits { max_grid_dofs: 20_000, ..SessionLimits::default() }, ..Session::default() };
+    s.execute("geometry.open", &json!({"path": path})).unwrap();
+    let design = s.design.clone().unwrap();
+    assert_eq!(design.bodies.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), vec!["First", "Second"]);
+    let face = |body: &str, at: [f64; 3]| -> Value {
+        let shape = design.body(body).unwrap();
+        let found = shape.faces().iter().find(|f| {
+            let c = shape.face_centre(&f.name).unwrap();
+            (0..3).all(|k| (c[k] - at[k]).abs() < 1e-6)
+        });
+        json!({"body": body, "face": found.unwrap_or_else(|| panic!("no face of {body} at {at:?}")).name})
+    };
+    s.run_script(&json!([
+        {"command": "model.set.create", "params": {"name": "both", "geometry": [{"body": "First"}, {"body": "Second"}]}},
+        {"command": "model.material.create", "params": {"name": "Steel", "elastic": {"type": "isotropic", "young": YOUNG, "poisson": POISSON}, "density": 7.85e-9}},
+        {"command": "model.section.create", "params": {"name": "Solid", "set": "both", "material": "Steel", "kind": {"type": "solid"}}},
+        {"command": "model.set.create", "params": {"name": "x0", "geometry": [face("First", [0.0, 5.0, 5.0])]}},
+        {"command": "model.set.create", "params": {"name": "end", "geometry": [face("Second", [35.0, 5.0, 5.0])]}},
+        {"command": "model.set.create", "params": {"name": "y0", "geometry": [face("First", [10.0, 0.0, 5.0]), face("Second", [27.5, 0.0, 5.0])]}},
+        {"command": "model.set.create", "params": {"name": "z0", "geometry": [face("First", [10.0, 5.0, 0.0]), face("Second", [27.5, 5.0, 0.0])]}},
+        {"command": "model.boundary_condition.create", "params": {"name": "HoldX", "type": "symmetry", "target": {"set": "x0"}, "plane": "x"}},
+        {"command": "model.boundary_condition.create", "params": {"name": "HoldY", "type": "symmetry", "target": {"set": "y0"}, "plane": "y"}},
+        {"command": "model.boundary_condition.create", "params": {"name": "HoldZ", "type": "symmetry", "target": {"set": "z0"}, "plane": "z"}},
+        {"command": "model.load.create", "params": {"name": "Pull", "type": "pressure", "set": "end", "magnitude": -PULL}},
+        {"command": "model.step.create", "params": {"name": "Pull", "procedure": {"type": "static"}, "boundary_conditions": ["HoldX", "HoldY", "HoldZ"], "loads": ["Pull"]}},
+    ]))
+    .unwrap();
+    let r = s.execute("solve.static.grid", &json!({"cell_size": 5, "degree": 2})).unwrap();
+    let bodies = r["bodies"].as_array().unwrap();
+    assert_eq!(bodies.iter().map(|b| b["body"].as_str().unwrap()).collect::<Vec<_>>(), vec!["First", "Second"]);
+    let connections = r["connections"].as_array().unwrap();
+    assert_eq!(connections.len(), 1, "{connections:?}");
+    assert_eq!(connections[0]["bodies"], json!(["First", "Second"]));
+    assert_eq!(connections[0]["kind"], "bonded");
+    assert!(close(connections[0]["area"].as_f64().unwrap(), 100.0, 1e-9), "{}", connections[0]["area"]);
+    assert_eq!(connections[0]["faces"][0], json!([face("First", [20.0, 5.0, 5.0])["face"]]));
+    assert!(close(r["max_von_mises"]["value"].as_f64().unwrap(), PULL, STRESS), "{}", r["max_von_mises"]);
+    assert!(close(r["max_displacement"]["value"].as_f64().unwrap(), PULL * 35.0 / YOUNG, 2e-2), "{}", r["max_displacement"]);
+    let (applied, reaction) = (r["applied_total"][0].as_f64().unwrap(), r["reaction_total"][0].as_f64().unwrap());
+    assert!(close(applied, PULL * 100.0, 1e-9) && close(-reaction, applied, 1e-6), "{applied} {reaction}");
+    assert!(r["reactions"].as_array().unwrap().iter().any(|x| x["body"] == "First") && r["warnings"].as_array().unwrap().is_empty(), "{r}");
+    // The far end, read on the second body's surface.
+    let probe = s.execute("solve.probe", &json!({"step": "Pull", "at": [[35.0, 5.0, 5.0]]})).unwrap();
+    assert!(close(probe["nodes"][0]["displacement"][0].as_f64().unwrap(), PULL * 35.0 / YOUNG, TRAVEL), "{probe}");
+    let on_end = s.execute("solve.probe", &json!({"step": "Pull", "set": "end"})).unwrap();
+    assert!(on_end["nodes"].as_array().is_some_and(|nodes| !nodes.is_empty()), "{on_end}");
+    let reactions = s.execute("results.reactions", &json!({"step": "Pull", "sets": ["x0"]})).unwrap();
+    assert!(close(-reactions["sets"][0]["force"][0].as_f64().unwrap(), PULL * 100.0, 1e-6), "{reactions}");
+
+    // Free of each other, nothing holds the second block along x; what is not run for several
+    // bodies yet is refused, and one body can still be solved on its own.
+    let e = s.execute("solve.static.grid", &json!({"cell_size": 5, "degree": 2, "connections": "none"})).unwrap_err().to_string();
+    assert!(e.contains("singular") || e.contains("holds"), "{e}");
+    for (params, word) in
+        [(json!({"adapt": 2}), "adapt"), (json!({"check_convergence": true}), "check_convergence"), (json!({"connections": "welded"}), "connections")]
+    {
+        let e = s.execute("solve.static.grid", &params).unwrap_err().to_string();
+        assert!(e.contains(word), "{e}");
+    }
+    // One body on its own takes sets of its own faces only.
+    let e = s.execute("solve.static.grid", &json!({"body": "First", "cell_size": 5, "degree": 2})).unwrap_err().to_string();
+    assert!(e.contains("set `y0` names body `Second`"), "{e}");
 }

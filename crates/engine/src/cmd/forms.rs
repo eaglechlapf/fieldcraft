@@ -2775,7 +2775,12 @@ const THREADS: Field = int("threads", "Threads", 1, 256).help("Threads to use; t
 pub const SOLVE_STATIC: &[Field] = &[STEP, MAX_DOFS, MAX_FACTOR, THREADS];
 pub const SOLVE_STATIC_GRID: &[Field] = &[
     STEP,
-    reference("body", "Body", C::Body).help("The body of the design to solve, on its own; the only one when empty.").hint("the only one"),
+    reference("body", "Body", C::Body)
+        .help("A body of the design to solve on its own. Empty: every body of the design, bonded where two of them touch.")
+        .hint("every body"),
+    choice("connections", "Bodies that touch", &[("bonded", "Bonded"), ("none", "Free")])
+        .help("Several bodies are solved together. Bonded: where faces of two bodies lie on each other they are joined, found from the geometry and listed in the reply. Free: no body holds another, and each needs a support of its own.")
+        .def("\"bonded\""),
     positive("cell_size", "Cell size", D::Length)
         .help("The size of the grid's cubic cells, the same everywhere. For a stress peak at a hole or a fillet within about 1 %: two cells per radius of the smallest stressed feature at degree 4, or four at degree 3. Displacements and reactions need far less.")
         .hint("1/20 of the diagonal"),

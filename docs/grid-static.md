@@ -77,7 +77,8 @@ mesh; each solve replaces the step's result.
 | Parameter | Default | |
 |---|---|---|
 | `step` | the only static step | The step to solve. |
-| `body` | the only body | The body of the open design to solve, on its own. |
+| `body` | every body | A body of the open design to solve on its own. Left out: every body of the design, solved together ([Several bodies](#several-bodies-an-assembly)). |
+| `connections` | `"bonded"` | With several bodies. `"bonded"`: where faces of two bodies lie on each other they are joined; the faces are found from the geometry and listed in the reply. `"none"`: no body holds another. |
 | `cell_size` | 1/20 of the bounding-box diagonal | The size of the grid's cubic cells (a length). |
 | `degree` | 3 | The polynomial degree of the shape functions, 1 to 8. |
 | `basis` | `"auto"` | The shape functions of a cell. `"tensor"`: every product of the polynomials along the three axes up to the degree. `"trunk"`: only those of total degree up to it, half the unknowns a cell at degree 3. `"auto"`: the trunk space for a body that is thin for the grid, the tensor product otherwise. The reply's `basis` names the one used. See [Rounds that follow the solution](#rounds-that-follow-the-solution). |
@@ -94,18 +95,18 @@ mesh; each solve replaces the step's result.
 
 ## What it solves, and what it refuses
 
-It solves one body: linear elastic, isotropic, static.
+It solves one body, or several bonded where they touch: linear elastic, isotropic, static.
 
 | | Solved | Refused, with the reason |
 |---|---|---|
 | Boundary conditions | *Fixed*, *Displacement* (its translations; a prescribed value may be non-zero) and *Symmetry* about a plane normal to X, Y or Z, on sets of whole faces | a temperature, an inclined symmetry plane, a reference point |
 | Loads | *Force* (a total over the set's faces), *Traction* and *Pressure* on sets of whole faces; *Gravity* | moments, body forces, centrifugal and thermal loads, a force at every node |
-| Targets | sets that name faces of the body | sets of nodes, elements, edges or vertices, and faces of another body |
+| Targets | sets that name faces of the body, or of any of the bodies solved together | sets of nodes, elements, edges or vertices; for one body on its own, faces of another body |
 | Material | isotropic elasticity; plasticity is not used | orthotropic elasticity |
-| Model | one body | contacts, ties, couplings, point masses, springs; a cell of a partitioned body |
+| Model | one body, or every body of the design | contacts, ties, couplings, point masses, springs; a cell of a partitioned body |
 
-A design with several bodies needs the `body` named, and the reply warns that the body was
-solved on its own.
+With `body` named in a design of several, the reply warns that the body was solved on its own,
+free wherever it touches another.
 
 ## Results
 
@@ -425,37 +426,55 @@ touch under load pass through each other. `"gaps": "joined"` (the form's **Narro
 the part as if every gap narrower than a cell were welded shut, which is what a corner seam
 that is welded after bending wants.
 
-## Assemblies: what comes next
+## Several bodies: an assembly
 
-The solver solves several bodies in one step (`fieldcraft_fcm::solve_assembly`,
-`crates/fcm/src/assembly.rs`): each on a grid of its own, with its own cell size and material,
-bonded where faces of two that a bond names touch, also where they overlap in part. Two blocks
-end to end are one bar to the accuracy of one body's cut cells, on any two grids; two materials
-in series stretch each by its own modulus; a block on a part of a plate is held through its
-foot (`crates/fcm/tests/assembly.rs`). The command does not use it yet: it still solves one
-body, and what follows is the plan for the rest.
+Leave **Body** empty in a design of several bodies and all of them are solved in one step. Each
+body has its own grid, with its own cell size (a twentieth of its own diagonal unless
+`cell_size` is given, so a small part gets small cells) and the material of its own section.
+Two bodies share no unknown, however close they are: what joins them is a *connection*.
 
-The grid solves one body. What it needs for several is what the gaps already use: every piece
-of material has unknowns of its own in the cells it shares with another, and pieces are joined
-only where something joins them. Two bodies are two pieces by definition, so in one grid over
-an assembly no cell joins them by accident, however close they are; what joins them is a
-*connection*, and connections can be found from the geometry instead of being drawn by hand:
+**Connections are found, not drawn.** Where faces of two bodies lie on each other, facing each
+other, the two are *bonded* there: they move together, as if glued or welded over that area.
+Flat faces touch to rounding; curved ones (a pin in a hole) within the triangulations'
+tolerance. Faces that overlap in part are bonded over the part. An edge or a corner resting on
+a face is no connection. The reply lists what was found:
 
-1. **Faces that touch.** Two faces of two bodies that lie on each other are found as the meshed
-   solve finds contact pairs (`interaction.contact.find`), and are *bonded* unless told
-   otherwise. On the grid a bond is cheap: the two bodies' pieces in the cells along the common
-   face share their unknowns there (exact for one material; with two, the cell integrates each
-   body with its own constants), or are tied in the weak form over the pieces of the common
-   face (Nitsche's method, as the supports are), which also carries *sliding* (the normal
-   component alone) and later contact.
+```json
+"connections": [{"kind": "bonded", "bodies": ["Base", "Post"], "faces": [["F1:+z"], ["F2:-z"]], "area": 2000.0}]
+```
+
+Read that list before the results: a connection that is missing (two parts that should touch
+and are modelled a hair apart) leaves a body held by less than intended, and one that nothing
+holds at all is refused by name. `"connections": "none"` solves the bodies free of each other,
+each on its own supports.
+
+**Supports and loads** are the step's, as for one body, and a set may name faces of several
+bodies. A body needs a boundary condition of its own or a connection to a body that is held. A
+*Force* is a total over the faces of one body.
+
+**What it is.** Each body is solved by the method of one body, and a bond makes the
+displacements of the two equal weakly where they touch (Nitsche's method for an interface, the
+traction taken from the body with the smaller face). Different materials, cell sizes and
+degrees of fill on the two sides are all the same to it: two blocks end to end are one bar to
+the accuracy of one body's cells, on any two grids, and two materials in series stretch each by
+its own modulus (`crates/fcm/tests/assembly.rs`). The unknowns of all bodies are ordered and
+factored together.
+
+**Not yet:** the rounds that follow the solution and **Check convergence** (solve the body
+that matters on its own for them, with `body`); connections other than bonded, which are the
+plan below.
+
+### What comes next
+
+Bonded is the first kind of connection. The others are found from the geometry the same way,
+and the list is where they will be switched:
+
+1. **Sliding and free.** A connection that carries the normal component alone (a part resting
+   in a pocket), and one switched off, per connection, before the solve: the engineer reviews
+   the list instead of building one.
 2. **Holes in line.** Coaxial holes through bodies that touch are bolt candidates
    (`interaction.bolt` of the roadmap's M7): a beam with the bolt's section, its head and nut
    bearing on the annuli around the holes.
 3. **Edges that end on a face.** A plate standing on another is a weld seam candidate
    (`interaction.weld`).
-
-Each found connection is listed with its kind, its two faces and its area, drawn in the
-viewport, and can be switched (bonded, sliding, free) before the solve: the engineer reviews a
-list instead of building one. In this order: several bodies with their own materials and every
-touching face bonded; the list and its switches; bolts and seams; sliding; contact, which needs
-the nonlinear step.
+4. **Contact**, which needs the nonlinear step.

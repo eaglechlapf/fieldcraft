@@ -139,7 +139,7 @@ the control channel and AI agents over MCP (docs/mcp.md) run the same commands.
 | Decks | LS-DYNA Deck — Write an LS-DYNA keyword file | ready | `deck.write {"format":"lsdyna"}` |
 | Decks | Read Deck — Read an Abaqus input deck's model data and the current writer's linear history: mesh, sets, materials, sections, static/frequency/buckling steps, boundary conditions and concentrated loads; unread keywords are listed, not kept | ready | `deck.read` |
 | Implicit | Static — Linear static (or coupled temperature–displacement) solve of a step with FieldCraft's own solver; nonlinear static, buckling and heat transfer in the drop-down | ready | `solve.static`, `solve.nonlinear`, `solve.buckle`, `solve.heat` |
-| Implicit | Grid Static — Linear static solve of one body with no mesh: its surface in a grid of high-order cells (the finite cell method) | ready | `solve.static.grid` |
+| Implicit | Grid Static — Linear static solve with no mesh, of one body or of every body of the design bonded where they touch: each surface in a grid of high-order cells (the finite cell method) | ready | `solve.static.grid` |
 | Implicit | Frequency — Natural frequencies and mode shapes of a frequency step | ready | `solve.frequency` |
 | Explicit | Explicit — Transient dynamics of an explicit step by central differences (contact and erosion coming in M10) | ready | `solve.explicit` |
 | Explicit | Blast & Impact — EOS-driven fluids with fluid–structure contact (ALE or SPH) | coming soon (M14) |  |

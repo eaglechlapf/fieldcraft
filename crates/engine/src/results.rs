@@ -96,6 +96,8 @@ pub fn grid_vertex(label: u32) -> Option<u32> {
 /// The reaction of one supported face of a grid solve.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FaceReaction {
+    /// The body the face is of.
+    pub body: String,
     /// The face's persistent name.
     pub face: String,
     /// The force the support exerts on the part (SI).
@@ -113,7 +115,7 @@ pub struct FaceReaction {
 /// reaction sums over sets) applies ([`StepResult::on_mesh`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct GridResult {
-    /// The body solved.
+    /// The body solved; of several solved together, their names, for a message.
     pub body: String,
     /// The sampled values; always a static result.
     pub result: fieldcraft_solver::StepResult,
@@ -122,8 +124,11 @@ pub struct GridResult {
     pub display: fieldcraft_render::DisplayMesh,
     /// The body's face (its name) each triangle of [`Self::display`] lies on.
     pub tri_face: Vec<u32>,
-    /// The names of the body's faces, by the index [`Self::tri_face`] holds.
+    /// The names of the body's faces, by the index [`Self::tri_face`] holds; of several bodies,
+    /// one body's faces after another's.
     pub faces: Vec<String>,
+    /// The body of each of [`Self::faces`].
+    pub face_bodies: Vec<String>,
     /// The reaction of every supported face.
     pub reactions: Vec<FaceReaction>,
 }
@@ -145,10 +150,10 @@ impl GridResult {
             .collect()
     }
 
-    /// The sampled vertices on the faces `on` picks by name (those of the faces' triangles, so
-    /// the faces' edges too), in label order.
-    pub fn points_on(&self, on: impl Fn(&str) -> bool) -> Vec<u32> {
-        let picked: Vec<bool> = self.faces.iter().map(|f| on(f)).collect();
+    /// The sampled vertices on the faces `on` picks by body and name (those of the faces'
+    /// triangles, so the faces' edges too), in label order.
+    pub fn points_on(&self, on: impl Fn(&str, &str) -> bool) -> Vec<u32> {
+        let picked: Vec<bool> = self.faces.iter().zip(&self.face_bodies).map(|(face, body)| on(body, face)).collect();
         let on_face = |face: &u32| picked.get(*face as usize).copied().unwrap_or(false);
         let mut out: Vec<u32> = self.display.tris.iter().zip(&self.tri_face).filter(|(_, face)| on_face(face)).flat_map(|(t, _)| t.nodes).collect();
         out.sort_unstable();

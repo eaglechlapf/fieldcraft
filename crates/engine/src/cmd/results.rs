@@ -685,9 +685,10 @@ fn grid_reactions(s: &Session, step: &str, g: &crate::results::GridResult, curre
     let mut per_set = Vec::new();
     for name in reaction_sets(s, step, p)? {
         let set = s.model.set(&name).ok_or_else(|| EngineError::Params(format!("no set `{name}`")))?;
-        let named =
-            |face: &str| fieldcraft_model::GeometryRef::face(g.body.clone(), face).is_ok_and(|tag| set.geometry.iter().any(|r| r.selects(&tag)));
-        let mut row = sum(&mut g.reactions.iter().filter(|r| named(&r.face)));
+        let named = |r: &crate::results::FaceReaction| {
+            fieldcraft_model::GeometryRef::face(r.body.clone(), r.face.as_str()).is_ok_and(|tag| set.geometry.iter().any(|g| g.selects(&tag)))
+        };
+        let mut row = sum(&mut g.reactions.iter().filter(|r| named(r)));
         row["set"] = json!(name);
         per_set.push(row);
     }

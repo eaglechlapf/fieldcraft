@@ -1504,7 +1504,8 @@ pub(crate) fn probe(s: &mut Session, p: &Value) -> Result<Value> {
             let name = opt::<String>(p, "set")?.unwrap_or_default();
             let set = s.model.set(&name).ok_or_else(|| EngineError::Params(format!("no set `{}`", name.chars().take(100).collect::<String>())))?;
             let body = grid.map_or("", |g| g.body.as_str());
-            let named = |face: &str| fieldcraft_model::GeometryRef::face(body, face).is_ok_and(|tag| set.geometry.iter().any(|r| r.selects(&tag)));
+            let named =
+                |of: &str, face: &str| fieldcraft_model::GeometryRef::face(of, face).is_ok_and(|tag| set.geometry.iter().any(|r| r.selects(&tag)));
             let found = grid.map(|g| g.points_on(named)).unwrap_or_default();
             if found.is_empty() {
                 return Err(EngineError::Params(format!(
