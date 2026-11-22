@@ -64,6 +64,13 @@ const BATCH: usize = 1 << 22;
 /// Dense work (multiply–adds) from which a kernel's tiles run in parallel.
 const PARALLEL_WORK: usize = 1 << 21;
 
+/// Columns of the matrix whose rows one task sorts ([`Lower::new`]).
+const SORTED: usize = 1024;
+
+/// Entries of an update from which its subtraction runs in parallel, column by column
+/// ([`subtract`]).
+const PARALLEL_ENTRIES: usize = 1 << 16;
+
 /// Subtrees are handed to threads in pieces of about this fraction of the total work.
 const SUBTREE_SHARE: usize = 256;
 
@@ -81,20 +88,41 @@ impl<T: Scalar> UpperColumns<T> {
     /// From a symmetric matrix stored by full rows (row k's entries with column ≤ k are column k
     /// of the upper triangle).
     pub fn from_symmetric(a: &crate::sparse::Csr<T>) -> UpperColumns<T> {
+        // Every row's share is counted, then the rows are copied by the thousand, in parallel:
+        // each task writes its own part of the columns.
+        let counts = parallel::map_grained(a.n, SORTED, |k| a.row(k).0.iter().filter(|c| **c <= k).count());
         let mut ptr = Vec::with_capacity(a.n + 1);
-        ptr.push(0);
-        let mut idx = Vec::new();
-        let mut val = Vec::new();
-        for k in 0..a.n {
-            let (cols, vals) = a.row(k);
-            for (c, v) in cols.iter().zip(vals) {
-                if *c <= k {
-                    idx.push(*c);
-                    val.push(*v);
+        ptr.push(0usize);
+        for count in &counts {
+            ptr.push(ptr.last().copied().unwrap_or(0) + count);
+        }
+        let total = ptr.last().copied().unwrap_or(0);
+        let (mut idx, mut val) = (vec![0usize; total], vec![T::ZERO; total]);
+        let mut pieces: Vec<(std::ops::Range<usize>, &mut [usize], &mut [T])> = Vec::new();
+        let (mut rest_idx, mut rest_val) = (idx.as_mut_slice(), val.as_mut_slice());
+        for rows in parallel::blocks(a.n, SORTED) {
+            let entries = ptr.get(rows.end).copied().unwrap_or(0).saturating_sub(ptr.get(rows.start).copied().unwrap_or(0));
+            let entries = entries.min(rest_idx.len()).min(rest_val.len());
+            let (own_idx, tail_idx) = std::mem::take(&mut rest_idx).split_at_mut(entries);
+            let (own_val, tail_val) = std::mem::take(&mut rest_val).split_at_mut(entries);
+            pieces.push((rows, own_idx, own_val));
+            (rest_idx, rest_val) = (tail_idx, tail_val);
+        }
+        parallel::for_each_mut(&mut pieces, |_, (rows, own_idx, own_val)| {
+            let mut at = 0;
+            for k in rows.clone() {
+                let (cols, vals) = a.row(k);
+                for (c, v) in cols.iter().zip(vals) {
+                    if *c <= k {
+                        if let (Some(i), Some(x)) = (own_idx.get_mut(at), own_val.get_mut(at)) {
+                            (*i, *x) = (*c, *v);
+                        }
+                        at += 1;
+                    }
                 }
             }
-            ptr.push(idx.len());
-        }
+        });
+        drop(pieces);
         UpperColumns { n: a.n, ptr, idx, val }
     }
 }
@@ -172,8 +200,75 @@ pub(crate) fn factor_entries<T>(a: &UpperColumns<T>) -> usize {
     symbolic(a).1.iter().sum()
 }
 
-/// The elimination tree and the entry count of each column of L, without computing values.
+/// Unknowns of a block that share one structure, when the matrix is made of such blocks
+/// ([`uniform_blocks`]): the three displacement components of a node or a shape function.
+const BLOCK: usize = 3;
+
+/// The matrix of the blocks of [`BLOCK`] consecutive unknowns, when every block's unknowns
+/// have one structure: each couples with the whole of every block it couples with, its own
+/// included (a solid model: three displacements a node, each with every displacement of the
+/// nodes around). Its pattern has a ninth of the entries; `None` for any other matrix.
+fn uniform_blocks<T>(a: &UpperColumns<T>) -> Option<UpperColumns<T>> {
+    if a.n == 0 || !a.n.is_multiple_of(BLOCK) {
+        return None;
+    }
+    let mut ptr = Vec::with_capacity(a.n / BLOCK + 1);
+    ptr.push(0);
+    let mut idx = Vec::with_capacity(a.idx.len() / (BLOCK * BLOCK) + a.n / BLOCK);
+    for q in 0..a.n / BLOCK {
+        // The first unknown's column: whole blocks above, then itself.
+        let (&own, above) = a.column(BLOCK * q).0.split_last()?;
+        if own != BLOCK * q || !above.len().is_multiple_of(BLOCK) {
+            return None;
+        }
+        for block in above.chunks(BLOCK) {
+            let first = *block.first()?;
+            if !first.is_multiple_of(BLOCK) || !block.iter().enumerate().all(|(i, row)| *row == first + i) {
+                return None;
+            }
+            idx.push(first / BLOCK);
+        }
+        idx.push(q);
+        // The others': the same above, then the block's unknowns up to themselves.
+        for c in 1..BLOCK {
+            let rows = a.column(BLOCK * q + c).0;
+            let (same, within) = rows.split_at_checked(above.len())?;
+            if same != above || within.len() != c + 1 || !within.iter().enumerate().all(|(i, row)| *row == BLOCK * q + i) {
+                return None;
+            }
+        }
+        ptr.push(idx.len());
+    }
+    Some(UpperColumns { n: a.n / BLOCK, ptr, idx, val: Vec::new() })
+}
+
+/// The elimination tree and the entry count of each column of L, without computing values. A
+/// matrix of uniform blocks ([`uniform_blocks`]) has them from the blocks' matrix, a ninth of
+/// the work: within a block every unknown's parent is the next one, the last one's is the first
+/// unknown of the block's parent, and unknown c of a block whose column of blocks has `count`
+/// of them has BLOCK · count − c entries (the rows of the blocks below, and its own block's
+/// from itself on).
 fn symbolic<T>(a: &UpperColumns<T>) -> (Vec<usize>, Vec<usize>) {
+    let Some(blocks) = uniform_blocks(a) else { return symbolic_by_columns(a) };
+    let (block_parent, block_counts) = symbolic_by_columns(&blocks);
+    let (mut parent, mut counts) = (Vec::with_capacity(a.n), Vec::with_capacity(a.n));
+    for (q, (above, count)) in block_parent.iter().zip(&block_counts).enumerate() {
+        for c in 0..BLOCK {
+            parent.push(if c + 1 < BLOCK {
+                BLOCK * q + c + 1
+            } else if *above == NONE {
+                NONE
+            } else {
+                BLOCK * above
+            });
+            counts.push(BLOCK * count - c);
+        }
+    }
+    (parent, counts)
+}
+
+/// [`symbolic`] column by column, for any matrix.
+fn symbolic_by_columns<T>(a: &UpperColumns<T>) -> (Vec<usize>, Vec<usize>) {
     let parent = etree(a);
     let mut counts = vec![1usize; a.n];
     let mut stack = vec![0; a.n];
@@ -463,19 +558,43 @@ pub(crate) fn products<T: Scalar>(
     if mu.saturating_mul(wu).saturating_mul(kw) >= PARALLEL_WORK { parallel::map(tiles, tile) } else { (0..tiles).map(tile).collect() }
 }
 
-/// own(rel(i), rel(c)) −= S(i, c) for i ≥ c, with S in the tiles of [`products`].
-pub(crate) fn subtract<T: Scalar>(own: &mut [T], m: usize, tiles: &[Vec<T>], mu: usize, wu: usize, rel: impl Fn(usize) -> usize) {
-    for (t, tile) in tiles.iter().enumerate() {
-        let i0 = t * TILE;
-        let h = TILE.min(mu - i0);
-        for c in 0..wu.min(i0 + h) {
-            let cc = rel(c);
+/// own(rel(i), rel(c)) −= S(i, c) for i ≥ c, with S in the tiles of [`products`]; `rel` rises
+/// with its argument. Every entry takes one subtraction, so a large update is subtracted column
+/// by column in parallel: the columns of `own` are apart in memory.
+pub(crate) fn subtract<T: Scalar>(own: &mut [T], m: usize, tiles: &[Vec<T>], mu: usize, wu: usize, rel: impl Fn(usize) -> usize + Sync) {
+    // Column c of the update into its column of `own`, which starts at the row rel(c).
+    let column = |c: usize, target: &mut [T]| {
+        let cc = rel(c);
+        for (t, tile) in tiles.iter().enumerate().skip(c / TILE) {
+            let i0 = t * TILE;
+            let h = TILE.min(mu.saturating_sub(i0));
             for i in i0.max(c)..i0 + h {
-                let rr = rel(i);
-                if let (Some(x), Some(s)) = (own.get_mut(offset(m, cc) + rr - cc), tile.get(c * TILE + i - i0)) {
+                if let (Some(x), Some(s)) = (target.get_mut(rel(i).wrapping_sub(cc)), tile.get(c * TILE + i - i0)) {
                     *x -= *s;
                 }
             }
+        }
+    };
+    // The columns the update reaches, each a slice of `own`: they rise with c.
+    let mut columns: Vec<&mut [T]> = Vec::with_capacity(wu);
+    let (mut rest, mut at) = (own, 0usize);
+    for c in 0..wu.min(mu) {
+        let cc = rel(c);
+        let start = offset(m, cc);
+        if start < at || cc >= m {
+            break;
+        }
+        let Some((_, tail)) = std::mem::take(&mut rest).split_at_mut_checked(start - at) else { break };
+        let Some((target, tail)) = tail.split_at_mut_checked(m - cc) else { break };
+        columns.push(target);
+        rest = tail;
+        at = start + m - cc;
+    }
+    if mu.saturating_mul(wu) >= PARALLEL_ENTRIES {
+        parallel::for_each_mut(&mut columns, |c, target| column(c, target));
+    } else {
+        for (c, target) in columns.iter_mut().enumerate() {
+            column(c, target);
         }
     }
 }
@@ -566,12 +685,26 @@ impl Pattern {
                 }
             }
         }
-        for j in 0..n {
-            let (s, e) = (ptr.get(j).copied().unwrap_or(0), ptr.get(j + 1).copied().unwrap_or(0));
-            if let Some(col) = entries.get_mut(s..e) {
-                col.sort_by_key(|p| p.0);
-            }
+        // Every column's rows in order: columns by the thousand, in parallel.
+        let mut pieces: Vec<(usize, &mut [(usize, usize)])> = Vec::new();
+        let mut rest = entries.as_mut_slice();
+        for columns in parallel::blocks(n, SORTED) {
+            let (s, e) = (ptr.get(columns.start).copied().unwrap_or(0), ptr.get(columns.end).copied().unwrap_or(0));
+            let entries = e.saturating_sub(s).min(rest.len());
+            let (piece, tail) = std::mem::take(&mut rest).split_at_mut(entries);
+            pieces.push((columns.start, piece));
+            rest = tail;
         }
+        parallel::for_each_mut(&mut pieces, |_, (first, piece)| {
+            let base = ptr.get(*first).copied().unwrap_or(0);
+            for j in *first..(*first + SORTED).min(n) {
+                let (s, e) = (ptr.get(j).copied().unwrap_or(0), ptr.get(j + 1).copied().unwrap_or(0));
+                if let Some(col) = piece.get_mut(s - base..e - base) {
+                    col.sort_by_key(|p| p.0);
+                }
+            }
+        });
+        drop(pieces);
         let mut slot = vec![0usize; a.idx.len()];
         for (pos, &(_, e)) in entries.iter().enumerate() {
             if let Some(x) = slot.get_mut(e) {
@@ -1209,11 +1342,19 @@ impl Symbolic {
         let ns = self.supernodes();
         let mut values: Vec<Vec<T>> = Vec::new();
         values.try_reserve_exact(ns).map_err(|_| FactorError::OutOfMemory { entries: self.entries })?;
-        for s in 0..ns {
-            let mut v = Vec::new();
-            v.try_reserve_exact(self.structure.size(s)).map_err(|_| FactorError::OutOfMemory { entries: self.entries })?;
-            v.resize(self.structure.size(s), T::ZERO);
-            values.push(v);
+        values.resize_with(ns, Vec::new);
+        // Each supernode's memory is taken and zeroed by a task: the system hands it out page
+        // by page as it is first written, which is most of the time this takes.
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        parallel::for_each_mut(&mut values, |s, v| {
+            if v.try_reserve_exact(self.structure.size(s)).is_err() {
+                failed.store(true, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                v.resize(self.structure.size(s), T::ZERO);
+            }
+        });
+        if failed.into_inner() {
+            return Err(FactorError::OutOfMemory { entries: self.entries });
         }
         Ok(values)
     }
@@ -1611,6 +1752,105 @@ mod tests {
             })
             .unwrap();
             assert!(one.values.iter().flatten().zip(values.iter().flatten()).all(|(a, b)| a.to_bits() == b.to_bits()), "batches of {batch}");
+        }
+    }
+
+    /// A matrix of blocks of three unknowns has its tree and its column counts from the
+    /// blocks' matrix, the same as column by column; any other matrix is taken column by column.
+    #[test]
+    fn the_structure_of_uniform_blocks_is_the_structure_by_columns() {
+        let nodes = 40;
+        let mut seed = 7u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        let mut dense = vec![vec![0.0; BLOCK * nodes]; BLOCK * nodes];
+        let couple = |dense: &mut Vec<Vec<f64>>, a: usize, b: usize| {
+            for i in 0..BLOCK {
+                for j in 0..BLOCK {
+                    dense[BLOCK * a + i][BLOCK * b + j] = if a == b && i == j { 100.0 } else { 0.5 };
+                    dense[BLOCK * b + j][BLOCK * a + i] = dense[BLOCK * a + i][BLOCK * b + j];
+                }
+            }
+        };
+        for a in 0..nodes {
+            couple(&mut dense, a, a);
+            for _ in 0..3 {
+                let b = next() % nodes;
+                couple(&mut dense, a.max(b), a.min(b));
+            }
+        }
+        let upper = UpperColumns::from_symmetric(&dense_to_csr(&dense));
+        let blocks = uniform_blocks(&upper).expect("blocks of three");
+        assert_eq!((blocks.n, blocks.ptr.len()), (nodes, nodes + 1));
+        assert_eq!(symbolic(&upper), symbolic_by_columns(&upper));
+        let f = Factor::new(&upper, usize::MAX).unwrap();
+        check_solve(&dense_to_csr(&dense), &f, 1e-10);
+        // One entry short of a block, one unknown short of whole blocks: column by column.
+        let (a, b) = (BLOCK * (nodes - 1), 1);
+        assert!(dense[a][b] == 0.0 || dense[a][b] == 0.5);
+        let mut other = dense.clone();
+        let was = other[a][b];
+        other[a][b] = if was == 0.0 { 0.5 } else { 0.0 };
+        other[b][a] = other[a][b];
+        let ragged = UpperColumns::from_symmetric(&dense_to_csr(&other));
+        assert!(uniform_blocks(&ragged).is_none());
+        assert_eq!(symbolic(&ragged), symbolic_by_columns(&ragged));
+        let shorter: Vec<Vec<f64>> = dense.iter().take(BLOCK * nodes - 1).map(|row| row[..BLOCK * nodes - 1].to_vec()).collect();
+        assert!(uniform_blocks(&UpperColumns::from_symmetric(&dense_to_csr(&shorter))).is_none());
+    }
+
+    /// The matrix in another order keeps every column's rows sorted and every value, and its
+    /// upper triangle by columns is the rows' entries up to the diagonal, however many columns
+    /// a task takes.
+    #[test]
+    fn the_matrix_is_copied_and_reordered_whole() {
+        let n = 3 * SORTED + 17;
+        let mut seed = 99u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        // A band with a few entries far off it, by full rows.
+        let mut rows: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+        for i in 0..n {
+            rows[i].push((i, 10.0 + i as f64));
+            for j in [i.saturating_sub(1), i.saturating_sub(7), next() % (i + 1)] {
+                if j < i && !rows[i].iter().any(|(c, _)| *c == j) {
+                    let v = 1.0 + (next() % 100) as f64 / 100.0;
+                    rows[i].push((j, v));
+                    rows[j].push((i, v));
+                }
+            }
+        }
+        let (mut ptr, mut idx, mut val) = (vec![0], Vec::new(), Vec::new());
+        for row in &mut rows {
+            row.sort_by_key(|(c, _)| *c);
+            idx.extend(row.iter().map(|(c, _)| *c));
+            val.extend(row.iter().map(|(_, v)| *v));
+            ptr.push(idx.len());
+        }
+        let upper = UpperColumns::from_symmetric(&Csr { n, ptr, idx, val });
+        for k in 0..n {
+            let expected: Vec<(usize, f64)> = rows[k].iter().copied().filter(|(c, _)| *c <= k).collect();
+            let (r, v) = upper.column(k);
+            assert_eq!(r.iter().copied().zip(v.iter().copied()).collect::<Vec<_>>(), expected, "column {k}");
+        }
+        // Reversed: column j of the lower triangle is the old column n − 1 − j, its rows turned,
+        // and every entry of the upper columns is found where its row and column say.
+        let inverse: Vec<usize> = (0..n).map(|i| n - 1 - i).collect();
+        let pattern = Pattern::new(&upper, &inverse);
+        for j in 0..n {
+            let r = pattern.rows(j);
+            assert!(r.windows(2).all(|w| w[0] < w[1]) && r.first() == Some(&j), "column {j}: {r:?}");
+            let mut expected: Vec<usize> = rows[n - 1 - j].iter().filter(|(c, _)| *c <= n - 1 - j).map(|(c, _)| n - 1 - c).collect();
+            expected.sort_unstable();
+            assert_eq!(r, expected.as_slice(), "column {j}");
+        }
+        for (entry, &(row, column)) in pattern.coords.iter().enumerate() {
+            let at = pattern.slot[entry];
+            assert!(pattern.range(column).contains(&at) && pattern.idx[at] == row, "entry {entry}");
         }
     }
 

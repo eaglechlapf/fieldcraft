@@ -335,6 +335,33 @@ Where the answer can be poor:
   rounding where every cut cell was integrated exactly, and to about 1e-5 where some were
   sampled.
 
+## How large a model
+
+The unknowns are solved all at once, by a factorization of their matrix. Its time grows with
+the square of the unknowns for a compact part and its memory a little faster than the
+unknowns; a thin part, whose cells lie side by side in a sheet, costs far less. Measured at
+degree 3 on a desktop processor with 24 threads (i7-13700KF), the whole solve:
+
+| Part | Unknowns | Time | Factor |
+|---|---|---|---|
+| A solid block, 14 cells along its longest side | 220,000 | 7 s | 2.1 GB |
+| The same, 18 cells | 416,000 | 21 s | 5.1 GB |
+| A plate one cell thick, 40 cells along | 167,000 | 1.6 s | 0.5 GB |
+
+Two limits stop a solve before it takes the machine's memory. `max_factor_entries` caps the
+factor (8 bytes an entry; the default of 400 million is 3.2 GB, a compact part of about
+300,000 unknowns): raise it when the machine has the memory, up to about half of it. The
+stiffness matrix itself holds at most 180 million entries, which a compact part reaches at
+about 480,000 unknowns of degree 3. A solve above a limit is refused with the number that
+was reached, or, for several bodies on cells of the command's choosing, run again on larger
+cells with a warning.
+
+A compact part of a million unknowns is beyond the matrix limit, and would take about two
+minutes and 16 GB without it; one of several million is out of reach of a factorization on a
+desktop. The trunk space
+(`"basis": "trunk"`) halves the unknowns at degree 3, and a lower `degree` with a level more
+of `refine` costs less than a smaller `cell_size` everywhere.
+
 ## Narrow gaps: sheet metal corners, slits, fins
 
 A cell carries one polynomial, and a polynomial cannot tell the two sides of a narrow gap apart.
