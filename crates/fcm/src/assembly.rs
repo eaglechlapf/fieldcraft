@@ -85,17 +85,30 @@ use std::sync::OnceLock;
 use fieldcraft_fem::{DofLayout, DofSet};
 use fieldcraft_mesh::surface::BoundarySurface;
 use fieldcraft_solver::Limits;
-use fieldcraft_solver::cholesky::{Factor, UpperColumns};
+use fieldcraft_solver::cholesky::{Factor, FactorError, UpperColumns, predicted};
 use fieldcraft_solver::ordering::element_dissection;
 use fieldcraft_solver::sparse::{NodeGraph, add_block};
 
 use crate::cell::{Curved, Grip};
 use crate::grid::{self, Grid, cross, dot, sub};
 use crate::islands::closest_point;
+use crate::iterative;
 use crate::refine::Tree;
-use crate::solve::{self, Load, MAX_MATRIX_ENTRIES, Material, Options, Round, Solution, Solved, Support, Tied, Ties, View};
+use crate::solve::{self, Load, MAX_MATRIX_ENTRIES, Material, Options, Round, Solution, Solved, Solver, Support, Tied, Ties, View};
 use crate::space::NONE;
 use crate::{Error, Result};
+
+/// Unknowns from which a system may be solved by iteration ([`Solver::Auto`]): below, the
+/// factorization takes a few seconds at most, and its result is exact.
+const ITERATIVE_FROM: usize = 100_000;
+/// The multiply–adds of the factorization for every entry of the stiffness from which the
+/// iteration is the faster of the two: measured on a block of 220,000 and of 416,000 unknowns
+/// at degree 3 on 24 threads, where the factorization does 85 billion multiply–adds a second
+/// and the iteration takes 0.04 s for every million entries of the stiffness.
+const WORK_PER_ENTRY: f64 = 3000.0;
+/// Poisson's ratio above which a body's system is left to the factorization: towards one half
+/// the rounds of the iteration grow without bound ([`iterative`]).
+const NEARLY_INCOMPRESSIBLE: f64 = 0.45;
 
 /// Bodies of one solve, at most (their solves are nested).
 pub const MAX_PARTS: usize = 64;
@@ -1199,7 +1212,11 @@ pub(crate) fn solve_system(
         // its factor cannot fit: the larger system of the same part is taken to have no fewer
         // entries of the factor for each of the stiffness than the solve before it had (the
         // fill of a nested dissection grows with the system).
-        if let Some((before, factor)) = views.iter().find_map(|view| view.before).filter(|(before, _)| *before > 0 && entries >= *before) {
+        // (Only where the factorization is the one way asked for: an iteration takes a
+        // system whose factor does not fit.)
+        let factored = views.iter().any(|view| view.solver == Solver::Direct);
+        if let Some((before, factor)) = views.iter().find_map(|view| view.before).filter(|(before, _)| factored && *before > 0 && entries >= *before)
+        {
             let least = entries as f64 * factor as f64 / before as f64;
             if least > limits.max_factor_entries as f64 {
                 return Err(Error::Limit(format!(
@@ -1297,13 +1314,70 @@ pub(crate) fn solve_system(
     }
     drop(pairs);
 
-    // The solution. The factorization reads the matrix's lower triangle, and nothing reads the
-    // matrix after it.
-    let factor = Factor::new(&UpperColumns::from_symmetric(&stiffness), limits.max_factor_entries).map_err(|e| solve::factor_error(e, refine))?;
-    let factor_entries = factor.entries();
-    let mut u = load;
-    factor.solve(&mut u)?;
-    drop(factor);
+    // The solution: by the factorization, or by iteration where the factorization would take
+    // far more work than the system has entries, or more memory than is allowed. What the
+    // factorization would cost is known from the matrix's structure before any of it is done.
+    let upper = UpperColumns::from_symmetric(&stiffness);
+    let (entries, work) = predicted(&upper);
+    let fits = entries <= limits.max_factor_entries;
+    let asked = |solver: Solver| views.iter().any(|view| view.solver == solver);
+    let iterate = if asked(Solver::Direct) {
+        false
+    } else if asked(Solver::Iterative) {
+        true
+    } else {
+        // A material that hardly changes its volume is not the iteration's ([`iterative`]).
+        let suits = views.iter().all(|view| view.poisson <= NEARLY_INCOMPRESSIBLE);
+        !fits || (3 * total >= ITERATIVE_FROM && suits && work > WORK_PER_ENTRY * stiffness_entries as f64)
+    };
+    let mut iterated = None;
+    if iterate {
+        // The factorization's copy of the matrix is taken again if it comes to that.
+        drop(upper);
+        let mut linear = vec![false; total];
+        for (body, view) in views.iter().enumerate() {
+            for (function, flag) in view.linear.iter().enumerate().take(view.count) {
+                if let Some(slot) = place.get(global(body, function)).and_then(|node| linear.get_mut(*node)) {
+                    *slot = *flag;
+                }
+            }
+        }
+        // The local level: every element's unknowns, and those of every two elements a
+        // connection couples together, whose stiff coupling a block of one body would not see.
+        let elements: Vec<(usize, usize)> =
+            views.iter().enumerate().flat_map(|(body, view)| (0..view.elements.len()).map(move |element| (body, element))).collect();
+        let mut blocks: Vec<Vec<usize>> = elements.iter().map(|(body, element)| placed(*body, *element)).collect();
+        // The blocks whose answers are taken whole: of a cell the surface cuts or a support or
+        // a connection acts in, and of two coupled cells.
+        let mut whole: Vec<bool> = elements
+            .iter()
+            .map(|(body, element)| views.get(*body).is_none_or(|view| (view.fraction)(*element) < 1.0 || (view.nitsche)(*element) > 0.0))
+            .collect();
+        whole.resize(blocks.len() + coupled.len(), true);
+        blocks.extend(coupled.iter().map(|(first, element, second, other)| {
+            let mut both = placed(*first, *element);
+            both.extend(placed(*second, *other));
+            both
+        }));
+        let progress = fieldcraft_model::progress::current();
+        let cancelled = || progress.as_ref().is_some_and(|p| p.is_cancelled());
+        iterated = iterative::solve(&stiffness, &load, &linear, &blocks, &whole, limits, iterative::SETTLED, iterative::MOST, &cancelled)?;
+    }
+    let (u, factor_entries, iterations, residual) = match iterated {
+        Some(outcome) => (outcome.u, outcome.coarse_entries, outcome.iterations, outcome.residual),
+        None => {
+            if !fits {
+                return Err(solve::factor_error(FactorError::TooLarge { entries, limit: limits.max_factor_entries }, refine));
+            }
+            // The factorization reads the matrix's lower triangle.
+            let upper = UpperColumns::from_symmetric(&stiffness);
+            let factor = Factor::new(&upper, limits.max_factor_entries).map_err(|e| solve::factor_error(e, refine))?;
+            drop(upper);
+            let mut u = load;
+            factor.solve(&mut u)?;
+            (u, factor.entries(), 0, 0.0)
+        }
+    };
     drop(stiffness);
     if u.iter().any(|x| !x.is_finite()) {
         return Err(Error::Singular("the solution is not finite: the stiffness is singular to working precision".into()));
@@ -1318,7 +1392,7 @@ pub(crate) fn solve_system(
                     out.copy_from_slice(values);
                 }
             }
-            Solved { u: own, stiffness_entries, factor_entries }
+            Solved { u: own, stiffness_entries, factor_entries, iterations, residual }
         })
         .collect())
 }

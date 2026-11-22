@@ -10,6 +10,8 @@ workspace = true
 
 [dependencies]
 fieldcraft-mesh = { workspace = true }
+# Whether the caller has cancelled, asked between the rounds of the iteration.
+fieldcraft-model = { workspace = true }
 fieldcraft-fem = { workspace = true }
 fieldcraft-solver = { workspace = true }
 fieldcraft-parallel = { workspace = true }

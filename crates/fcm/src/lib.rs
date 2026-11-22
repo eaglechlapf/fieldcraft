@@ -105,6 +105,7 @@ pub mod gauss;
 pub mod grid;
 pub mod inside;
 pub mod islands;
+mod iterative;
 pub mod legendre;
 mod moments;
 mod refine;
@@ -113,7 +114,7 @@ mod space;
 
 pub use assembly::{Bond, Motion, Part, Touch, assembly_unknowns, bond_areas, find_bonds, free_motions, solve_assembly};
 pub use cell::{Curved, Grip};
-pub use solve::{Basis, Change, Load, Material, Options, Reaction, Solution, Stats, Support, solve};
+pub use solve::{Basis, Change, Load, Material, Options, Reaction, Solution, Solver, Stats, Support, solve};
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum Error {

@@ -195,6 +195,15 @@ fn ereach<T>(a: &UpperColumns<T>, k: usize, parent: &[usize], stack: &mut [usize
     top
 }
 
+/// What the Cholesky factorization of `a` would cost, from its structure alone and before any
+/// of it is computed: the entries of the factor, and the multiply–adds that compute them (half
+/// the squares of the columns' counts). A caller with another way to solve the system chooses
+/// by them.
+pub fn predicted(a: &UpperColumns) -> (usize, f64) {
+    let (_, counts) = symbolic(a);
+    (counts.iter().sum(), counts.iter().map(|count| 0.5 * (*count as f64) * (*count as f64)).sum())
+}
+
 /// The entries of the Cholesky factor of `a`'s pattern, in its own order, without values.
 pub(crate) fn factor_entries<T>(a: &UpperColumns<T>) -> usize {
     symbolic(a).1.iter().sum()

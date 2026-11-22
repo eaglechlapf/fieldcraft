@@ -1953,6 +1953,7 @@ dependencies = [
  "fieldcraft-fem",
  "fieldcraft-geometry",
  "fieldcraft-mesh",
+ "fieldcraft-model",
  "fieldcraft-parallel",
  "fieldcraft-solver",
  "libm",

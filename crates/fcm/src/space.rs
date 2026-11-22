@@ -88,6 +88,10 @@ pub(crate) struct Space {
     joined: Option<(Vec<u32>, Vec<u32>)>,
     /// Where each mode sits, in half cell steps of the grid from its origin.
     pub xyz: Vec<[f64; 3]>,
+    /// Whether each mode is a linear shape function: one of a vertex of a cell of its level.
+    /// The linear ones of all levels are the trilinear elements of the refined grid, the
+    /// coarse level of [`crate::iterative`].
+    pub linear: Vec<bool>,
 }
 
 /// The modes of a cell of degree `p`, each by its index along the three axes: the full tensor
@@ -399,6 +403,7 @@ impl Space {
             told_apart: 0,
             joined: None,
             xyz: Vec::new(),
+            linear: Vec::new(),
         };
         for leaf in tree.leaves() {
             if !tree.nodes.get(leaf as usize).is_some_and(|cell| cell.material()) {
@@ -459,6 +464,7 @@ impl Space {
             if found == next {
                 let steps = (1u64 << level) as f64;
                 space.xyz.push([x as f64 / steps, y as f64 / steps, z as f64 / steps]);
+                space.linear.push(dx == 0 && dy == 0 && dz == 0);
             }
             space.functions.push(found);
         };
@@ -621,6 +627,7 @@ impl Space {
         }
         let mut position = vec![usize::MAX; self.count];
         let mut xyz = Vec::with_capacity(self.count);
+        let mut linear = Vec::with_capacity(self.count);
         for (k, &mode) in order.iter().enumerate() {
             let slot = position.get_mut(mode).ok_or_else(broken)?;
             if *slot != usize::MAX {
@@ -628,11 +635,13 @@ impl Space {
             }
             *slot = k;
             xyz.push(self.xyz.get(mode).copied().ok_or_else(broken)?);
+            linear.push(self.linear.get(mode).copied().ok_or_else(broken)?);
         }
         for mode in &mut self.functions {
             *mode = position.get(*mode).copied().ok_or_else(broken)?;
         }
         self.xyz = xyz;
+        self.linear = linear;
         Ok(())
     }
 }

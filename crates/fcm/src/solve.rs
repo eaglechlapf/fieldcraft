@@ -279,6 +279,23 @@ pub struct Options {
     /// them without it, are integrated by the quadrature on an octree of [`Options::depth`]
     /// levels ([`crate::grid`]). [`Stats::exact_cells`] counts them.
     pub exact: bool,
+    /// How the unknowns are solved for.
+    pub solver: Solver,
+}
+
+/// How the unknowns of a step are solved for ([`Options::solver`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Solver {
+    /// By the factorization, unless the system is large and the factorization would take far
+    /// more work than an iteration, or more memory than is allowed: then by iteration, and by
+    /// the factorization after all when the iteration does not settle ([`crate::iterative`]).
+    #[default]
+    Auto,
+    /// By the sparse Cholesky factorization: the same result to the last bit on every machine.
+    Direct,
+    /// By iteration whatever the system's size (and by the factorization when it does not
+    /// settle): the result is right to the iteration's tolerance, not to rounding.
+    Iterative,
 }
 
 impl Options {
@@ -340,6 +357,7 @@ impl Options {
             settle: 0.0,
             reuse: true,
             exact: true,
+            solver: Solver::Auto,
         }
     }
 
@@ -436,6 +454,11 @@ pub struct Stats {
     /// Whether a round of [`Options::adapt`] was left out: with its cells the system would have
     /// been too large, or could not be solved.
     pub left_out: bool,
+    /// The rounds of the iteration that solved the system ([`Options::solver`]); 0 when the
+    /// factorization did. [`Stats::factor_entries`] is then the factor of the coarse level.
+    pub iterations: usize,
+    /// The residual the iteration ended at, relative to the load; 0 for the factorization.
+    pub residual: f64,
 }
 
 /// How far two solutions of the same step are apart ([`Solution::change_from`]): an indicator
@@ -626,6 +649,15 @@ pub(crate) struct View<'a> {
     pub at: &'a dyn Fn([f64; 3], [f64; 3]) -> Option<(usize, Vec<f64>)>,
     /// The Nitsche parameter of an element's cell, once its matrices were handed over.
     pub nitsche: &'a dyn Fn(usize) -> f64,
+    /// The fraction of an element's cell that holds its material, once its matrices were handed
+    /// over: 1 for a cell wholly inside the part.
+    pub fraction: &'a dyn Fn(usize) -> f64,
+    /// Which functions are linear shape functions ([`crate::space::Space::linear`]).
+    pub linear: &'a [bool],
+    /// How the body asks for its unknowns to be solved, and its Poisson's ratio, which decides
+    /// whether an iteration suits it.
+    pub solver: Solver,
+    pub poisson: f64,
     /// The levels of refinement asked for, and the stiffness and factor entries of the solve
     /// before this one, for what a refusal says and when.
     pub refine: usize,
@@ -638,6 +670,9 @@ pub(crate) struct Solved {
     pub u: Vec<f64>,
     pub stiffness_entries: usize,
     pub factor_entries: usize,
+    /// The rounds and the residual of the iteration; zero when the system was factored.
+    pub iterations: usize,
+    pub residual: f64,
 }
 
 /// Where a body's equations go: into a system of its own, or one of several bodies.
@@ -1792,6 +1827,8 @@ fn solve_at(
         rounds: 0,
         settled: 0.0,
         left_out: false,
+        iterations: 0,
+        residual: 0.0,
     };
     let tally =
         RefCell::new(Tally { stats, nitsche: vec![0.0; elements], fractions: vec![1.0; elements], material: vec![([0.0; 3], [1.0; 3]); elements] });
@@ -1922,6 +1959,7 @@ fn solve_at(
         [0, 1, 2].map(|a| grid.origin[a] + 0.5 * grid.spacing * at[a])
     };
     let nitsche_of = |element: usize| tally.try_borrow().ok().and_then(|tally| tally.nitsche.get(element).copied()).unwrap_or(0.0);
+    let fraction_of = |element: usize| tally.try_borrow().ok().and_then(|tally| tally.fractions.get(element).copied()).unwrap_or(1.0);
     let view = View {
         grid,
         tree: &tree,
@@ -1932,6 +1970,10 @@ fn solve_at(
         tied: &tied,
         at: &at,
         nitsche: &nitsche_of,
+        fraction: &fraction_of,
+        linear: &space.linear,
+        solver: options.solver,
+        poisson: material.poisson,
         refine: options.refine,
         before: round.before,
     };
@@ -1942,6 +1984,8 @@ fn solve_at(
     let Tally { mut stats, nitsche, fractions, material } = tally.into_inner();
     stats.stiffness_entries = solved.stiffness_entries;
     stats.factor_entries = solved.factor_entries;
+    stats.iterations = solved.iterations;
+    stats.residual = solved.residual;
     let u = solved.u;
     if u.len() != unknowns || u.iter().any(|x| !x.is_finite()) {
         return Err(Error::Singular("the solution is not finite: the stiffness is singular to working precision".into()));
