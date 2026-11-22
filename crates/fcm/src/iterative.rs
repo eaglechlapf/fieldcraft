@@ -46,21 +46,34 @@
 //! solid block 105 and 31. The blocks around the vertices take three quarters of the memory of
 //! those of the cells.
 //!
-//! Two bodies that a connection holds together are coupled stiffly across it: every two cells
-//! it couples are a block too, with the functions of both.
+//! **Cells of two sizes side by side.** A function of a cell beside a divided one reaches all
+//! the cells that one is divided into, and a block of everything within its reach has
+//! thousands of unknowns. So the blocks around vertices are those of functions that reach
+//! eight cells at most ([`AROUND`]), and a farther-reaching function is taken together with
+//! what follows it ([`crate::extended`]): that leaves it orthogonal to the functions within
+//! its reach, and it is in a block with the other such functions around its vertex. Measured
+//! on the bracket above at degree 3: 40 rounds with its cells divided once at its fillet and
+//! holes, 63 divided twice, 49 to 66 divided three times, and 42 at degree 4 divided once.
+//! With the far-reaching functions in blocks of the single cells they reach instead, it was
+//! 117 rounds divided once, 233 twice, and 174 at degree 4 (J. N. Jomo, F. de Prenter,
+//! M. Elhaddad, D. D'Angella, C. V. Verhoosel, S. Kollmannsberger, J. S. Kirschke, V. Nübel,
+//! E. H. van Brummelen, E. Rank, *Robust and parallel scalable iterative solutions for
+//! large-scale finite cell analyses*, Finite Elem. Anal. Des. 163:14–30, 2019, iterate on such
+//! grids with blocks of cells).
+//!
+//! **Connected bodies.** Two bodies that a connection holds together are coupled stiffly
+//! across it. Every two cells it couples are a block, with the functions of both, and the
+//! functions of the cells that lead across it are taken with those of the cells that follow
+//! ([`crate::extended`]): 53 rounds for three bonded blocks and 51 where they slide, for 85
+//! and 78 with the blocks of two cells alone.
 //!
 //! # What it is not good at
-//! **Divided cells.** A function of a cell that is divided reaches all the cells it is
-//! divided into, and a block of everything within its reach has thousands of unknowns. So the
-//! blocks around vertices are those of functions that reach eight cells at most
-//! ([`AROUND`]), and every cell that a farther-reaching function reaches is a block as well,
-//! which holds that function with the cell's. That is not all it takes: the bracket above
-//! with its cells divided once at its fillet and holes takes 117 rounds at degree 3 and 174 at
-//! degree 4, divided twice 233 (J. N. Jomo, F. de Prenter, M. Elhaddad, D. D'Angella,
-//! C. V. Verhoosel, S. Kollmannsberger, J. S. Kirschke, V. Nübel, E. H. van Brummelen,
-//! E. Rank, *Robust and parallel scalable iterative solutions for large-scale finite cell
-//! analyses*, Finite Elem. Anal. Des. 163:14–30, 2019, iterate on such grids with blocks of
-//! cells).
+//! **Walls much thinner than the cells.** A body of sheet on cells many times its thickness
+//! takes more rounds, and more the thinner it is: 225 for a plate a tenth of its cells thick on
+//! the trunk space, 111 with the tensor product. The coarse level is what lacks: its linear
+//! functions are too stiff in the bending of a wall inside a cell. Such a body's factorization
+//! is cheap, a wall being all surface, and the choice between the two counts it so
+//! ([`crate::assembly`]).
 //!
 //! **A material that hardly changes its volume** (Poisson's ratio near one half), whose
 //! stiffness against that one kind of strain dwarfs the rest. Such a system, and any other the
@@ -78,6 +91,7 @@ use fieldcraft_solver::cholesky::{Factor, UpperColumns};
 use fieldcraft_solver::sparse::Csr;
 
 use crate::blocked::Blocked;
+use crate::extended::Extended;
 use crate::packed;
 use crate::{Error, Result};
 
@@ -120,22 +134,14 @@ pub(crate) struct Outcome {
     pub coarse_entries: usize,
 }
 
-/// The blocks of the local level: the nodes of each, rising. `lists` has the nodes of every
-/// cell, the first `cells` of them, and then of every two cells a connection couples; `own`
-/// says which nodes were taken out of the system, and are in no block. Every other node of a
-/// list is in one block at least.
-pub(crate) fn patches(lists: &[Vec<usize>], cells: usize, own: &[bool]) -> Vec<Vec<usize>> {
-    let kept = |node: &usize| own.get(*node) == Some(&false);
-    let tidy = |mut nodes: Vec<usize>| {
-        nodes.sort_unstable();
-        nodes.dedup();
-        nodes
-    };
-    // The cells each node that is left reaches, rising.
+/// The cells each node that is in the system reaches, rising: `lists` has the nodes of every
+/// cell, the first `cells` of them, and `own` says which nodes were taken out of the system
+/// (they reach none).
+pub(crate) fn reach(lists: &[Vec<usize>], cells: usize, own: &[bool]) -> Vec<Vec<u32>> {
     let mut reach: Vec<Vec<u32>> = vec![Vec::new(); own.len()];
     for (cell, list) in lists.iter().take(cells).enumerate() {
         let Ok(cell) = u32::try_from(cell) else { break };
-        for node in list.iter().filter(|node| kept(node)) {
+        for node in list.iter().filter(|node| own.get(**node) == Some(&false)) {
             if let Some(reach) = reach.get_mut(*node)
                 && reach.last() != Some(&cell)
             {
@@ -143,6 +149,29 @@ pub(crate) fn patches(lists: &[Vec<usize>], cells: usize, own: &[bool]) -> Vec<V
             }
         }
     }
+    reach
+}
+
+/// The far-reaching nodes of `matrix`, each with what follows it ([`Extended`]): those that
+/// reach more cells than a vertex of a grid has around it, and those that cells of another
+/// body follow across a connection (`pairs`: the cell that leads and the one that follows).
+/// `linear` says which nodes carry a linear shape function.
+pub(crate) fn extended(matrix: &Blocked, lists: &[Vec<usize>], reach: &[Vec<u32>], linear: &[bool], pairs: &[(u32, u32)]) -> Extended {
+    Extended::new(matrix, lists, reach, linear, AROUND, pairs)
+}
+
+/// The blocks of the local level: the nodes of each, rising. `lists` has the nodes of every
+/// cell, the first `cells` of them, and then of every two cells a connection couples; `own`
+/// says which nodes were taken out of the system, and are in no block; `reach` has the cells
+/// of the others ([`reach`]) and `extended` the far-reaching ones that are taken with what
+/// follows them. Every node of a list that is in the system is in one block at least.
+pub(crate) fn patches(lists: &[Vec<usize>], cells: usize, own: &[bool], reach: &[Vec<u32>], extended: &Extended) -> Vec<Vec<usize>> {
+    let kept = |node: &usize| own.get(*node) == Some(&false);
+    let tidy = |mut nodes: Vec<usize>| {
+        nodes.sort_unstable();
+        nodes.dedup();
+        nodes
+    };
     let reach_of = |node: usize| reach.get(node).map(Vec::as_slice).unwrap_or_default();
     // The sets of cells that are all a node reaches, of no more than a vertex has around it:
     // each once.
@@ -164,8 +193,11 @@ pub(crate) fn patches(lists: &[Vec<usize>], cells: usize, own: &[bool]) -> Vec<V
         nodes
     });
     let mut blocks: Vec<Vec<usize>> = around.into_iter().filter(|nodes| !nodes.is_empty()).collect();
-    // A cell with a node no such block holds (one that reaches farther, where cells are
-    // divided; a cell that shares nothing) is a block itself.
+    // The far-reaching nodes that are taken with what follows them: with each other, around
+    // the vertices of the larger cells.
+    blocks.extend(extended.blocks(lists, reach, AROUND));
+    // A cell with a node no such block holds (a far-reaching one that is taken as it is; a
+    // cell that shares nothing) is a block itself.
     let mut held = vec![false; own.len()];
     for node in blocks.iter().flatten() {
         if let Some(flag) = held.get_mut(*node) {
@@ -192,12 +224,13 @@ struct Block {
 }
 
 impl Block {
-    /// The block of the nodes `nodes` (rising, each once; three unknowns each) of `matrix`.
-    /// None when there is no memory for its factor.
-    fn new(matrix: &Blocked, nodes: &[usize]) -> Option<Block> {
+    /// The block of the nodes `nodes` (rising, each once; three unknowns each) of `matrix`,
+    /// the far-reaching ones taken with what follows them. None when there is no memory for
+    /// its factor.
+    fn new(matrix: &Blocked, extended: &Extended, nodes: &[usize]) -> Option<Block> {
         let unknowns: Vec<usize> = nodes.iter().flat_map(|node| 3 * node..3 * node + 3).collect();
         let n = unknowns.len();
-        let mut factor = packed::lower(matrix, nodes)?;
+        let mut factor = extended.lower(matrix, nodes)?;
         if !packed::cholesky(&mut factor, n) {
             // A block that is not positive to working precision (a sliver of material on its
             // fictitious stiffness): its diagonal alone, which is.
@@ -232,8 +265,9 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
 /// Solve `matrix` u = `load` on the nodes that are not `own` to a cell (three unknowns each;
 /// the others' rows and columns are left out, and `load` is zero there) by the iteration of
 /// the module's head, to the residual `settled` of `scale`, the size of the whole load, in at
-/// most `most` rounds. `linear` says which nodes carry a linear shape function, and `blocks`
-/// lists the nodes of every block of the local level ([`patches`]). `Ok(None)` when the rounds
+/// most `most` rounds. `linear` says which nodes carry a linear shape function, `blocks` lists
+/// the nodes of every block of the local level ([`patches`]), and `extended` has the
+/// far-reaching nodes the blocks take with what follows them. `Ok(None)` when the rounds
 /// did not settle it, or a step broke down: the system is then the factorization's.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn solve(
@@ -243,6 +277,7 @@ pub(crate) fn solve(
     scale: f64,
     linear: &[bool],
     blocks: &[Vec<usize>],
+    extended: &Extended,
     limits: &Limits,
     settled: f64,
     most: usize,
@@ -295,7 +330,9 @@ pub(crate) fn solve(
     // The local level, and each block's weight: the mean over its unknowns of one over the
     // blocks each is in.
     let blocks: Option<Vec<Block>> =
-        parallel::map(blocks.len(), |block| Block::new(matrix, blocks.get(block).map(Vec::as_slice).unwrap_or_default())).into_iter().collect();
+        parallel::map(blocks.len(), |block| Block::new(matrix, extended, blocks.get(block).map(Vec::as_slice).unwrap_or_default()))
+            .into_iter()
+            .collect();
     let Some(blocks) = blocks else {
         return Err(Error::Limit("no memory for the blocks the iteration solves the cells in (use a larger cell size or a lower degree)".into()));
     };
@@ -315,28 +352,40 @@ pub(crate) fn solve(
     drop(shared);
     let mut locals: Vec<Vec<f64>> = vec![Vec::new(); blocks.len()];
     let mut held = Vec::with_capacity(coarse.len());
+    let mut inward = Vec::new();
     // z = M⁻¹ r.
     let mut apply = |r: &[f64], z: &mut [f64]| -> Result<()> {
         z.fill(0.0);
-        if let Some(factor) = &coarse_factor {
-            held.clear();
-            held.extend(coarse.iter().map(|unknown| r.get(*unknown).copied().unwrap_or(0.0)));
-            factor.solve(&mut held)?;
-            for (unknown, value) in coarse.iter().zip(&held) {
-                if let Some(slot) = z.get_mut(*unknown) {
-                    *slot = *value;
-                }
-            }
-        }
+        // The blocks, on the far-reaching unknowns as they are taken with what follows them.
+        let seen: &[f64] = if extended.any() {
+            extended.inward(r, &mut inward);
+            &inward
+        } else {
+            r
+        };
         parallel::for_each_mut(&mut locals, |block, out| {
             if let Some(found) = blocks.get(block) {
-                found.solve(r, out);
+                found.solve(seen, out);
             }
         });
         for ((block, local), weight) in blocks.iter().zip(&locals).zip(&weights) {
             for (unknown, value) in block.unknowns.iter().zip(local) {
                 if let Some(slot) = z.get_mut(*unknown) {
                     *slot += weight * value;
+                }
+            }
+        }
+        if extended.any() {
+            extended.outward(z);
+        }
+        // The coarse level, on the linear functions as they are.
+        if let Some(factor) = &coarse_factor {
+            held.clear();
+            held.extend(coarse.iter().map(|unknown| r.get(*unknown).copied().unwrap_or(0.0)));
+            factor.solve(&mut held)?;
+            for (unknown, value) in coarse.iter().zip(&held) {
+                if let Some(slot) = z.get_mut(*unknown) {
+                    *slot += *value;
                 }
             }
         }
@@ -454,7 +503,7 @@ mod tests {
         let linear: Vec<bool> = (0..nodes).map(|node| node % 4 == 0).collect();
         let blocks: Vec<Vec<usize>> = (0..nodes).step_by(4).map(|first| (first..(first + 5).min(nodes)).collect()).collect();
         let run = |matrix: &Blocked, load: &[f64], linear: &[bool], most: usize, cancelled: bool| {
-            solve(matrix, &[], load, size(load), linear, &blocks, &Limits::default(), SETTLED, most, &|| cancelled)
+            solve(matrix, &[], load, size(load), linear, &blocks, &Extended::none(matrix.nodes()), &Limits::default(), SETTLED, most, &|| cancelled)
         };
         let solved = run(&matrix, &load, &linear, MOST, false).unwrap().expect("settled");
         let mut direct = load.clone();
@@ -503,8 +552,9 @@ mod tests {
         let linear: Vec<bool> = (0..nodes).map(|node| node % 6 == 0).collect();
         let blocks: Vec<Vec<usize>> =
             (0..nodes).step_by(3).map(|first| (first..(first + 4).min(nodes)).filter(|node| !own[*node]).collect()).collect();
-        let solved =
-            solve(&matrix, &own, &load, size(&load), &linear, &blocks, &Limits::default(), SETTLED, MOST, &|| false).unwrap().expect("settled");
+        let solved = solve(&matrix, &own, &load, size(&load), &linear, &blocks, &Extended::none(nodes), &Limits::default(), SETTLED, MOST, &|| false)
+            .unwrap()
+            .expect("settled");
         let kept = matrix.rows_kept(&own);
         let mut direct: Vec<f64> = load.as_chunks::<3>().0.iter().zip(&own).filter(|(_, own)| !**own).flat_map(|(entries, _)| *entries).collect();
         Factor::new(&UpperColumns::from_symmetric(&kept), usize::MAX).unwrap().solve(&mut direct).unwrap();
@@ -556,7 +606,8 @@ mod tests {
         // What one cell alone has is taken out: the squares' own nodes and the outer edges.
         // (The four corners are in one cell too; they are kept here, to be found in a block.)
         let own: Vec<bool> = (0..nodes).map(|node| count[node] == 1 && node >= vertices).collect();
-        let blocks = patches(&lists, lists.len(), &own);
+        let cells = reach(&lists, lists.len(), &own);
+        let blocks = patches(&lists, lists.len(), &own, &cells, &Extended::none(nodes));
         // One block for each of the four inner vertices: the vertex, the four edges that meet
         // there, and the vertices at the rim that reach none but its cells.
         assert_eq!(blocks.len(), 4);
@@ -581,19 +632,20 @@ mod tests {
         far.push(vec![0, 1, 40]);
         let mut own_far = own.clone();
         own_far.push(false);
-        let blocks = patches(&far, 9, &own_far);
+        let blocks = patches(&far, 9, &own_far, &reach(&far, 9, &own_far), &Extended::none(nodes + 1));
         assert_eq!(blocks.len(), 4 + 9 + 1);
         assert!(blocks[4..13].iter().all(|block| block.contains(&wide)) && blocks[..4].iter().all(|block| !block.contains(&wide)));
         assert_eq!(blocks[13], [0, 1]);
         // A cell alone, and no lists at all.
-        assert_eq!(patches(&[vec![2, 0, 1, 1]], 1, &[false, false, true]), [vec![0, 1]]);
-        assert!(patches(&[], 0, &[]).is_empty());
+        let (alone, taken) = ([vec![2, 0, 1, 1]], [false, false, true]);
+        assert_eq!(patches(&alone, 1, &taken, &reach(&alone, 1, &taken), &Extended::none(3)), [vec![0, 1]]);
+        assert!(patches(&[], 0, &[], &[], &Extended::none(0)).is_empty());
     }
 
     #[test]
     fn a_block_is_solved_by_its_own_factor() {
         let (rows, _) = chain(6);
-        let block = Block::new(&Blocked::from_rows(&rows), &[1, 2, 4]).expect("small");
+        let block = Block::new(&Blocked::from_rows(&rows), &Extended::none(6), &[1, 2, 4]).expect("small");
         assert_eq!(block.unknowns, [3, 4, 5, 6, 7, 8, 12, 13, 14]);
         // K_block x = r for a known x.
         let x: Vec<f64> = (0..9).map(|i| 0.5 + i as f64).collect();

@@ -655,6 +655,9 @@ pub(crate) struct View<'a> {
     /// whether an iteration suits it.
     pub solver: Solver,
     pub poisson: f64,
+    /// Whether the body has the trunk basis: what a caller gives one that is thin on its cells,
+    /// which the iteration takes more rounds for.
+    pub trunk: bool,
     /// The levels of refinement asked for, and the stiffness and factor entries of the solve
     /// before this one, for what a refusal says and when.
     pub refine: usize,
@@ -1975,6 +1978,7 @@ fn solve_at(
         linear: &space.linear,
         solver: options.solver,
         poisson: material.poisson,
+        trunk: options.basis == Basis::Trunk,
         refine: options.refine,
         before: round.before,
     };

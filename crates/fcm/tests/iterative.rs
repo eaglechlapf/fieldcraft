@@ -124,8 +124,9 @@ fn a_block_by_iteration_is_the_block_by_factorization() {
 /// A thick tube under pressure in its bore, its cells divided where the surface is curved: the
 /// coarse level is the linear functions of every level, and the iteration settles on a grid of
 /// several levels. Nearly every cell of so coarse a grid is cut by the curved surface, which
-/// costs no rounds; cells of two sizes side by side do (the functions of a divided cell reach
-/// farther than a block around a vertex holds), three or four times as many.
+/// costs no rounds; nor do cells of two sizes side by side, where the functions of the larger
+/// cell reach over all the smaller ones beside it and are taken with what follows them
+/// (blocks of single cells for them took 116 rounds with two levels, for 32).
 #[test]
 fn divided_cells_are_iterated_like_the_grids_own() {
     let surface = tube(48, 1.0, 0.5, 0.6);
@@ -146,11 +147,17 @@ fn divided_cells_are_iterated_like_the_grids_own() {
             direct.stats.unknowns,
             iterated.stats.iterations
         );
-        // One level, and two with every cell divided, are grids of one size; three are not.
-        let most = if refine < 2 { 60 } else { 200 };
-        assert!(iterated.stats.iterations > 0 && iterated.stats.iterations < most, "{refine} levels: {} rounds", iterated.stats.iterations);
+        assert!(iterated.stats.iterations > 0 && iterated.stats.iterations < 60, "{refine} levels: {} rounds", iterated.stats.iterations);
         assert!(du < 1e-7 && ds < 1e-6, "{refine} levels: displacement {du:.2e}, stress {ds:.2e}");
         assert!(refine == 0 || direct.stats.levels[refine] > 0, "no cell of level {refine}");
+        if refine == 1 {
+            // The same to the bit on one thread, with what follows the far-reaching functions
+            // worked out one after another.
+            let one =
+                fieldcraft_parallel::with_threads(1, || solve(&surface, &STEEL, &held, &loads, &options(Solver::Iterative), &Limits::default()))
+                    .unwrap();
+            assert_eq!((one.strain_energy.to_bits(), one.stats.iterations), (iterated.strain_energy.to_bits(), iterated.stats.iterations));
+        }
     }
 }
 
@@ -181,7 +188,8 @@ fn a_thin_part_with_a_hole_is_iterated_like_a_compact_one() {
 }
 
 /// Bodies bonded and bodies that slide, solved both ways: a base with two blocks standing on
-/// it. The blocks of two cells a connection couples are part of the local level.
+/// it. The blocks of two cells a connection couples are part of the local level, and the
+/// functions of the cells that lead across it are taken with those that follow them.
 #[test]
 fn connected_bodies_by_iteration_are_those_by_factorization() {
     let surfaces = [block([0.0; 3], [1.0, 0.9, 0.4]), block([0.1, 0.1, 0.4], [0.45, 0.8, 0.8]), block([0.55, 0.1, 0.4], [0.9, 0.8, 0.8])];
@@ -207,7 +215,7 @@ fn connected_bodies_by_iteration_are_those_by_factorization() {
         let (direct, iterated) = (run(Solver::Direct), run(Solver::Iterative));
         let rounds = iterated[0].stats.iterations;
         // Every body's solution counts the rounds of the one system.
-        assert!(iterated.iter().all(|s| s.stats.iterations == rounds) && rounds > 0 && rounds < 100, "{grip:?}: {rounds} rounds");
+        assert!(iterated.iter().all(|s| s.stats.iterations == rounds) && rounds > 0 && rounds < 70, "{grip:?}: {rounds} rounds");
         for (body, at) in points.iter().enumerate() {
             let (du, ds) = apart(&iterated[body], &direct[body], at);
             println!("{grip:?}, body {body}: {rounds} rounds; displacement {du:.1e}, stress {ds:.1e} apart");

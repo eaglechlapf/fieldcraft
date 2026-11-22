@@ -103,16 +103,21 @@ use crate::{Error, Result};
 /// Unknowns from which a system may be solved by iteration ([`Solver::Auto`]): below, the
 /// factorization takes under a second, and its result is exact.
 const ITERATIVE_FROM: usize = 50_000;
-/// What a round of the iteration costs, in multiply–adds of the factorization for every entry
-/// of the stiffness, the cells' own unknowns and the blocks' factors counted in: measured at
-/// degree 3 on 24 threads, the two take the same time on the oracle's bracket with its cells
-/// divided once (117 rounds, a factorization of 1240 multiply–adds an entry) and near it
-/// divided twice (233 rounds and 1075: the factorization 1.5 times as fast).
-const WORK_PER_ROUND: f64 = 10.0;
-/// The rounds a system is taken to need, to choose: on cells that are not divided (29 to 40
-/// measured, on thin parts and compact ones), and on divided ones (117 to 233).
-const ROUNDS: f64 = 40.0;
-const ROUNDS_DIVIDED: f64 = 240.0;
+/// What an iteration costs, in multiply–adds of a factorization for every entry of the
+/// stiffness, by how many times cells are divided (not, once, twice, more): its set-up (the
+/// cells' own unknowns, the blocks' factors, what follows the far-reaching functions) and its
+/// rounds. Measured at degree 3 on 24 threads on the oracle's bracket, as the factorization's
+/// work for an entry times the iteration's time over the factorization's: 560 on cells of
+/// 2.2 mm (38 rounds), 620 on cells of 4.4 mm divided once (40 rounds), 1000 on cells of 8 mm
+/// divided twice (63 rounds), and with cells divided three times 1150 on cells of 16 mm (49
+/// rounds) and 2450 on cells of 8 mm (66 rounds).
+const ITERATION: [f64; 4] = [600.0, 600.0, 1000.0, 2400.0];
+/// How many times that where bodies are connected (47 to 85 rounds measured on three blocks
+/// bonded and sliding, for 40 of one body), and where a body has the trunk basis, which is what
+/// a caller gives one that is thin on its cells (225 rounds on a plate a tenth of its cells
+/// thick).
+const CONNECTED: f64 = 2.0;
+const THIN: f64 = 3.0;
 /// Poisson's ratio above which a body's system is left to the factorization: towards one half
 /// the rounds of the iteration grow (32 at 0.3, 47 at 0.49, 69 at 0.499 and 166 at 0.4999 on
 /// one block).
@@ -1248,9 +1253,15 @@ pub(crate) fn solve_system(
                 // A material that hardly changes its volume is not the iteration's
                 // ([`iterative`]); what does not fit as a factor is, whatever it suits.
                 let suits = views.iter().all(|view| view.poisson <= NEARLY_INCOMPRESSIBLE);
-                let rounds = if views.iter().any(|view| view.tree.deepest() > 0) { ROUNDS_DIVIDED } else { ROUNDS };
-                entries > limits.max_factor_entries
-                    || (3 * total >= ITERATIVE_FROM && suits && work > WORK_PER_ROUND * rounds * stiffness_entries as f64)
+                let divided = views.iter().map(|view| view.tree.deepest()).max().unwrap_or(0);
+                let mut iteration = ITERATION.get(divided).or(ITERATION.last()).copied().unwrap_or(f64::INFINITY);
+                if !coupled.is_empty() {
+                    iteration *= CONNECTED;
+                }
+                if views.iter().any(|view| view.trunk) {
+                    iteration *= THIN;
+                }
+                entries > limits.max_factor_entries || (3 * total >= ITERATIVE_FROM && suits && work > iteration * stiffness_entries as f64)
             }
         };
         // The entries a factor needs, where they are known.
@@ -1415,16 +1426,48 @@ pub(crate) fn solve_system(
                 both
             }));
             let condensed = condense(&mut blocked, &load, &lists)?;
-            let blocks = iterative::patches(&lists, cells, &condensed.own);
+            let reach = iterative::reach(&lists, cells, &condensed.own);
+            // Across a connection the cells of the body that has fewer of them there lead, and
+            // those of the other follow.
+            let first_cell: Vec<usize> = views.iter().scan(0usize, |sum, view| Some(std::mem::replace(sum, *sum + view.elements.len()))).collect();
+            let cell = |body: usize, element: usize| first_cell.get(body).and_then(|first| u32::try_from(first + element).ok());
+            let mut sides: BTreeMap<(usize, usize), (BTreeSet<usize>, BTreeSet<usize>)> = BTreeMap::new();
+            for (first, element, second, other) in &coupled {
+                let entry = sides.entry((*first, *second)).or_default();
+                entry.0.insert(*element);
+                entry.1.insert(*other);
+            }
+            let leads: Vec<(u32, u32)> = coupled
+                .iter()
+                .filter_map(|(first, element, second, other)| {
+                    let (a, b) = (cell(*first, *element)?, cell(*second, *other)?);
+                    let first_leads = sides.get(&(*first, *second)).is_none_or(|(elements, others)| elements.len() <= others.len());
+                    Some(if first_leads { (a, b) } else { (b, a) })
+                })
+                .collect();
+            let extended = iterative::extended(&blocked, &lists, &reach, &linear, &leads);
+            let blocks = iterative::patches(&lists, cells, &condensed.own, &reach, &extended);
             drop(lists);
+            drop(reach);
             let scale = load.iter().map(|entry| entry * entry).sum::<f64>().sqrt();
             let progress = fieldcraft_model::progress::current();
             let cancelled = || progress.as_ref().is_some_and(|p| p.is_cancelled());
             // With no factorization to fall back on, the iteration is given longer.
             let alone = needed.is_some_and(|entries| entries > limits.max_factor_entries) || blocked.entries() > MAX_MATRIX_ENTRIES;
             let most = if alone { iterative::MOST_ALONE } else { iterative::MOST };
-            let iterated =
-                iterative::solve(&blocked, &condensed.own, &condensed.load, scale, &linear, &blocks, limits, iterative::SETTLED, most, &cancelled)?;
+            let iterated = iterative::solve(
+                &blocked,
+                &condensed.own,
+                &condensed.load,
+                scale,
+                &linear,
+                &blocks,
+                &extended,
+                limits,
+                iterative::SETTLED,
+                most,
+                &cancelled,
+            )?;
             drop(blocks);
             let (mut u, factor_entries, iterations, residual) = match iterated {
                 Some(outcome) => (outcome.u, outcome.coarse_entries, outcome.iterations, outcome.residual),

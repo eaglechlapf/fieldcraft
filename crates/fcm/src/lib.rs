@@ -103,6 +103,7 @@ mod cell;
 mod condense;
 mod dense;
 pub mod exact;
+mod extended;
 pub mod gauss;
 pub mod grid;
 pub mod inside;
