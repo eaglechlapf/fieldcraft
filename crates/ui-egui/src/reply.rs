@@ -1039,6 +1039,49 @@ fn solve_summary(ui: &mut egui::Ui, t: &Tokens, v: &Value, units: Option<&Displa
             }
         }
     }
+    // A grid solve of several bodies: where they are joined, which is what to check before the
+    // results, and each body's grid.
+    if let Some(connections) = m.get("connections").and_then(Value::as_array) {
+        shown.push("connections");
+        kit::section_count(ui, "fc_reply_solve_connections", "Connections", true, Some(connections.len()), |ui| {
+            let names = |x: &Value| x.as_array().map_or_else(String::new, |a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "));
+            let rows: Vec<Vec<String>> = connections
+                .iter()
+                .take(MAX_ROWS)
+                .map(|x| {
+                    vec![
+                        format!("{} — {}", x["bodies"][0].as_str().unwrap_or_default(), x["bodies"][1].as_str().unwrap_or_default()),
+                        x["kind"].as_str().unwrap_or_default().to_string(),
+                        x["area"].as_f64().map_or("—".into(), number),
+                        format!("{} — {}", names(&x["faces"][0]), names(&x["faces"][1])),
+                    ]
+                })
+                .collect();
+            let area = with_unit("Area".into(), unit(Quantity::Area, units).map(|u| format!("[{u}]")).as_deref());
+            text_table(ui, "fc_reply_solve_connections", &["Bodies", "Kind", &area, "Faces"], &rows);
+            more(ui, t, connections.len());
+        });
+    }
+    if let Some(bodies) = m.get("bodies").and_then(Value::as_array).filter(|a| !a.is_empty()) {
+        shown.push("bodies");
+        kit::section_count(ui, "fc_reply_solve_bodies", "Bodies", true, Some(bodies.len()), |ui| {
+            let rows: Vec<Vec<String>> = bodies
+                .iter()
+                .take(MAX_ROWS)
+                .map(|x| {
+                    vec![
+                        x["body"].as_str().unwrap_or_default().to_string(),
+                        x["material"].as_str().unwrap_or_default().to_string(),
+                        x["cell_size"].as_f64().map_or("—".into(), number),
+                        x["unknowns"].as_u64().map_or("—".into(), count),
+                    ]
+                })
+                .collect();
+            let cell = with_unit("Cell size".into(), unit(Quantity::Length, units).map(|u| format!("[{u}]")).as_deref());
+            text_table(ui, "fc_reply_solve_bodies", &["Body", "Material", &cell, "Unknowns"], &rows);
+            more(ui, t, bodies.len());
+        });
+    }
     // A grid solve's supports: the force each supported face carries.
     if let Some(reactions) = m.get("reactions").and_then(Value::as_array).filter(|a| !a.is_empty()) {
         shown.push("reactions");
@@ -1048,7 +1091,11 @@ fn solve_summary(ui: &mut egui::Ui, t: &Tokens, v: &Value, units: Option<&Displa
                 .take(MAX_ROWS)
                 .map(|x| {
                     let force = serde_json::from_value::<Vec<f64>>(x["force"].clone()).ok();
-                    vec![x["face"].as_str().unwrap_or_default().to_string(), force.map_or("—".into(), |f| components(&f, 0.0))]
+                    // Of several bodies, the face's body goes before its name.
+                    let face = x["face"].as_str().unwrap_or_default();
+                    let face =
+                        x["body"].as_str().filter(|_| m.contains_key("bodies")).map_or_else(|| face.to_string(), |body| format!("{body}: {face}"));
+                    vec![face, force.map_or("—".into(), |f| components(&f, 0.0))]
                 })
                 .collect();
             let force = with_unit("Force".into(), unit(Quantity::Force, units).map(|u| format!("[{u}]")).as_deref());
@@ -1284,6 +1331,40 @@ mod tests {
         let rows = quality_rows(&json!({"measured": 3125, "valid": 3125, "volume": 9552.3, "area": 0.0}), &units);
         let text: Vec<(&str, &str)> = rows.iter().map(|(k, v, _)| (*k, v.as_str())).collect();
         assert_eq!(text, [("Elements", "3,125"), ("Valid", "3,125"), ("Invalid", "0"), ("Volume", "9\u{2009}550 mm³")]);
+    }
+
+    /// A grid solve of several bodies lists where they are joined and each body's grid as tables,
+    /// with the reactions' faces named by their bodies.
+    #[test]
+    fn a_solve_of_several_bodies_lists_its_connections_and_bodies() {
+        let mut app = ModelApp::new(fieldcraft_engine::Session::default());
+        let value = json!({
+            "step": "Load",
+            "unknowns": 130053,
+            "seconds": 6.8,
+            "bodies": [
+                {"body": "Base", "material": "Steel", "cell_size": 11.4, "unknowns": 7068},
+                {"body": "Clamp", "material": "Steel", "cell_size": 2.3, "unknowns": 59427},
+            ],
+            "connections": [{"kind": "bonded", "bodies": ["Base", "Clamp"], "faces": [["F1:+z"], ["F4:-z"]], "area": 187.4}],
+            "reactions": [{"body": "Base", "face": "F1:-z", "force": [-200.0, 0.0, 500.0]}],
+            "warnings": [],
+        });
+        app.reply = Some(Reply { command: "solve.static.grid".into(), label: "Grid Static".into(), params: json!({}), value });
+        let t = Tokens::get(false);
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.allocate_ui(vec2(320.0, 2000.0), |ui| show(&mut app, ui, &t));
+            });
+            out.textures_delta.clear();
+        }
+        let drawn: Vec<String> = solidcraft_ui_registry::rects("").into_iter().map(|(name, _)| name).collect();
+        for table in ["fc_reply_solve_connections", "fc_reply_solve_bodies", "fc_reply_solve_reactions"] {
+            assert!(drawn.iter().any(|name| name.contains(table)), "{table} is not drawn: {drawn:?}");
+        }
+        // Nothing of them is left for the folded details.
+        assert!(!drawn.iter().any(|name| name.contains("fc_reply_solve_details")), "{drawn:?}");
     }
 
     /// A3-5: a reply's key/value rows share one value column, sized to its longest key.
