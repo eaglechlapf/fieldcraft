@@ -49,7 +49,7 @@
 //! the pairs of cells a bond couples ([`fieldcraft_solver::ordering::element_dissection`]), and
 //! factored as one matrix. A body that only a bond holds needs no support of its own.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
@@ -227,6 +227,9 @@ struct Shared<'a> {
     /// The cells of each body, once its solve has them: a copy the other bodies' pieces are
     /// cut along.
     frames: &'a [OnceLock<(Grid, Tree)>],
+    /// Set when the unknowns are only counted: the system is not solved, and the count is left
+    /// here.
+    count: Option<&'a Cell<Option<usize>>>,
     solved: RefCell<Vec<Option<Solved>>>,
     solutions: RefCell<Vec<Option<Solution>>>,
 }
@@ -292,6 +295,12 @@ fn nest(shared: &Shared, index: usize, up: Option<&Chain>) -> Result<()> {
                 at = link.up;
             }
             views.reverse();
+            if let Some(count) = shared.count {
+                // Counting: nothing is integrated or solved, and this error ends the bodies'
+                // solves; the caller reads the count.
+                count.set(Some(views.iter().fold(0usize, |sum, view| sum.saturating_add(3 * view.count))));
+                return Err(broken("counted"));
+            }
             let solved = solve_system(&views, &|body, tag, x| partner(couplings, body, tag, x), shared.limits)?;
             let mut kept = shared.solved.try_borrow_mut().map_err(|_| broken("the solutions are in use"))?;
             *kept = solved.into_iter().map(Some).collect();
@@ -309,11 +318,16 @@ fn nest(shared: &Shared, index: usize, up: Option<&Chain>) -> Result<()> {
     Ok(())
 }
 
-/// Solve several bodies as one step, bonded where the faces a [`Bond`] names touch; the
-/// solutions come in the bodies' order. A body needs a support of its own or a bond that holds
-/// it. Refused like a single body's solve: a system above the limits, a body or a group of
-/// bodies that nothing holds.
-pub fn solve_assembly(parts: &[Part], bonds: &[Bond], limits: &Limits) -> Result<Vec<Solution>> {
+/// The bonds as the solves read them, and of each body the faces a bond takes the traction of
+/// and whether a bond holds it.
+struct Bonded {
+    couplings: Vec<Coupling>,
+    tied: Vec<BTreeSet<u32>>,
+    held: Vec<bool>,
+}
+
+/// The bonds of an assembly, checked.
+fn couplings(parts: &[Part], bonds: &[Bond]) -> Result<Bonded> {
     if parts.is_empty() || parts.len() > MAX_PARTS {
         return Err(Error::Invalid(format!("an assembly has 1 to {MAX_PARTS} bodies; this one has {}", parts.len())));
     }
@@ -359,6 +373,42 @@ pub fn solve_assembly(parts: &[Part], bonds: &[Bond], limits: &Limits) -> Result
         }
         couplings.push(Coupling { flux: flux.0, faces, other: other.0, reach: Reach::new(surface, Some(&others), bond.tolerance)? });
     }
+    Ok(Bonded { couplings, tied, held })
+}
+
+/// The unknowns [`solve_assembly`] would solve for: the bodies' grids are built and their cells
+/// sorted, and nothing is integrated or solved. For choosing cell sizes that fit a budget
+/// before the work is done.
+pub fn assembly_unknowns(parts: &[Part], bonds: &[Bond], limits: &Limits) -> Result<usize> {
+    let Bonded { couplings, tied, held } = couplings(parts, bonds)?;
+    let fictitious: Vec<f64> = parts.iter().map(|part| part.options.fictitious).collect();
+    let frames: Vec<OnceLock<(Grid, Tree)>> = (0..parts.len()).map(|_| OnceLock::new()).collect();
+    let count = Cell::new(None);
+    let shared = Shared {
+        parts,
+        couplings: &couplings,
+        limits,
+        tied: &tied,
+        held: &held,
+        fictitious: &fictitious,
+        frames: &frames,
+        count: Some(&count),
+        solved: RefCell::new(Vec::new()),
+        solutions: RefCell::new(Vec::new()),
+    };
+    match (nest(&shared, 0, None), count.get()) {
+        (_, Some(unknowns)) => Ok(unknowns),
+        (Err(e), None) => Err(e),
+        (Ok(()), None) => Err(broken("the unknowns were not counted")),
+    }
+}
+
+/// Solve several bodies as one step, bonded where the faces a [`Bond`] names touch; the
+/// solutions come in the bodies' order. A body needs a support of its own or a bond that holds
+/// it. Refused like a single body's solve: a system above the limits, a body or a group of
+/// bodies that nothing holds.
+pub fn solve_assembly(parts: &[Part], bonds: &[Bond], limits: &Limits) -> Result<Vec<Solution>> {
+    let Bonded { couplings, tied, held } = couplings(parts, bonds)?;
     // As small a fictitious stiffness as the factorization allows, as for one body: a hundred
     // times more at a time for every body, up to what its material leaves. Each step raises
     // one at least, so the loop ends.
@@ -374,6 +424,7 @@ pub fn solve_assembly(parts: &[Part], bonds: &[Bond], limits: &Limits) -> Result
             held: &held,
             fictitious: &fictitious,
             frames: &frames,
+            count: None,
             solved: RefCell::new(Vec::new()),
             solutions: RefCell::new((0..parts.len()).map(|_| None).collect()),
         };

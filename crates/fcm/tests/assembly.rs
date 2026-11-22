@@ -7,7 +7,7 @@
 //! fictitious stiffness of the cut cells, as in `tests/patch.rs`: the bond is consistent, and
 //! the cells of the two bodies need not match.
 
-use fieldcraft_fcm::{Bond, Error, Load, Material, Options, Part, Solution, Support, find_bonds, solve_assembly};
+use fieldcraft_fcm::{Bond, Error, Load, Material, Options, Part, Solution, Support, assembly_unknowns, find_bonds, solve_assembly};
 use fieldcraft_mesh::surface::{BoundarySurface, SurfaceOptions};
 use fieldcraft_solver::Limits;
 
@@ -204,6 +204,11 @@ fn a_block_on_a_plate_is_held_through_its_foot() {
         println!("at {at:?}: plate {below:?}, post {above:?}");
         assert!(apart < 0.05 * largest, "at {at:?}: {apart:.3e} apart of {largest:.3e}");
     }
+    // The unknowns are counted without the solve, and a limit refuses the count as it does it.
+    let unknowns: usize = solutions.iter().map(|solution| solution.stats.unknowns).sum();
+    assert_eq!(assembly_unknowns(&parts, std::slice::from_ref(&bond), &Limits::default()).unwrap(), unknowns);
+    let few = Limits { max_dofs: unknowns - 1, ..Limits::default() };
+    assert!(matches!(solve_assembly(&parts, std::slice::from_ref(&bond), &few), Err(Error::Limit(_))));
     // The post bends over: its top moves more than its foot.
     assert!(largest > 2.0 * solutions[1].displacement([0.85, 0.7, 0.3]).unwrap()[0].abs());
     // Without the bond nothing holds the post.
