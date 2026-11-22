@@ -111,7 +111,7 @@ mod refine;
 mod solve;
 mod space;
 
-pub use assembly::{Bond, Motion, Part, Touch, assembly_unknowns, find_bonds, free_motions, solve_assembly};
+pub use assembly::{Bond, Motion, Part, Touch, assembly_unknowns, bond_areas, find_bonds, free_motions, solve_assembly};
 pub use cell::{Curved, Grip};
 pub use solve::{Basis, Change, Load, Material, Options, Reaction, Solution, Stats, Support, solve};
 

@@ -497,25 +497,9 @@ fn motions(parts: &[Part], couplings: &[Coupling], curved: &[BTreeMap<u32, Curve
         }
         motions
     };
-    // The triangles of the faces of a body a restraint names, each by the middles of its sides
-    // with a third of its area: exact for the squares of the motions, which are linear.
     let sampled = |body: usize, faces: &dyn Fn(u32) -> bool, visit: &mut dyn FnMut(u32, [f64; 3], [f64; 3], f64)| {
-        let Some(part) = parts.get(body) else { return };
-        let points = part.surface.points();
-        for (triangle, tag) in part.surface.triangles().iter().zip(part.surface.tri_face()) {
-            if !faces(*tag) {
-                continue;
-            }
-            let [Some(a), Some(b), Some(c)] = triangle.map(|v| points.get(v as usize).copied()) else { continue };
-            let doubled = cross(sub(b, a), sub(c, a));
-            let length = dot(doubled, doubled).sqrt();
-            if !(length > 0.0 && length.is_finite()) {
-                continue;
-            }
-            let normal = doubled.map(|c| c / length);
-            for (p, q) in [(a, b), (b, c), (c, a)] {
-                visit(*tag, [0, 1, 2].map(|i| 0.5 * (p[i] + q[i])), normal, length / 6.0);
-            }
+        if let Some(part) = parts.get(body) {
+            side_points(part.surface, faces, visit);
         }
     };
     let mut gram = vec![0.0; n * n];
@@ -672,6 +656,49 @@ fn motions(parts: &[Part], couplings: &[Coupling], curved: &[BTreeMap<u32, Curve
     Ok(free)
 }
 
+/// Visit the triangles of the faces of a surface that `faces` keeps, each by the middles of its
+/// sides with a third of its area (exact for what is quadratic over a triangle): the face, the
+/// point, the triangle's unit normal and the weight.
+fn side_points(surface: &BoundarySurface, faces: &dyn Fn(u32) -> bool, visit: &mut dyn FnMut(u32, [f64; 3], [f64; 3], f64)) {
+    let points = surface.points();
+    for (triangle, tag) in surface.triangles().iter().zip(surface.tri_face()) {
+        if !faces(*tag) {
+            continue;
+        }
+        let [Some(a), Some(b), Some(c)] = triangle.map(|v| points.get(v as usize).copied()) else { continue };
+        let doubled = cross(sub(b, a), sub(c, a));
+        let length = dot(doubled, doubled).sqrt();
+        if !(length > 0.0 && length.is_finite()) {
+            continue;
+        }
+        let normal = doubled.map(|c| c / length);
+        for (p, q) in [(a, b), (b, c), (c, a)] {
+            visit(*tag, [0, 1, 2].map(|i| 0.5 * (p[i] + q[i])), normal, length / 6.0);
+        }
+    }
+}
+
+/// The area over which the faces of each bond touch, as the solve takes it: of the faces whose
+/// traction the bond takes (the smaller ones), what lies within the bond's tolerance of the
+/// other body's. Zero for faces that do not touch: such a bond joins nothing.
+pub fn bond_areas(parts: &[Part], bonds: &[Bond]) -> Result<Vec<f64>> {
+    let Bonded { couplings, .. } = couplings(parts, bonds)?;
+    Ok(couplings
+        .iter()
+        .map(|coupling| {
+            let mut area = 0.0;
+            if let Some(part) = parts.get(coupling.flux) {
+                side_points(part.surface, &|tag| coupling.faces.contains(&tag), &mut |_, x, _, weight| {
+                    if coupling.reach.nearest(x).is_some() {
+                        area += weight;
+                    }
+                });
+            }
+            area
+        })
+        .collect())
+}
+
 /// What a solve of bodies that can still move is refused with.
 fn refuse_free(motions: &[Motion]) -> Result<()> {
     let Some(motion) = motions.first() else { return Ok(()) };
@@ -816,6 +843,9 @@ pub struct Touch {
     pub bond: Bond,
     /// The area over which they touch, as the triangles of the two surfaces sample it.
     pub area: f64,
+    /// Every face of the first body with a face of the second that it touches, and the area
+    /// the two share.
+    pub pairs: Vec<(u32, u32, f64)>,
 }
 
 /// A face touches another over at least this share of the smaller of the two: less is an edge
@@ -885,7 +915,7 @@ pub fn find_bonds(surfaces: &[&BoundarySurface], tolerance: f64) -> Result<Vec<T
                 let seen = pairs.entry((a, b)).or_insert(0.0);
                 *seen = seen.max(area);
             }
-            let (mut faces, mut others, mut total) = (BTreeSet::new(), BTreeSet::new(), 0.0);
+            let (mut faces, mut others, mut total, mut joined) = (BTreeSet::new(), BTreeSet::new(), 0.0, Vec::new());
             for ((a, b), area) in pairs {
                 // Two faces touch over no more than the smaller of them.
                 let smaller = own.get(&a).copied().unwrap_or(0.0).min(theirs.get(&b).copied().unwrap_or(0.0));
@@ -894,6 +924,7 @@ pub fn find_bonds(surfaces: &[&BoundarySurface], tolerance: f64) -> Result<Vec<T
                     faces.insert(a);
                     others.insert(b);
                     total += area;
+                    joined.push((a, b, area));
                 }
             }
             if !faces.is_empty() {
@@ -903,7 +934,7 @@ pub fn find_bonds(surfaces: &[&BoundarySurface], tolerance: f64) -> Result<Vec<T
                     tolerance,
                     grip: Grip::Bonded,
                 };
-                touches.push(Touch { bond, area: total });
+                touches.push(Touch { bond, area: total, pairs: joined });
             }
         }
     }

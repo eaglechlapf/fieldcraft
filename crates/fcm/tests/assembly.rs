@@ -228,6 +228,10 @@ fn a_block_on_a_plate_is_held_through_its_foot() {
     assert_eq!(free_motions(&parts, std::slice::from_ref(&apart)).unwrap().len(), 6);
     assert!(matches!(solve_assembly(&parts, &[apart], &Limits::default()), Err(Error::Invalid(_))));
     assert!(free_motions(&parts, std::slice::from_ref(&bond)).unwrap().is_empty());
+    // The bond's faces touch over the post's foot, 0.5 by 0.4; faces apart touch over nothing.
+    let apart = Bond { first: (0, vec![5]), second: (1, vec![5]), tolerance: 1e-6, grip: Grip::Bonded };
+    let areas = fieldcraft_fcm::bond_areas(&parts, &[bond.clone(), apart]).unwrap();
+    assert!((areas[0] - 0.2).abs() < 1e-12 && areas[1] == 0.0, "{areas:?}");
 }
 
 /// One body with no bond is the body's own solve, bit for bit, and what cannot be an assembly
@@ -359,6 +363,7 @@ fn faces_that_touch_are_found() {
     let ends = [block([0.0; 3], [1.0, 0.8, 0.6]), block([1.0, 0.0, 0.0], [2.3, 0.8, 0.6])];
     let found = find_bonds(&[&ends[0], &ends[1]], 1e-6).unwrap();
     assert_eq!(found.len(), 1);
+    assert_eq!(found[0].pairs.iter().map(|(a, b, _)| (*a, *b)).collect::<Vec<_>>(), [(1, 0)]);
     assert_eq!((&found[0].bond.first, &found[0].bond.second), (&(0, vec![1]), &(1, vec![0])));
     assert!((found[0].area - 0.48).abs() < 1e-12, "{}", found[0].area);
 
