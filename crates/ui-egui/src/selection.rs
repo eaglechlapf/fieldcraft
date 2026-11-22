@@ -870,6 +870,9 @@ pub enum Target {
     /// The selected geometry faces as `faces: [{body, face}]`, in place of a sphere or labels
     /// (the faces Relax Nodes relaxes, the faces a local size refines).
     Faces,
+    /// The selected faces of two bodies as a connection's `first` and `second`: those of the
+    /// one body, and those of the other.
+    Connection,
 }
 
 /// Where command `id`'s form takes the selection, if it does. `params` (the form's current
@@ -883,6 +886,7 @@ pub fn target(id: &str, params: &Value) -> Option<Target> {
         "mesh.cells" => Some(Target::Bodies),
         "mesh.hex.extrude" => Some(Target::ExtrudeFaces),
         "mesh.node.relax" | "mesh.size.set" | "mesh.seed.face" => Some(Target::Faces),
+        "interaction.connection" | "interaction.connection.edit" => Some(Target::Connection),
         "model.boundary_condition.create" | "model.boundary_condition.edit" => Some(Target::TargetSet),
         "model.section.create" | "model.section.edit" | "model.coupling.create" | "model.coupling.edit" | "interaction.rigid_wall" => {
             Some(Target::Set)
@@ -900,7 +904,7 @@ pub fn target(id: &str, params: &Value) -> Option<Target> {
 pub fn form_filter(id: &str, params: &Value) -> Option<Filter> {
     match target(id, params) {
         Some(Target::Edges) => return Some(Filter::Edges),
-        Some(Target::ExtrudeFaces) => return Some(Filter::Faces),
+        Some(Target::ExtrudeFaces | Target::Connection) => return Some(Filter::Faces),
         _ => {}
     }
     match id {
@@ -967,6 +971,34 @@ pub fn with_faces(params: &Value, selection: &Selection) -> Option<Value> {
     Some(Value::Object(out))
 }
 
+/// `params` with the selected faces as a connection's two sides: `first` the faces of one body,
+/// `second` those of the other (the bodies in the order of their names, as a selection keeps
+/// its items). Refused unless faces of exactly two bodies are selected: a connection joins two.
+pub fn with_connection(params: &Value, selection: &Selection) -> Result<Value, String> {
+    let mut sides: Vec<(String, Vec<Value>)> = Vec::new();
+    for item in selection.items() {
+        let Item::Geometry(g) = item else { continue };
+        if !matches!(g.entity, Entity::Face(_)) {
+            continue;
+        }
+        match sides.iter_mut().find(|(body, _)| *body == g.body) {
+            Some((_, faces)) => faces.push(json!(g)),
+            None => sides.push((g.body.clone(), vec![json!(g)])),
+        }
+    }
+    let [(_, first), (_, second)] = sides.as_slice() else {
+        return Err(match sides.len() {
+            0 => "no face is selected: pick the faces of two bodies that touch (Select: Faces)".to_string(),
+            1 => "faces of one body are selected: pick the faces of the other body that touch them too".to_string(),
+            n => format!("faces of {n} bodies are selected: a connection joins two"),
+        });
+    };
+    let mut out = params.as_object().cloned().unwrap_or_default();
+    out.insert("first".into(), Value::Array(first.clone()));
+    out.insert("second".into(), Value::Array(second.clone()));
+    Ok(Value::Object(out))
+}
+
 /// The one selected design entity of `kind` (`face`, `edge` or `vertex`), of `body` when given,
 /// as its body and persistent name: what a name field's Pick fills in (a face of a set's
 /// geometry row, the face an absorption goes into). `None` when none, or more than one, is
@@ -1020,7 +1052,14 @@ pub fn with_set(params: &Value, target: Target, set: &str) -> Value {
         Target::Set => {
             out.insert("set".into(), json!(set));
         }
-        Target::Members | Target::Edges | Target::Position | Target::DatumPoint | Target::Bodies | Target::ExtrudeFaces | Target::Faces => {}
+        Target::Members
+        | Target::Edges
+        | Target::Position
+        | Target::DatumPoint
+        | Target::Bodies
+        | Target::ExtrudeFaces
+        | Target::Faces
+        | Target::Connection => {}
     }
     Value::Object(out)
 }
@@ -1364,6 +1403,35 @@ mod tests {
         assert_eq!(extrude_key(&json!({"source_set": "Section"})), "to_surface");
         s.apply([Item::Node(4)], Mode::Replace);
         assert!(with_extrude_faces(&form, &s).is_none(), "no face selected");
+    }
+
+    /// A connection's form takes the picked faces of two bodies as its two sides, and says what
+    /// is missing when the selection is not that.
+    #[test]
+    fn a_connection_takes_the_faces_of_two_bodies() {
+        for command in ["interaction.connection", "interaction.connection.edit"] {
+            assert_eq!(target(command, &json!({})), Some(Target::Connection));
+            assert_eq!(form_filter(command, &json!({})), Some(Filter::Faces));
+        }
+        let face = |body: &str, name: &str| Item::Geometry(GeometryRef::face(body, name).unwrap());
+        let mut s = Selection::default();
+        s.apply([face("Plate", "F1:+z"), face("Clamp", "F4:-z"), face("Plate", "F2"), Item::Node(4)], Mode::Replace);
+        let form = with_connection(&json!({"name": "Glue", "kind": "sliding", "first": [{"body": "", "face": ""}]}), &s).unwrap();
+        assert_eq!(
+            form,
+            json!({
+                "name": "Glue",
+                "kind": "sliding",
+                "first": [{"body": "Clamp", "face": "F4:-z"}],
+                "second": [{"body": "Plate", "face": "F1:+z"}, {"body": "Plate", "face": "F2"}],
+            })
+        );
+        s.apply([face("Plate", "F1:+z"), Item::Geometry(GeometryRef::body("Clamp").unwrap())], Mode::Replace);
+        assert!(with_connection(&json!({}), &s).unwrap_err().contains("faces of one body"));
+        s.apply([Item::Node(4)], Mode::Replace);
+        assert!(with_connection(&json!({}), &s).unwrap_err().contains("no face is selected"));
+        s.apply([face("A", "F1"), face("B", "F1"), face("C", "F1")], Mode::Replace);
+        assert!(with_connection(&json!({}), &s).unwrap_err().contains("faces of 3 bodies"));
     }
 
     #[test]

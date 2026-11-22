@@ -97,6 +97,9 @@ pub fn summary_in(command: &str, v: &Value, units: Option<&DisplaySystem>) -> St
         "interaction.contact.find" => {
             format!("{} among {}", plural(count("touching") as u64, "touching pair"), plural(v["parts"].as_u64().unwrap_or(0), "part"))
         }
+        "interaction.connection.find" => {
+            format!("{} added, {} in the model", plural(count("added") as u64, "connection"), count("connections"))
+        }
         "results.reactions" => match serde_json::from_value::<Vec<f64>>(v["total"]["force"].clone()) {
             Ok(f) => format!("total reaction force ({})", with_unit(components(&f, 0.0), unit(Quantity::Force, units).as_deref())),
             Err(_) => scalars(v),
@@ -1039,26 +1042,31 @@ fn solve_summary(ui: &mut egui::Ui, t: &Tokens, v: &Value, units: Option<&Displa
             }
         }
     }
-    // A grid solve of several bodies: where they are joined, which is what to check before the
-    // results, and each body's grid.
+    // A grid solve of several bodies: how they hold each other, which is what to check before
+    // the results, and each body's grid. The connections are the model's (Interactions in the
+    // browser, where each is changed or deleted); those this solve found are marked.
     if let Some(connections) = m.get("connections").and_then(Value::as_array) {
-        shown.push("connections");
+        shown.extend(["connections", "connections_added"]);
+        let added: Vec<&str> = m.get("connections_added").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
         kit::section_count(ui, "fc_reply_solve_connections", "Connections", true, Some(connections.len()), |ui| {
             let names = |x: &Value| x.as_array().map_or_else(String::new, |a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "));
             let rows: Vec<Vec<String>> = connections
                 .iter()
                 .take(MAX_ROWS)
                 .map(|x| {
+                    let name = x["name"].as_str().unwrap_or_default();
+                    let kind = x["kind"].as_str().unwrap_or_default();
                     vec![
+                        name.to_string(),
+                        if added.contains(&name) { format!("{kind} (found)") } else { kind.to_string() },
                         format!("{} — {}", x["bodies"][0].as_str().unwrap_or_default(), x["bodies"][1].as_str().unwrap_or_default()),
-                        x["kind"].as_str().unwrap_or_default().to_string(),
                         x["area"].as_f64().map_or("—".into(), number),
                         format!("{} — {}", names(&x["faces"][0]), names(&x["faces"][1])),
                     ]
                 })
                 .collect();
             let area = with_unit("Area".into(), unit(Quantity::Area, units).map(|u| format!("[{u}]")).as_deref());
-            text_table(ui, "fc_reply_solve_connections", &["Bodies", "Kind", &area, "Faces"], &rows);
+            text_table(ui, "fc_reply_solve_connections", &["Name", "Kind", "Bodies", &area, "Faces"], &rows);
             more(ui, t, connections.len());
         });
     }
@@ -1346,7 +1354,8 @@ mod tests {
                 {"body": "Base", "material": "Steel", "cell_size": 11.4, "unknowns": 7068},
                 {"body": "Clamp", "material": "Steel", "cell_size": 2.3, "unknowns": 59427},
             ],
-            "connections": [{"kind": "bonded", "bodies": ["Base", "Clamp"], "faces": [["F1:+z"], ["F4:-z"]], "area": 187.4}],
+            "connections": [{"name": "Base-Clamp", "kind": "bonded", "bodies": ["Base", "Clamp"], "faces": [["F1:+z"], ["F4:-z"]], "area": 187.4}],
+            "connections_added": ["Base-Clamp"],
             "reactions": [{"body": "Base", "face": "F1:-z", "force": [-200.0, 0.0, 500.0]}],
             "warnings": [],
         });

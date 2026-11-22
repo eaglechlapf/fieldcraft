@@ -1839,13 +1839,14 @@ impl ModelApp {
         };
         let scene = self.scene_key();
         let set = self.selected_set();
+        let joined = self.selected_connection();
         let cut = self.partition_preview();
         let merge = self.merge_preview();
         let relax_key = self.dialog.as_ref().filter(|d| d.command == "mesh.node.relax").map(|d| d.text.clone());
         let move_key = self.dialog.as_ref().filter(|d| d.command == node_move::COMMAND).map(|d| (d.text.clone(), self.node_move_pending()));
         // Over result contours the selection is an outline, as the hover is (#207).
         let fill = self.plot.1.is_none();
-        let selected = hash(&|h| (scene, self.pick.generation, &set, &cut, &*merge, &relax_key, &move_key, fill).hash(h));
+        let selected = hash(&|h| (scene, self.pick.generation, &set, &joined, &cut, &*merge, &relax_key, &move_key, fill).hash(h));
         let key = hash(&|h| (selected, self.pick.hover_generation).hash(h));
         if self.pick.overlay.0 == Some(key) {
             return (key, self.pick.overlay.1.clone());
@@ -1860,7 +1861,9 @@ impl ModelApp {
                 s.tris.clear();
             }
             // The set selected in the browser: its members in the highlight of selected symbols.
-            if let Some(items) = set.as_ref().and_then(|name| self.set_items(name)) {
+            // The connection selected in the browser likewise: the faces of its two bodies.
+            let members = set.as_ref().and_then(|name| self.set_items(name)).or_else(|| joined.as_ref().and_then(|name| self.connection_items(name)));
+            if let Some(items) = members {
                 let highlight = t.glyph_colors().highlight;
                 let m = self.with_picker(|p| p.items_overlay(&items, highlight));
                 s.tris.extend(m.tris);
@@ -2023,6 +2026,20 @@ impl ModelApp {
         }
     }
 
+    /// The connection selected in the browser, if one is.
+    fn selected_connection(&self) -> Option<String> {
+        match &self.selected {
+            Some((browser::Def::Connection, name)) => Some(name.clone()),
+            _ => None,
+        }
+    }
+
+    /// The faces connection `name` joins, of both bodies, as viewport items.
+    fn connection_items(&self, name: &str) -> Option<Vec<selection::Item>> {
+        let connection = self.session.model.connection(name)?;
+        Some(connection.first.iter().chain(&connection.second).cloned().map(selection::Item::Geometry).collect())
+    }
+
     /// Set `name`'s members as viewport items (design entities by name, mesh items by label).
     fn set_items(&self, name: &str) -> Option<Vec<selection::Item>> {
         let set = self.session.model.sets().get(name)?;
@@ -2105,6 +2122,7 @@ impl ModelApp {
             selection::Target::Faces => {
                 selection::with_faces(&params, &self.pick.selection).ok_or("no face is selected: pick the faces (Select: Faces)")?
             }
+            selection::Target::Connection => selection::with_connection(&params, &self.pick.selection)?,
             selection::Target::Bodies => {
                 let bodies = selection::bodies(&self.pick.selection).ok_or("no geometry is selected: pick cells with Select: Bodies")?;
                 let mut out = params.as_object().cloned().unwrap_or_default();
@@ -3781,6 +3799,36 @@ mod tests {
                 assert!(!legend.contains(at) && view.contains(at), "{w}×{h}: corner {k} at {at:?}, legend {legend:?}");
             }
         }
+    }
+
+    /// A connection selected in the browser shows the faces it joins, of both bodies.
+    #[test]
+    fn a_selected_connection_highlights_its_faces() {
+        let dir = std::env::temp_dir().join(format!("fieldcraft-connection-faces-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let design = dir.join("two.solidcraft");
+        let two = r#"{"commands": [
+            {"command": "solid.box", "params": {"corner": [0, 0, 0], "length": 20, "width": 10, "height": 10, "body_name": "First"}},
+            {"command": "solid.box", "params": {"corner": [20, 0, 0], "length": 15, "width": 10, "height": 10, "body_name": "Second"}}
+        ]}"#;
+        std::fs::write(&design, fieldcraft_geometry::script_design(two).unwrap()).unwrap();
+        let mut app = ModelApp::new(Session::default());
+        app.run("geometry.open", json!({"path": design.to_string_lossy()})).unwrap();
+        let face = |app: &ModelApp, body: &str| {
+            let shape = app.session.design.as_ref().unwrap().body(body).unwrap().clone();
+            json!({"body": body, "face": shape.faces()[0].name})
+        };
+        let (first, second) = (face(&app, "First"), face(&app, "Second"));
+        app.run("interaction.connection", json!({"name": "Glue", "kind": "sliding", "first": [first], "second": [second]})).unwrap();
+        let highlight = theme::Tokens::get(app.ui.dark).glyph_colors().highlight;
+        let shown = |app: &mut ModelApp| app.overlay().1.tris.iter().filter(|x| x.color == highlight).count();
+        assert_eq!(shown(&mut app), 0);
+        app.selected = Some((browser::Def::Connection, "Glue".into()));
+        let both = shown(&mut app);
+        assert!(both >= 4, "a face of each body, two triangles each at least: {both}");
+        app.selected = None;
+        assert_eq!(shown(&mut app), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A section's form starts with a set of elements or bodies, never with a set of faces

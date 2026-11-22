@@ -383,6 +383,9 @@ fn form(app: &mut ModelApp, ui: &mut egui::Ui, t: &Tokens, bounds: Rect, anchor:
                     selection::Target::Faces => {
                         "The selected design faces (Shift-click to pick, Select: Faces) become the form's faces, in place of a sphere"
                     }
+                    selection::Target::Connection => {
+                        "Pick the faces of two bodies that touch (Shift-click, Select: Faces): they become the connection's two sides"
+                    }
                 };
                 let button = match target {
                     selection::Target::ExtrudeFaces if selection::extrude_key(&params) == "source" => "Use as source",

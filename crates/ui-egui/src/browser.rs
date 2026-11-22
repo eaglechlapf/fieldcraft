@@ -251,6 +251,8 @@ pub enum Def {
     Contact,
     /// A tie between two surfaces (`interaction.tie`).
     Tie,
+    /// How two bodies hold each other where their faces touch (`interaction.connection`).
+    Connection,
     FluidDomain,
     /// A datum plane, axis or point.
     Datum,
@@ -279,7 +281,7 @@ pub enum Def {
 }
 
 impl Def {
-    pub const ALL: [Def; 23] = [
+    pub const ALL: [Def; 24] = [
         Def::Set,
         Def::Material,
         Def::Section,
@@ -290,6 +292,7 @@ impl Def {
         Def::Coupling,
         Def::Contact,
         Def::Tie,
+        Def::Connection,
         Def::FluidDomain,
         Def::Datum,
         Def::Partition,
@@ -319,6 +322,7 @@ impl Def {
             Def::Coupling => "coupling",
             Def::Contact => "contact",
             Def::Tie => "tie",
+            Def::Connection => "connection",
             Def::FluidDomain => "fluid_domain",
             Def::Datum => "datum",
             Def::Mass => "point_mass",
@@ -347,6 +351,7 @@ impl Def {
             Def::Tie => Definition::Tie,
             Def::Step => Definition::Step,
             Def::Set
+            | Def::Connection
             | Def::Material
             | Def::Section
             | Def::FluidDomain
@@ -378,6 +383,7 @@ impl Def {
             Def::Coupling => Collection::Coupling,
             Def::Contact => Collection::Contact,
             Def::Tie => Collection::Tie,
+            Def::Connection => Collection::Connection,
             Def::FluidDomain => Collection::FluidDomain,
             Def::Datum => Collection::Datum,
             Def::Partition => Collection::Partition,
@@ -408,6 +414,7 @@ impl Def {
             Def::Coupling => "coupling",
             Def::Contact => "contact",
             Def::Tie => "tie",
+            Def::Connection => "connection",
             Def::FluidDomain => "fluid_domain",
             Def::Datum => "datum",
             Def::Partition => "partition",
@@ -436,6 +443,7 @@ impl Def {
             Def::Coupling => "Coupling",
             Def::Contact => "Contact",
             Def::Tie => "Tie",
+            Def::Connection => "Connection",
             Def::FluidDomain => "Fluid Domain",
             Def::Datum => "Datum",
             Def::Partition => "Partition",
@@ -465,6 +473,7 @@ impl Def {
             Def::Coupling => "model.coupling.create",
             Def::Contact => "interaction.contact.pair",
             Def::Tie => "interaction.tie",
+            Def::Connection => "interaction.connection",
             Def::FluidDomain => "model.fluid_domain.create",
             Def::Datum => "geometry.datum",
             Def::Partition => "geometry.partition",
@@ -503,6 +512,8 @@ impl Def {
             (Def::Contact, _) => format!("interaction.contact.{verb}"),
             (Def::Tie, "create") => "interaction.tie".into(),
             (Def::Tie, _) => format!("interaction.tie.{verb}"),
+            (Def::Connection, "create") => "interaction.connection".into(),
+            (Def::Connection, _) => format!("interaction.connection.{verb}"),
             (Def::Datum | Def::Partition, "create") => self.icon().into(),
             (Def::Datum | Def::Partition, _) => format!("geometry.{}.{verb}", self.stem()),
             _ => format!("model.{}.{verb}", self.stem()),
@@ -590,6 +601,7 @@ impl Def {
             | Def::Coupling
             | Def::Contact
             | Def::Tie
+            | Def::Connection
             | Def::Partition
             | Def::Mass
             | Def::Spring
@@ -617,6 +629,7 @@ impl Def {
             Def::Coupling => m.couplings().len(),
             Def::Contact => m.contacts().len(),
             Def::Tie => m.ties().len(),
+            Def::Connection => m.connections().len(),
             Def::FluidDomain => m.fluid_domains().len(),
             Def::Datum => m.datums().len(),
             Def::Partition => m.partitions().len(),
@@ -646,6 +659,7 @@ impl Def {
             Def::Coupling => m.couplings().contains_key(name),
             Def::Contact => m.contacts().contains_key(name),
             Def::Tie => m.tie(name).is_some(),
+            Def::Connection => m.connection(name).is_some(),
             Def::FluidDomain => m.fluid_domain(name).is_some(),
             Def::Datum => m.datum(name).is_some(),
             Def::Partition => m.partitions().iter().any(|p| p.name == name),
@@ -675,6 +689,7 @@ impl Def {
             Def::Coupling => m.couplings().keys().cloned().collect(),
             Def::Contact => m.contacts().keys().cloned().collect(),
             Def::Tie => m.ties().keys().cloned().collect(),
+            Def::Connection => m.connections().keys().cloned().collect(),
             Def::FluidDomain => m.fluid_domains().keys().cloned().collect(),
             Def::Datum => m.datums().keys().cloned().collect(),
             Def::Partition => m.partitions().iter().map(|p| p.name.clone()).collect(),
@@ -730,6 +745,7 @@ pub fn definition(m: &Model, kind: Def, name: &str) -> Option<Value> {
         Def::Coupling => serde_json::to_value(m.couplings().get(name)?),
         Def::Contact => serde_json::to_value(m.contacts().get(name)?),
         Def::Tie => serde_json::to_value(m.tie(name)?),
+        Def::Connection => serde_json::to_value(m.connection(name)?),
         Def::FluidDomain => serde_json::to_value(m.fluid_domain(name)?),
         Def::Datum => serde_json::to_value(m.datum(name)?),
         Def::Partition => serde_json::to_value(m.partitions().iter().find(|p| p.name == name)?),
@@ -1304,7 +1320,7 @@ const GROUPS: [(&str, &str, &[Def]); 7] = [
     ("sections", "Sections", &[Def::Section]),
     ("steps", "Steps", &[Def::Step]),
     ("loads", "Loads & BCs", &[Def::BoundaryCondition, Def::Load, Def::InitialField]),
-    ("interactions", "Interactions", &[Def::ReferencePoint, Def::Coupling, Def::Contact, Def::Tie, Def::Spring, Def::Mass]),
+    ("interactions", "Interactions", &[Def::Connection, Def::ReferencePoint, Def::Coupling, Def::Contact, Def::Tie, Def::Spring, Def::Mass]),
     ("fluids", "Fluid Domains", &[Def::FluidDomain]),
 ];
 
@@ -1975,6 +1991,30 @@ pub(crate) mod tests {
         s.execute("file.sample", &json!({"name": "heated-bracket"})).unwrap();
         assert_eq!(item_icon(&s.model, Def::BoundaryCondition, "Heater"), ("model.step.heat", false));
         assert_eq!(item_icon(&s.model, Def::Load, "Air").0, "model.step.heat");
+    }
+
+    /// Connections are listed under Interactions, read back with their kind and faces, and
+    /// changed and deleted by their own commands.
+    #[test]
+    fn connections_are_interactions() {
+        use fieldcraft_model::{Connection, ConnectionKind, GeometryRef};
+        let mut app = ModelApp::new(Session::default());
+        let glue = Connection {
+            kind: ConnectionKind::Sliding,
+            first: vec![GeometryRef::face("Base", "F1:+z").unwrap()],
+            second: vec![GeometryRef::face("Clamp", "F4:-z").unwrap()],
+        };
+        app.session.model.add_connection("Base-Clamp", glue).unwrap();
+        assert_eq!(Def::Connection.names(&app.session.model), ["Base-Clamp"]);
+        assert_eq!(Def::Connection.count(&app.session.model), 1);
+        let (command, params) = Def::Connection.edit(&app.session.model, "Base-Clamp", app.session.units()).unwrap();
+        assert_eq!(command, "interaction.connection.edit");
+        assert_eq!((params["kind"].as_str(), params["first"][0]["face"].as_str()), (Some("sliding"), Some("F1:+z")), "{params}");
+        assert_eq!(Def::Connection.command("delete"), "interaction.connection.delete");
+        assert_eq!(Def::Connection.command("create"), "interaction.connection");
+        assert_eq!(Def::Connection.rename_kind(), Some("connection"));
+        let rows = crate::describe::rows(&app.session.model, Def::Connection, "Base-Clamp", app.session.units()).unwrap();
+        assert!(rows.iter().any(|(label, value)| label == "Kind" && value == "Sliding"), "{rows:?}");
     }
 
     /// Ties are listed under Interactions, read back and edited like the others (#366).
