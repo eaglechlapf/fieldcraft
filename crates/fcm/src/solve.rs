@@ -1674,13 +1674,19 @@ fn solve_at(
     if unknowns > limits.max_dofs {
         return Err(Error::Limit(format!("{unknowns} unknowns; the limit is {} ({})", limits.max_dofs, smaller(options.refine))));
     }
-    let too_large = |entries: usize| {
-        Error::Limit(format!("the stiffness would have {entries} entries; the limit is {MAX_MATRIX_ENTRIES} ({})", smaller(options.refine)))
-    };
+    // A first refusal before the cells are ordered and integrated, on a count that is not
+    // below the blocks of the stiffness (nine entries each): the entries are counted, and held
+    // to the limit of the way they are solved, once the system is put together
+    // ([`crate::assembly`]).
+    let most = if options.solver == Solver::Direct { MAX_MATRIX_ENTRIES } else { MAX_MATRIX_ENTRIES.max(limits.max_factor_entries) };
     let blocks =
         (0..elements).fold(0usize, |sum, element| sum.saturating_add(space.functions(element).len().saturating_mul(space.functions(element).len())));
-    if blocks > MAX_MATRIX_ENTRIES {
-        return Err(too_large(blocks.saturating_mul(9)));
+    if blocks > most {
+        return Err(Error::Limit(format!(
+            "the stiffness would have {} entries; the limit is {most} ({})",
+            blocks.saturating_mul(9),
+            smaller(options.refine)
+        )));
     }
     // Nested dissection by elements: the functions of a cell all couple, so a separator is
     // the functions two groups of cells share, not a layer of functions through the cells.

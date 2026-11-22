@@ -98,6 +98,7 @@
 #![allow(clippy::needless_range_loop)]
 
 pub mod assembly;
+mod blocked;
 mod cell;
 mod dense;
 pub mod exact;

@@ -85,10 +85,11 @@ use std::sync::OnceLock;
 use fieldcraft_fem::{DofLayout, DofSet};
 use fieldcraft_mesh::surface::BoundarySurface;
 use fieldcraft_solver::Limits;
-use fieldcraft_solver::cholesky::{Factor, FactorError, UpperColumns, predicted};
+use fieldcraft_solver::cholesky::{Factor, FactorError, UpperColumns, predicted_of_nodes};
 use fieldcraft_solver::ordering::element_dissection;
-use fieldcraft_solver::sparse::{NodeGraph, add_block};
+use fieldcraft_solver::sparse::{Csr, NodeGraph, add_block};
 
+use crate::blocked::Blocked;
 use crate::cell::{Curved, Grip};
 use crate::grid::{self, Grid, cross, dot, sub};
 use crate::islands::closest_point;
@@ -1034,6 +1035,24 @@ struct Pair {
 /// functions.
 const SYMMETRIC: [[usize; 3]; 3] = [[0, 1, 2], [1, 3, 4], [2, 4, 5]];
 
+/// The stiffness as the way it is solved keeps it.
+enum Stiffness {
+    /// Rows of entries, for the factorization.
+    Rows(Csr),
+    /// Blocks of three by three, for the iteration.
+    Blocks(Blocked),
+}
+
+impl Stiffness {
+    /// Add the matrix `data` of the element of `nodes` (three unknowns each).
+    fn add(&mut self, layout: &DofLayout, nodes: &[usize], data: &[f64]) -> Result<()> {
+        match self {
+            Stiffness::Rows(rows) => Ok(add_block(rows, layout, nodes, DofSet::TRANSLATIONS, data)?),
+            Stiffness::Blocks(blocked) => blocked.add(nodes, data),
+        }
+    }
+}
+
 /// One matrix of the bodies whose `views` are ready: ordered, added up, factored and solved,
 /// with the blocks of the bonds; `partner` is the body a point of a tied face touches and the
 /// nearest point of that body's faces. The solutions come in the views' order.
@@ -1189,14 +1208,18 @@ pub(crate) fn solve_system(
 
     // The matrix.
     let refine = views.first().map_or(0, |view| view.refine);
-    let too_large = |entries: usize| {
-        Error::Limit(format!("the stiffness would have {entries} entries; the limit is {MAX_MATRIX_ENTRIES} ({})", solve::smaller(refine)))
+    let too_large = |entries: usize, limit: usize| {
+        Error::Limit(format!("the stiffness would have {entries} entries; the limit is {limit} ({})", solve::smaller(refine)))
     };
     let layout = DofLayout::uniform(0..total as u32, DofSet::TRANSLATIONS);
     if layout.dofs() != 3 * total {
         return Err(broken("the layout does not hold three unknowns per function"));
     }
-    let (mut stiffness, stiffness_entries) = {
+    // How the system is solved is chosen before it is added up, from its pattern: by the
+    // factorization, or by iteration where the factorization would take far more work than
+    // the system has entries, or more memory than is allowed. The iteration keeps the matrix
+    // by blocks, in half the memory, and takes as much more of it.
+    let (mut stiffness, stiffness_entries, entries, fits) = {
         let bodies = views.iter().enumerate().flat_map(|(body, view)| (0..view.elements.len()).map(move |element| (body, element)));
         let joined = coupled.iter().map(|(first, element, second, other)| {
             let mut both = placed(*first, *element);
@@ -1204,9 +1227,27 @@ pub(crate) fn solve_system(
             both
         });
         let graph = NodeGraph::new(total, bodies.map(|(body, element)| placed(body, element)).chain(joined));
-        let entries = graph.entries(&layout);
-        if entries > MAX_MATRIX_ENTRIES {
-            return Err(too_large(entries));
+        let stiffness_entries = graph.entries(&layout);
+        let (entries, work) = predicted_of_nodes(&graph.adjacency);
+        let fits = entries <= limits.max_factor_entries;
+        let asked = |solver: Solver| views.iter().any(|view| view.solver == solver);
+        let iterate = if asked(Solver::Direct) {
+            false
+        } else if asked(Solver::Iterative) {
+            true
+        } else {
+            // A material that hardly changes its volume is not the iteration's ([`iterative`]).
+            let suits = views.iter().all(|view| view.poisson <= NEARLY_INCOMPRESSIBLE);
+            // What does not fit as a factor, or as rows, is the iteration's whatever it suits.
+            !fits
+                || stiffness_entries > MAX_MATRIX_ENTRIES
+                || (3 * total >= ITERATIVE_FROM && suits && work > WORK_PER_ENTRY * stiffness_entries as f64)
+        };
+        // By blocks the matrix may have as many entries as the factor is allowed: that is the
+        // memory the caller has given the solve.
+        let limit = if iterate { MAX_MATRIX_ENTRIES.max(limits.max_factor_entries) } else { MAX_MATRIX_ENTRIES };
+        if stiffness_entries > limit {
+            return Err(too_large(stiffness_entries, limit));
         }
         // A round of [`Options::adapt`] is refused here, before its cells are integrated, when
         // its factor cannot fit: the larger system of the same part is taken to have no fewer
@@ -1214,10 +1255,10 @@ pub(crate) fn solve_system(
         // fill of a nested dissection grows with the system).
         // (Only where the factorization is the one way asked for: an iteration takes a
         // system whose factor does not fit.)
-        let factored = views.iter().any(|view| view.solver == Solver::Direct);
-        if let Some((before, factor)) = views.iter().find_map(|view| view.before).filter(|(before, _)| factored && *before > 0 && entries >= *before)
+        if let Some((before, factor)) =
+            views.iter().find_map(|view| view.before).filter(|(before, _)| asked(Solver::Direct) && *before > 0 && stiffness_entries >= *before)
         {
-            let least = entries as f64 * factor as f64 / before as f64;
+            let least = stiffness_entries as f64 * factor as f64 / before as f64;
             if least > limits.max_factor_entries as f64 {
                 return Err(Error::Limit(format!(
                     "the factorization would need {least:.0} entries or more; the limit is {} ({})",
@@ -1226,13 +1267,22 @@ pub(crate) fn solve_system(
                 )));
             }
         }
-        (graph.zero_matrix(&layout), entries)
+        let stiffness = if iterate {
+            let blocked = Blocked::zero(&graph.adjacency);
+            Stiffness::Blocks(
+                blocked
+                    .ok_or_else(|| Error::Limit(format!("no memory for a stiffness of {stiffness_entries} entries ({})", solve::smaller(refine))))?,
+            )
+        } else {
+            Stiffness::Rows(graph.zero_matrix(&layout))
+        };
+        (stiffness, stiffness_entries, entries, fits)
     };
     let mut load = vec![0.0; 3 * total];
     for (body, view) in views.iter().enumerate() {
         (view.assemble)(&mut |element: usize, cell_stiffness: &[f64], cell_load: &[f64]| -> Result<()> {
             let nodes = placed(body, element);
-            add_block(&mut stiffness, &layout, &nodes, DofSet::TRANSLATIONS, cell_stiffness)?;
+            stiffness.add(&layout, &nodes, cell_stiffness)?;
             for (a, node) in nodes.iter().enumerate() {
                 for i in 0..3 {
                     if let (Some(sum), Some(value)) = (load.get_mut(3 * node + i), cell_load.get(3 * a + i)) {
@@ -1283,7 +1333,7 @@ pub(crate) fn solve_system(
                     }
                 }
             }
-            add_block(&mut stiffness, &layout, &nodes, DofSet::TRANSLATIONS, &block)?;
+            stiffness.add(&layout, &nodes, &block)?;
             continue;
         }
         for row in 0..3 * na {
@@ -1310,30 +1360,12 @@ pub(crate) fn solve_system(
                 }
             }
         }
-        add_block(&mut stiffness, &layout, &nodes, DofSet::TRANSLATIONS, &block)?;
+        stiffness.add(&layout, &nodes, &block)?;
     }
     drop(pairs);
 
-    // The solution: by the factorization, or by iteration where the factorization would take
-    // far more work than the system has entries, or more memory than is allowed. What the
-    // factorization would cost is known from the matrix's structure before any of it is done.
-    let upper = UpperColumns::from_symmetric(&stiffness);
-    let (entries, work) = predicted(&upper);
-    let fits = entries <= limits.max_factor_entries;
-    let asked = |solver: Solver| views.iter().any(|view| view.solver == solver);
-    let iterate = if asked(Solver::Direct) {
-        false
-    } else if asked(Solver::Iterative) {
-        true
-    } else {
-        // A material that hardly changes its volume is not the iteration's ([`iterative`]).
-        let suits = views.iter().all(|view| view.poisson <= NEARLY_INCOMPRESSIBLE);
-        !fits || (3 * total >= ITERATIVE_FROM && suits && work > WORK_PER_ENTRY * stiffness_entries as f64)
-    };
     let mut iterated = None;
-    if iterate {
-        // The factorization's copy of the matrix is taken again if it comes to that.
-        drop(upper);
+    if let Stiffness::Blocks(blocked) = &stiffness {
         let mut linear = vec![false; total];
         for (body, view) in views.iter().enumerate() {
             for (function, flag) in view.linear.iter().enumerate().take(view.count) {
@@ -1361,16 +1393,36 @@ pub(crate) fn solve_system(
         }));
         let progress = fieldcraft_model::progress::current();
         let cancelled = || progress.as_ref().is_some_and(|p| p.is_cancelled());
-        iterated = iterative::solve(&stiffness, &load, &linear, &blocks, &whole, limits, iterative::SETTLED, iterative::MOST, &cancelled)?;
+        // With no factorization to fall back on, the iteration is given longer.
+        let alone = !fits || blocked.entries() > MAX_MATRIX_ENTRIES;
+        let most = if alone { iterative::MOST_ALONE } else { iterative::MOST };
+        iterated = iterative::solve(blocked, &load, &linear, &blocks, &whole, limits, iterative::SETTLED, most, &cancelled)?;
     }
     let (u, factor_entries, iterations, residual) = match iterated {
         Some(outcome) => (outcome.u, outcome.coarse_entries, outcome.iterations, outcome.residual),
         None => {
-            if !fits {
-                return Err(solve::factor_error(FactorError::TooLarge { entries, limit: limits.max_factor_entries }, refine));
-            }
+            // What the iteration did not settle is the factorization's, by rows, if it can
+            // take it.
+            let unsettled = |why: String| Error::Limit(format!("the iteration did not settle the system, and {why} ({})", solve::smaller(refine)));
+            let rows = match stiffness {
+                Stiffness::Rows(_) if !fits => {
+                    return Err(solve::factor_error(FactorError::TooLarge { entries, limit: limits.max_factor_entries }, refine));
+                }
+                Stiffness::Rows(rows) => rows,
+                Stiffness::Blocks(_) if !fits => {
+                    return Err(unsettled(format!("the factorization would need {entries} entries; the limit is {}", limits.max_factor_entries)));
+                }
+                Stiffness::Blocks(blocked) if blocked.entries() > MAX_MATRIX_ENTRIES => {
+                    return Err(unsettled(format!(
+                        "the stiffness has {} entries; a factorization takes {MAX_MATRIX_ENTRIES} at most",
+                        blocked.entries()
+                    )));
+                }
+                Stiffness::Blocks(blocked) => blocked.rows(),
+            };
             // The factorization reads the matrix's lower triangle.
-            let upper = UpperColumns::from_symmetric(&stiffness);
+            let upper = UpperColumns::from_symmetric(&rows);
+            drop(rows);
             let factor = Factor::new(&upper, limits.max_factor_entries).map_err(|e| solve::factor_error(e, refine))?;
             drop(upper);
             let mut u = load;
@@ -1378,7 +1430,6 @@ pub(crate) fn solve_system(
             (u, factor.entries(), 0, 0.0)
         }
     };
-    drop(stiffness);
     if u.iter().any(|x| !x.is_finite()) {
         return Err(Error::Singular("the solution is not finite: the stiffness is singular to working precision".into()));
     }

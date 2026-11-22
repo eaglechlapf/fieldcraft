@@ -205,8 +205,11 @@ fn what_the_iteration_does_not_settle_is_factored() {
     let direct = solve(&surface, &rubber, &supports, &loads, &options(Solver::Direct), &Limits::default()).unwrap();
     let asked = solve(&surface, &rubber, &supports, &loads, &options(Solver::Iterative), &Limits::default()).unwrap();
     assert_eq!((asked.stats.iterations, asked.strain_energy.to_bits()), (0, direct.strain_energy.to_bits()));
-    // Where the factor may not be had either, the refusal is the factorization's.
+    // Where the factor may not be had either, the refusal says both.
     let none = Limits { max_factor_entries: 1000, ..Limits::default() };
     let refused = solve(&surface, &rubber, &supports, &loads, &options(Solver::Iterative), &none);
-    assert!(matches!(&refused, Err(Error::Limit(why)) if why.contains("factorization")), "{:?}", refused.err());
+    assert!(matches!(&refused, Err(Error::Limit(why)) if why.contains("did not settle") && why.contains("factorization")), "{:?}", refused.err());
+    // Asked for the factorization alone, the refusal is its own.
+    let refused = solve(&surface, &rubber, &supports, &loads, &options(Solver::Direct), &none);
+    assert!(matches!(&refused, Err(Error::Limit(why)) if why.starts_with("the factorization needs")), "{:?}", refused.err());
 }

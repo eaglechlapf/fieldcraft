@@ -30,15 +30,16 @@
 //! function, and the blocks' answers for it are summed: W, diagonal, weights each unknown by
 //! one over the root of that number on the way in and on the way out, so that the sum is their
 //! mean and M⁻¹ stays symmetric (measured: a third to a half fewer rounds than unweighted). In
-//! a cell the surface cuts, the functions are nearly
-//! dependent on the little material the cell holds, which is what makes the stiffness of a cut
-//! grid ill-conditioned; within the cell's block that is solved exactly, and the iteration does
-//! not see it (F. de Prenter, C. V. Verhoosel, G. J. van Zwieten, E. H. van Brummelen,
-//! *Condition number analysis and preconditioning of the finite cell method*, Comput. Methods
-//! Appl. Mech. Engrg. 316:297–327, 2017; with a coarse level, J. N. Jomo, F. de Prenter,
-//! M. Elhaddad, D. D'Angella, C. V. Verhoosel, S. Kollmannsberger, J. S. Kirschke, V. Nübel,
-//! E. H. van Brummelen, E. Rank, *Robust and parallel scalable iterative solutions for
-//! large-scale finite cell analyses*, Finite Elem. Anal. Des. 163:14–30, 2019).
+//! a cell the surface cuts, the functions are nearly dependent on the little material the
+//! cell holds, which is what makes the stiffness of a cut grid ill-conditioned (F. de Prenter,
+//! C. V. Verhoosel, G. J. van Zwieten, E. H. van Brummelen, *Condition number analysis and
+//! preconditioning of the finite cell method*, Comput. Methods Appl. Mech. Engrg.
+//! 316:297–327, 2017); within the cell's block that is solved exactly, and the iteration does
+//! not see it (an additive Schwarz method on the cells of a refined grid: J. N. Jomo,
+//! F. de Prenter, M. Elhaddad, D. D'Angella, C. V. Verhoosel, S. Kollmannsberger,
+//! J. S. Kirschke, V. Nübel, E. H. van Brummelen, E. Rank, *Robust and parallel scalable
+//! iterative solutions for large-scale finite cell analyses*, Finite Elem. Anal. Des.
+//! 163:14–30, 2019).
 //!
 //! # What it is not good at
 //! The count of rounds does not grow with the grid, but it does with what the two levels do
@@ -47,16 +48,29 @@
 //! iteration does not settle in [`MOST`] rounds, is left to the factorization
 //! ([`crate::assembly`]).
 //!
+//! So does a thin part on cells as large as its walls are thick. The oracle's bracket, 8 mm
+//! thick with holes through it, takes 124 rounds on cells of 2.2 mm at degree 3, 268 on cells
+//! of 4.4 mm and 390 on cells of 8 mm, and 1120 at degree 4 with the cells at its fillet and
+//! holes divided once; a compact part takes about a hundred on any cells. What is left after a
+//! few hundred rounds sits at the rims of the holes, in shape functions shared by cells that
+//! each hold little material: a block of one cell does not hold what such a function has in
+//! common with the functions of the other cells. Blocks of all the functions around every
+//! shared one (the cells around a vertex, each with its neighbours) settle the same systems in 60 rounds at
+//! degree 3, at several times the memory of the cells' blocks; they are not built here. A thin
+//! part's factor is small, so it is factored instead, at far more unknowns than a compact
+//! part; one too large for that is iterated for up to [`MOST_ALONE`] rounds.
+//!
 //! # Determinism
-//! Every sum runs in a fixed order: the products of the matrix node by node, each over the
-//! blocks of its rows in order; the blocks one by one into the result in their order; the inner products
-//! from the first unknown to the last. The result is the same on any number of threads.
+//! Every sum runs in a fixed order: the products of the matrix as [`Blocked`] has them; the
+//! blocks one by one into the result in their order; the inner products from the first
+//! unknown to the last. The result is the same on any number of threads.
 
 use fieldcraft_parallel as parallel;
 use fieldcraft_solver::Limits;
 use fieldcraft_solver::cholesky::{Factor, UpperColumns};
 use fieldcraft_solver::sparse::Csr;
 
+use crate::blocked::Blocked;
 use crate::{Error, Result};
 
 /// The residual at which the iteration is done, relative to the load: the unknowns are then
@@ -71,6 +85,11 @@ const ROUNDING: f64 = 10.0;
 /// Rounds after which a system is left to the factorization: three times what a system the
 /// two levels suit takes at the tolerance (about a hundred).
 pub(crate) const MOST: usize = 400;
+
+/// Rounds for a system the factorization cannot take, its factor or its rows above their
+/// limits: five times as many. What the two levels suit poorly still settles, slowly (the
+/// module's head: 1120 rounds measured there).
+pub(crate) const MOST_ALONE: usize = 5 * MOST;
 
 /// Rounds between two looks at whether the caller has cancelled.
 const LOOK: usize = 8;
@@ -87,110 +106,6 @@ pub(crate) struct Outcome {
     pub coarse_entries: usize,
 }
 
-/// Nodes a task of the product takes.
-const ROWS: usize = 1024;
-
-/// The matrix as the rounds multiply by it: a node has three unknowns, so the entries are kept
-/// as blocks of three by three with one column each, in a little over half the memory of the
-/// entries with a column each. The product takes its time to read the matrix, and that much
-/// less of it.
-struct Blocked {
-    /// Where each node's blocks start, and where the last one's end.
-    start: Vec<usize>,
-    /// The node each block is for.
-    node: Vec<u32>,
-    /// The blocks, row by row.
-    value: Vec<[f64; 9]>,
-}
-
-/// The nodes that the three rows of `node` have entries for, rising, each with its block.
-fn coupled(matrix: &Csr, node: usize, mut each: impl FnMut(usize, [f64; 9])) {
-    let rows = [matrix.row(3 * node), matrix.row(3 * node + 1), matrix.row(3 * node + 2)];
-    let mut at = [0usize; 3];
-    // Every pass takes an entry of one row at least.
-    while let Some(next) = rows.iter().zip(&at).filter_map(|((columns, _), at)| columns.get(*at)).map(|column| column / 3).min() {
-        let mut block = [0.0; 9];
-        for (row, ((columns, values), at)) in rows.iter().zip(&mut at).enumerate() {
-            while let (Some(column), Some(value)) = (columns.get(*at), values.get(*at))
-                && column / 3 == next
-            {
-                if let Some(slot) = block.get_mut(3 * row + column % 3) {
-                    *slot = *value;
-                }
-                *at += 1;
-            }
-        }
-        each(next, block);
-    }
-}
-
-impl Blocked {
-    /// `matrix` by blocks. None when it has more nodes than a column counts.
-    fn new(matrix: &Csr) -> Option<Blocked> {
-        let nodes = matrix.n / 3;
-        u32::try_from(nodes).ok()?;
-        let counts = parallel::map_grained(nodes, ROWS, |node| {
-            let mut count = 0usize;
-            coupled(matrix, node, |_, _| count += 1);
-            count
-        });
-        let mut start = Vec::with_capacity(nodes + 1);
-        let mut total = 0usize;
-        start.push(0);
-        for count in &counts {
-            total += count;
-            start.push(total);
-        }
-        drop(counts);
-        let mut node = vec![0u32; total];
-        let mut value = vec![[0.0f64; 9]; total];
-        // Each task's part of the two lists.
-        let mut parts = Vec::new();
-        let (mut nodes_left, mut values_left) = (node.as_mut_slice(), value.as_mut_slice());
-        for range in parallel::blocks(nodes, ROWS) {
-            let length = start.get(range.end)?.checked_sub(*start.get(range.start)?)?;
-            let (own_nodes, rest) = std::mem::take(&mut nodes_left).split_at_mut_checked(length)?;
-            nodes_left = rest;
-            let (own_values, rest) = std::mem::take(&mut values_left).split_at_mut_checked(length)?;
-            values_left = rest;
-            parts.push((range, own_nodes, own_values));
-        }
-        parallel::for_each_mut(&mut parts, |_, (range, own_nodes, own_values)| {
-            let mut at = 0;
-            for node in range.clone() {
-                coupled(matrix, node, |other, block| {
-                    if let (Some(column), Some(slot)) = (own_nodes.get_mut(at), own_values.get_mut(at)) {
-                        *column = u32::try_from(other).unwrap_or(u32::MAX);
-                        *slot = block;
-                    }
-                    at += 1;
-                });
-            }
-        });
-        drop(parts);
-        Some(Blocked { start, node, value })
-    }
-
-    /// y = A x: the nodes in parallel, each row's sum over its blocks in order.
-    fn mul(&self, x: &[f64], y: &mut [f64]) {
-        parallel::chunks_mut(y, 3 * ROWS, |task, out| {
-            for (i, sums) in out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
-                let node = task * ROWS + i;
-                let (from, to) = (self.start.get(node).copied().unwrap_or(0), self.start.get(node + 1).copied().unwrap_or(0));
-                let mut sum = [0.0f64; 3];
-                for (other, a) in self.node.get(from..to).unwrap_or_default().iter().zip(self.value.get(from..to).unwrap_or_default()) {
-                    let at = 3 * *other as usize;
-                    let Some(&[x0, x1, x2]) = x.get(at..at + 3).and_then(|x| x.first_chunk::<3>()) else { continue };
-                    sum[0] += a[0] * x0 + a[1] * x1 + a[2] * x2;
-                    sum[1] += a[3] * x0 + a[4] * x1 + a[5] * x2;
-                    sum[2] += a[6] * x0 + a[7] * x1 + a[8] * x2;
-                }
-                *sums = sum;
-            }
-        });
-    }
-}
-
 /// One block of the local level: its unknowns in rising order, and the Cholesky factor of
 /// their matrix, the lower triangle row by row.
 struct Block {
@@ -199,30 +114,40 @@ struct Block {
 }
 
 impl Block {
-    /// The block of the nodes `nodes` (three unknowns each) of `matrix`.
-    fn new(matrix: &Csr, nodes: &[usize]) -> Block {
-        let mut unknowns: Vec<usize> = nodes.iter().flat_map(|node| [3 * node, 3 * node + 1, 3 * node + 2]).collect();
-        unknowns.sort_unstable();
-        unknowns.dedup();
+    /// The block of the nodes `nodes` (three unknowns each) of `matrix`. None when there is no
+    /// memory for its factor.
+    fn new(matrix: &Blocked, nodes: &[usize]) -> Option<Block> {
+        let mut own = nodes.to_vec();
+        own.sort_unstable();
+        own.dedup();
+        let unknowns: Vec<usize> = own.iter().flat_map(|node| [3 * node, 3 * node + 1, 3 * node + 2]).collect();
         let n = unknowns.len();
         // The lower triangle, row by row: row i starts at i (i + 1) / 2.
-        let mut factor = vec![0.0; n * (n + 1) / 2];
-        for (i, unknown) in unknowns.iter().enumerate() {
-            let (columns, values) = matrix.row(*unknown);
-            let row = i * (i + 1) / 2;
+        let mut factor = Vec::new();
+        factor.try_reserve_exact(n * (n + 1) / 2).ok()?;
+        factor.resize(n * (n + 1) / 2, 0.0);
+        for (i, node) in own.iter().enumerate() {
+            let (others, blocks) = matrix.row(*node);
             // Both lists rise: one pass over them.
             let mut j = 0;
-            for (column, value) in columns.iter().zip(values) {
-                while unknowns.get(j).is_some_and(|other| other < column) {
+            for (other, block) in others.iter().zip(blocks) {
+                let other = *other as usize;
+                while own.get(j).is_some_and(|node| *node < other) {
                     j += 1;
                 }
                 if j > i {
                     break;
                 }
-                if unknowns.get(j) == Some(column)
-                    && let Some(slot) = factor.get_mut(row + j)
-                {
-                    *slot = *value;
+                if own.get(j) != Some(&other) {
+                    continue;
+                }
+                for (r, entries) in block.as_chunks::<3>().0.iter().enumerate() {
+                    let row = 3 * i + r;
+                    for (column, value) in (3 * j..=row.min(3 * j + 2)).zip(entries) {
+                        if let Some(slot) = factor.get_mut(row * (row + 1) / 2 + column) {
+                            *slot = *value;
+                        }
+                    }
                 }
             }
         }
@@ -230,8 +155,7 @@ impl Block {
             // A block that is not positive to working precision (a sliver of material on its
             // fictitious stiffness): its diagonal alone, which is.
             for (i, unknown) in unknowns.iter().enumerate() {
-                let (columns, values) = matrix.row(*unknown);
-                let diagonal = columns.binary_search(unknown).ok().and_then(|at| values.get(at)).copied().unwrap_or(1.0);
+                let diagonal = matrix.diagonal(*unknown).unwrap_or(1.0);
                 let row = i * (i + 1) / 2;
                 if let Some(entries) = factor.get_mut(row..row + i + 1) {
                     entries.fill(0.0);
@@ -241,7 +165,7 @@ impl Block {
                 }
             }
         }
-        Block { unknowns, factor }
+        Some(Block { unknowns, factor })
     }
 
     /// `out` = K_block⁻¹ of the block's part of `r`.
@@ -311,10 +235,10 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
 /// Solve `matrix` u = `load` by the iteration of the module's head, to the residual `settled`
 /// of the load in at most `most` rounds. `linear` says which nodes (three unknowns each) carry
 /// a linear shape function, and `blocks` lists the nodes of every block of the local level
-/// (every node in one at least). `Ok(None)` when the rounds did not settle it, or a step broke
+/// (every node in one at least), with whether its answer is taken `whole`. `Ok(None)` when the rounds did not settle it, or a step broke
 /// down: the system is then the factorization's.
 pub(crate) fn solve(
-    matrix: &Csr,
+    matrix: &Blocked,
     load: &[f64],
     linear: &[bool],
     blocks: &[Vec<usize>],
@@ -324,8 +248,8 @@ pub(crate) fn solve(
     most: usize,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Option<Outcome>> {
-    let n = matrix.n;
-    if load.len() != n || linear.len() * 3 != n {
+    let n = 3 * matrix.nodes();
+    if load.len() != n || linear.len() != matrix.nodes() {
         return Err(Error::Internal("the iteration's system and its load differ in size".into()));
     }
     let scale = dot(load, load).sqrt();
@@ -334,26 +258,22 @@ pub(crate) fn solve(
         return Ok(scale.is_finite().then(|| Outcome { u: vec![0.0; n], iterations: 0, residual: 0.0, coarse_entries: 0 }));
     }
 
-    let Some(product) = Blocked::new(matrix) else { return Ok(None) };
-
     // The coarse level: the linear functions' part of the matrix, factored.
-    let mut place = vec![usize::MAX; n];
+    let mut place = vec![usize::MAX; matrix.nodes()];
     let mut coarse = Vec::new();
     for (node, _) in linear.iter().enumerate().filter(|(_, linear)| **linear) {
-        for unknown in 3 * node..3 * node + 3 {
-            if let Some(slot) = place.get_mut(unknown) {
-                *slot = coarse.len();
-            }
-            coarse.push(unknown);
+        if let Some(slot) = place.get_mut(node) {
+            *slot = coarse.len() / 3;
         }
+        coarse.extend(3 * node..3 * node + 3);
     }
     let (mut ptr, mut idx, mut val) = (vec![0usize], Vec::new(), Vec::new());
     for unknown in &coarse {
-        let (columns, values) = matrix.row(*unknown);
-        for (column, value) in columns.iter().zip(values) {
-            if let Some(at) = place.get(*column).copied().filter(|at| *at != usize::MAX) {
-                idx.push(at);
-                val.push(*value);
+        let (others, blocks) = matrix.row(unknown / 3);
+        for (other, block) in others.iter().zip(blocks) {
+            if let Some(at) = place.get(*other as usize).copied().filter(|at| *at != usize::MAX) {
+                idx.extend(3 * at..3 * at + 3);
+                val.extend_from_slice(block.get(3 * (unknown % 3)..3 * (unknown % 3) + 3).unwrap_or_default());
             }
         }
         ptr.push(idx.len());
@@ -373,7 +293,11 @@ pub(crate) fn solve(
     }
 
     // The local level, and each unknown's weight: one over the root of the blocks it is in.
-    let blocks: Vec<Block> = parallel::map(blocks.len(), |block| Block::new(matrix, blocks.get(block).map(Vec::as_slice).unwrap_or_default()));
+    let blocks: Option<Vec<Block>> =
+        parallel::map(blocks.len(), |block| Block::new(matrix, blocks.get(block).map(Vec::as_slice).unwrap_or_default())).into_iter().collect();
+    let Some(blocks) = blocks else {
+        return Err(Error::Limit("no memory for the blocks the iteration solves the cells in (use a larger cell size or a lower degree)".into()));
+    };
     let mut weight = vec![0.0f64; n];
     for unknown in blocks.iter().flat_map(|block| &block.unknowns) {
         if let Some(count) = weight.get_mut(*unknown) {
@@ -450,7 +374,7 @@ pub(crate) fn solve(
         if iteration % LOOK == 0 && cancelled() {
             return Err(Error::Internal("cancelled".into()));
         }
-        product.mul(&p, &mut ap);
+        matrix.mul(&p, &mut ap);
         let curvature = dot(&p, &ap);
         // A direction with no stiffness, or a number that is none: not this method's system.
         if !(curvature > 0.0 && rz > 0.0) || !curvature.is_finite() || !rz.is_finite() {
@@ -468,7 +392,7 @@ pub(crate) fn solve(
         if residual <= settled {
             // The residual of the recurrence drifts from the true one over many rounds: the
             // true one decides.
-            product.mul(&u, &mut ap);
+            matrix.mul(&u, &mut ap);
             for ((res, b), a) in r.iter_mut().zip(load).zip(&ap) {
                 *res = b - a;
             }
@@ -538,14 +462,15 @@ mod tests {
     #[test]
     fn the_iteration_solves_what_the_factorization_does() {
         let nodes = 60;
-        let (matrix, load) = chain(nodes);
+        let (rows, load) = chain(nodes);
+        let matrix = Blocked::from_rows(&rows);
         // Every fourth node is of the coarse level; the blocks are runs of five nodes that
         // overlap by one.
         let linear: Vec<bool> = (0..nodes).map(|node| node % 4 == 0).collect();
         let blocks: Vec<Vec<usize>> = (0..nodes).step_by(4).map(|first| (first..(first + 5).min(nodes)).collect()).collect();
         let solved = solve(&matrix, &load, &linear, &blocks, &[], &Limits::default(), SETTLED, MOST, &|| false).unwrap().expect("settled");
         let mut direct = load.clone();
-        Factor::new(&UpperColumns::from_symmetric(&matrix), usize::MAX).unwrap().solve(&mut direct).unwrap();
+        Factor::new(&UpperColumns::from_symmetric(&rows), usize::MAX).unwrap().solve(&mut direct).unwrap();
         let largest = direct.iter().fold(0.0f64, |m, x| m.max(x.abs()));
         for (a, b) in solved.u.iter().zip(&direct) {
             assert!((a - b).abs() < 1e-7 * largest, "{a} against {b}");
@@ -563,10 +488,11 @@ mod tests {
         let still = solve(&matrix, &vec![0.0; 3 * nodes], &linear, &blocks, &[], &Limits::default(), SETTLED, MOST, &|| false).unwrap().unwrap();
         assert!(still.iterations == 0 && still.u.iter().all(|x| *x == 0.0));
         assert!(solve(&matrix, &load, &linear, &blocks, &[], &Limits::default(), SETTLED, 2, &|| false).unwrap().is_none());
-        let mut indefinite = matrix.clone();
+        let mut indefinite = rows.clone();
         for value in &mut indefinite.val {
             *value = -*value;
         }
+        let indefinite = Blocked::from_rows(&indefinite);
         assert!(solve(&indefinite, &load, &linear, &blocks, &[], &Limits::default(), SETTLED, MOST, &|| false).unwrap().is_none());
         assert!(solve(&matrix, &load, &linear, &blocks, &[], &Limits::default(), SETTLED, MOST, &|| true).is_err());
         assert!(solve(&matrix, &load[1..], &linear, &blocks, &[], &Limits::default(), SETTLED, MOST, &|| false).is_err());
@@ -580,35 +506,15 @@ mod tests {
     }
 
     #[test]
-    fn the_product_by_blocks_is_the_product_by_rows() {
-        // The rows of a node here differ in their columns: the blocks hold a zero where a row
-        // has no entry.
-        let (matrix, _) = chain(40);
-        let blocked = Blocked::new(&matrix).expect("few nodes");
-        assert_eq!(blocked.start.len(), 41);
-        assert_eq!(blocked.node.len(), 3 * 40 - 2, "a node with its neighbours");
-        let x: Vec<f64> = (0..matrix.n).map(|i| ((i * i) as f64 * 0.37).sin()).collect();
-        let (mut rows, mut blocks) = (vec![0.0; matrix.n], vec![1.0; matrix.n]);
-        matrix.mul(&x, &mut rows);
-        blocked.mul(&x, &mut blocks);
-        for (a, b) in rows.iter().zip(&blocks) {
-            assert!((a - b).abs() < 1e-13, "{a} against {b}");
-        }
-        let mut one = vec![0.0; matrix.n];
-        parallel::with_threads(1, || Blocked::new(&matrix).expect("few nodes").mul(&x, &mut one));
-        assert!(one.iter().zip(&blocks).all(|(a, b)| a.to_bits() == b.to_bits()));
-    }
-
-    #[test]
     fn a_block_is_solved_by_its_own_factor() {
-        let (matrix, _) = chain(6);
-        let block = Block::new(&matrix, &[4, 1, 2]);
+        let (rows, _) = chain(6);
+        let block = Block::new(&Blocked::from_rows(&rows), &[4, 1, 2]).expect("small");
         assert_eq!(block.unknowns, [3, 4, 5, 6, 7, 8, 12, 13, 14]);
         // K_block x = r for a known x.
         let x: Vec<f64> = (0..9).map(|i| 0.5 + i as f64).collect();
-        let mut r = vec![0.0; matrix.n];
+        let mut r = vec![0.0; rows.n];
         for (i, unknown) in block.unknowns.iter().enumerate() {
-            let (columns, values) = matrix.row(*unknown);
+            let (columns, values) = rows.row(*unknown);
             let _ = i;
             for (column, value) in columns.iter().zip(values) {
                 if let Ok(j) = block.unknowns.binary_search(column) {

@@ -91,7 +91,7 @@ mesh; each solve replaces the step's result.
 | `sample_size` | `cell_size` / `degree` | The results are read at points of the surface no farther apart than this; where cells are divided, as much closer as the cells are smaller. |
 | `max_dofs` | 6 000 000 | A cap on the unknowns; may only be lowered. |
 | `solver` | `"auto"` | How the unknowns are solved for: `"direct"` by factorization, `"iterative"` by conjugate gradients, `"auto"` whichever is predicted to be the less work. See [How large a model](#how-large-a-model). |
-| `max_factor_entries` | 400 000 000 | A cap on the entries of the factorization (8 bytes each), as for `solve.static`. |
+| `max_factor_entries` | 400 000 000 | A cap on the entries of the factorization (8 bytes each), as for `solve.static`, and on the entries of the stiffness the iteration keeps. See [How large a model](#how-large-a-model). |
 | `threads` | the session's | Changes the time only, never the result. |
 
 ## What it solves, and what it refuses
@@ -315,8 +315,10 @@ fillet of 6 mm:
   at degree 3 give 211 to 221 MPa, with none 184 to 243 (`crates/fcm/tests/bracket.rs`, at a
   tolerance of 0.05 mm).
 
-What is refused on this part: degree 4 with one level at the default cell size (a stiffness
-of 228 million entries against the solver's cap of 180 million). Two levels at the default cell
+Too large to factor on this part: degree 4 with one level at the default cell size (339 000
+unknowns, a stiffness of 228 million entries against the 180 million a factorization takes).
+It is solved by iteration, slowly for a part this thin (1120 rounds, 49 s: see
+[How large a model](#how-large-a-model)), and gives about 219 MPa (+3 %). Two levels at the default cell
 size (cells of 1.1 mm at the fillet, 367 000 unknowns) take 13 s and give 211.2 MPa (−0.8 %). The
 largest displacement is 0.1549 to 0.1550 mm on every grid of the table but the three of 8 mm
 cells with no levels (0.1499, 0.1538 and 0.1546 mm), and the clamped face carries the 2 kN on
@@ -353,32 +355,46 @@ The unknowns are solved all at once, in one of two ways, and the command chooses
 
 Left to the command, a system under 100,000 unknowns is factored, and so is a larger one
 whose factorization is predicted to be the less work (a thin part); the others are iterated,
-and so is any whose factor would not fit `max_factor_entries`. What the iteration does not
-settle in 400 rounds, such as a nearly incompressible material (Poisson's ratio towards one
-half), is factored after all. The reply's `solver` says which it was, with the `iterations`.
+and so is any whose factor would not fit `max_factor_entries` or whose stiffness has more
+than 180 million entries. The choice is made from the grid, before the stiffness is added
+up, because the two ways keep it differently. What the iteration does not settle in 400
+rounds, such as a nearly incompressible material (Poisson's ratio towards one half), is
+factored after all; a system too large to factor is iterated for up to 2000 rounds. The
+reply's `solver` says which it was, with the `iterations`.
 
 Measured at degree 3 on a desktop processor with 24 threads (i7-13700KF), the whole solve:
 
 | Part | Unknowns | Factorization | Iteration | Chosen |
 |---|---|---|---|---|
-| A solid block, 14 cells along its longest side | 220,000 | 7.4 s, 2.1 GB of factor | 3.9 s, 106 rounds | iteration |
-| The same, 18 cells | 416,000 | 23 s, 5.1 GB | 7.6 s, 106 rounds | iteration |
-| A thick tube, curved, 20 cells across | 340,000 | 10.8 s, 3.1 GB | 5.9 s, 103 rounds | iteration |
-| Three blocks bonded together | 188,000 | 7.6 s, 1.7 GB | 6.9 s, 137 rounds | iteration |
+| A solid block, 14 cells along its longest side | 220,000 | 7.4 s, 2.1 GB of factor | 2.9 s, 106 rounds | iteration |
+| The same, 18 cells | 416,000 | 23 s, 5.1 GB | 5.7 s, 106 rounds | iteration |
+| The same, 24 cells | 974,000 | too large | 14.7 s, 105 rounds | iteration |
+| The same, 36 cells | 3,050,000 | too large | 53 s, 104 rounds | iteration |
+| A thick tube, curved, 20 cells across | 340,000 | 10.8 s, 3.1 GB | 4.4 s, 103 rounds | iteration |
+| Three blocks bonded together | 188,000 | 7.6 s, 1.7 GB | 5.5 s, 137 rounds | iteration |
 | A plate one cell thick, 40 cells along | 167,000 | 1.7 s, 0.5 GB | 2.2 s, 96 rounds | factorization |
 
-Besides the matrix (2.4 GB for the block of 416,000 unknowns) the iteration keeps one small
-factor per cell (0.7 GB), where the factorization keeps its factor (5.1 GB).
+The iteration keeps the stiffness by blocks of three by three, one for every two shape
+functions that couple (76 bytes for nine entries, where the factorization's rows take 144),
+and one small factor per cell: 2.0 GB in all for the block of 416,000 unknowns, 4.7 GB for
+974,000 and 15 GB for 3 million, about 5 GB for every million unknowns of degree 3. Its time
+grows with the unknowns: 15 to 18 s for every million on that processor.
 
-Two limits stop a solve before it takes the machine's memory. `max_factor_entries` caps a
-factor (8 bytes an entry; the default of 400 million is 3.2 GB): of the factorization it
-is the whole factor, and a system above it is iterated; of the iteration it is the small
-factor of the linear functions. The stiffness matrix itself holds at most 180 million entries,
-which a compact part reaches at about 480,000 unknowns of degree 3: a solve above it is
-refused with the number that was reached, or, for several bodies on cells of the command's
-choosing, run again on larger cells with a warning. The trunk space (`"basis": "trunk"`)
-halves the unknowns at degree 3, and a lower `degree` with a level more of `refine` costs
-less than a smaller `cell_size` everywhere.
+The rounds stay near a hundred for a compact part on any grid. They grow for a thin part
+on cells as large as its walls are thick: the 8 mm bracket above takes 124 rounds on cells
+of 2.2 mm, 268 on cells of 4.4 mm and 390 on cells of 8 mm at degree 3, and more at degree
+4. Such a part is factored, which is cheap for it, unless it is too large for that.
+
+Two limits stop a solve before it takes the machine's memory. `max_factor_entries` (8 bytes
+an entry; the default of 400 million is 3.2 GB) caps the factor of the factorization, and a
+system above it is iterated; and it caps the entries of the stiffness the iteration keeps,
+which a compact part reaches at about a million unknowns of degree 3. Raised to 1.2 billion
+on a machine with 32 GB, it lets 3 million unknowns through. The stiffness of a
+factorization holds at most 180 million entries (about 480,000 unknowns of a compact part
+at degree 3). A solve above its limit is refused with the number that was reached, or, for
+several bodies on cells of the command's choosing, run again on larger cells with a
+warning. The trunk space (`"basis": "trunk"`) halves the unknowns at degree 3, and a lower
+`degree` with a level more of `refine` costs less than a smaller `cell_size` everywhere.
 
 ## Narrow gaps: sheet metal corners, slits, fins
 
