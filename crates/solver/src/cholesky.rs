@@ -204,6 +204,27 @@ pub fn predicted(a: &UpperColumns) -> (usize, f64) {
     (counts.iter().sum(), counts.iter().map(|count| 0.5 * (*count as f64) * (*count as f64)).sum())
 }
 
+/// [`predicted`] before the matrix is there: for the matrix of [`BLOCK`] unknowns to a node
+/// whose nodes couple as `adjacency` says (for every node the nodes it couples with, rising,
+/// itself among them: a [`crate::sparse::NodeGraph`]'s), every unknown of a node with every
+/// unknown of the other. A caller that would keep the matrix in another form for another way
+/// to solve it chooses before it adds the matrix up.
+pub fn predicted_of_nodes(adjacency: &[Vec<usize>]) -> (usize, f64) {
+    let mut ptr = Vec::with_capacity(adjacency.len() + 1);
+    ptr.push(0);
+    let mut idx = Vec::new();
+    for (node, row) in adjacency.iter().enumerate() {
+        idx.extend(row.iter().copied().take_while(|other| *other < node));
+        idx.push(node);
+        ptr.push(idx.len());
+    }
+    let blocks: UpperColumns<f64> = UpperColumns { n: adjacency.len(), ptr, idx, val: Vec::new() };
+    let (_, counts) = symbolic_by_columns(&blocks);
+    // Unknown by unknown, as [`symbolic`] counts the columns of the blocks' matrix.
+    let columns = counts.iter().flat_map(|count| (0..BLOCK).map(move |c| (BLOCK * count).saturating_sub(c)));
+    columns.fold((0, 0.0), |(entries, work), count| (entries + count, work + 0.5 * (count as f64) * (count as f64)))
+}
+
 /// The entries of the Cholesky factor of `a`'s pattern, in its own order, without values.
 pub(crate) fn factor_entries<T>(a: &UpperColumns<T>) -> usize {
     symbolic(a).1.iter().sum()
@@ -1794,6 +1815,13 @@ mod tests {
         let blocks = uniform_blocks(&upper).expect("blocks of three");
         assert_eq!((blocks.n, blocks.ptr.len()), (nodes, nodes + 1));
         assert_eq!(symbolic(&upper), symbolic_by_columns(&upper));
+        // What the factor would cost, from the nodes' couplings alone: the same numbers.
+        let adjacency: Vec<Vec<usize>> = (0..nodes).map(|a| (0..nodes).filter(|b| dense[BLOCK * a][BLOCK * b] != 0.0).collect()).collect();
+        let (entries, work) = predicted(&upper);
+        assert_eq!(predicted_of_nodes(&adjacency), (entries, work));
+        assert!(entries > upper.idx.len() && work > 0.0);
+        assert_eq!(predicted_of_nodes(&[]), (0, 0.0));
+        assert_eq!(predicted_of_nodes(&[Vec::new()]), (6, 0.5 * (9.0 + 4.0 + 1.0)), "a node alone: its own block");
         let f = Factor::new(&upper, usize::MAX).unwrap();
         check_solve(&dense_to_csr(&dense), &f, 1e-10);
         // One entry short of a block, one unknown short of whole blocks: column by column.
