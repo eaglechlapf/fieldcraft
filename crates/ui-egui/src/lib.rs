@@ -1265,8 +1265,7 @@ impl ModelApp {
             }
             let was_empty = self.display.1.bounds.is_empty();
             self.display = (Some(self.revision), d);
-            // Bodies with no mesh carry their symbols on their surfaces as drawn here.
-            self.glyphs = self.session.glyphs_on(&body_surfaces(&self.bodies.1));
+            self.glyphs = self.setup_glyphs(None);
             if was_empty && !self.display.1.bounds.is_empty() {
                 self.reframe = framing::Reframe::merge(self.reframe, framing::Reframe::Fit);
             }
@@ -1572,6 +1571,35 @@ impl ModelApp {
         cache.1
     }
 
+    /// The setup's symbols (`step`: of what that solved step used). Bodies with no mesh carry
+    /// theirs on their surfaces as drawn here: the design's bodies as tessellated, and the
+    /// imported surfaces that are shown, their faces named by their tags.
+    fn setup_glyphs(&self, step: Option<&str>) -> Glyphs {
+        let shown: Vec<&fieldcraft_geometry::tagged_mesh::TaggedSurface> =
+            self.session.surfaces.iter().map(|s| &**s).filter(|s| self.session.shows(fieldcraft_engine::ItemKind::Surface, &s.name)).collect();
+        let imported: Vec<(Vec<String>, Vec<[f64; 3]>)> = shown
+            .iter()
+            .map(|s| {
+                (
+                    (0..s.faces).map(|f| f.to_string()).collect(),
+                    s.mesh.positions.iter().map(|p| fieldcraft_engine::units::geometry_point(*p)).collect(),
+                )
+            })
+            .collect();
+        let mut surfaces = body_surfaces(&self.bodies.1);
+        surfaces.extend(shown.iter().zip(&imported).map(|(s, (faces, positions))| fieldcraft_engine::BodySurface {
+            body: &s.name,
+            faces,
+            positions,
+            triangles: &s.mesh.triangles,
+            tri_face: &s.mesh.tri_face,
+        }));
+        match step {
+            Some(step) => self.session.step_glyphs_on(step, &surfaces),
+            None => self.session.glyphs_on(&surfaces),
+        }
+    }
+
     /// The definition selected in the browser, when it has symbols.
     fn highlighted(&self) -> Option<(Definition, &str)> {
         let (def, name) = self.selected.as_ref()?;
@@ -1606,7 +1634,7 @@ impl ModelApp {
             if let Some(step) = step.as_ref().filter(|_| self.ui.result_symbols) {
                 let for_plot = Some((self.revision, step.clone()));
                 if self.step_glyphs.0 != for_plot {
-                    self.step_glyphs = (for_plot, self.session.step_glyphs_on(step, &body_surfaces(&self.bodies.1)));
+                    self.step_glyphs = (for_plot, self.setup_glyphs(Some(step)));
                 }
             }
             let glyphs = if step.is_some() { &self.step_glyphs.1 } else { &self.glyphs };

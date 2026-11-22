@@ -431,6 +431,14 @@ fn display_parts(s: &Session, section: Option<Section>, toward: Vec3) -> (Displa
     for surface in s.surfaces.iter().filter(|x| s.shows(fieldcraft_io::ItemKind::Surface, &x.name)) {
         let positions: Vec<[f64; 3]> = surface.mesh.positions.iter().map(|p| crate::units::geometry_point(*p)).collect();
         d.add_surface(&positions, &surface.mesh.triangles, &surface.mesh.tri_face);
+        // Its faces are named by their tags.
+        surfaces.push(Tessellated {
+            body: surface.name.clone(),
+            faces: (0..surface.faces).map(|face| face.to_string()).collect(),
+            positions,
+            triangles: surface.mesh.triangles.clone(),
+            tri_face: surface.mesh.tri_face.clone(),
+        });
     }
     (d, failed, bodies, surfaces)
 }

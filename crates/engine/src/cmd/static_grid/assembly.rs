@@ -31,7 +31,7 @@ fn compact_unknowns(degree: usize) -> f64 {
 
 /// One body, ready for the solver.
 struct Prepared<'a> {
-    shape: &'a Shape,
+    shape: Solid<'a>,
     material: GridMaterial,
     material_name: &'a str,
     supports: Vec<Support>,
@@ -52,7 +52,7 @@ struct Prepared<'a> {
 
 /// The cylinders, cones, spheres and tori the faces of a body lie on, by face, in the solver's
 /// unit: the geometry's are in millimetres.
-fn curved(shape: &Shape) -> Result<Vec<(u32, Curved)>> {
+fn curved(shape: Solid) -> Result<Vec<(u32, Curved)>> {
     let point = crate::units::geometry_point;
     let surfaces = shape.face_surfaces()?;
     Ok(surfaces
@@ -91,7 +91,7 @@ fn parts_of<'a>(prepared: &'a [Prepared]) -> Vec<Part<'a>> {
 /// The model's connections as the solver's bonds, in their order: each body by its place among
 /// `shapes`, each face by its tag. A free connection comes as a bond too, for its area; the
 /// solver is given none of those.
-fn joints(connections: &[(&str, &Connection)], shapes: &[&Shape], reach: f64) -> Result<Vec<Bond>> {
+fn joints(connections: &[(&str, &Connection)], shapes: &[Solid], reach: f64) -> Result<Vec<Bond>> {
     let fix = "change the connection or delete it (interaction.connection.edit, interaction.connection.delete)";
     let side = |name: &str, faces: &[GeometryRef]| -> Result<(usize, Vec<u32>)> {
         let body = faces.first().map_or("", |face| face.body.as_str());
@@ -268,7 +268,7 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
         let (lo, hi) = (crate::units::geometry_point(measure.bbox_min), crate::units::geometry_point(measure.bbox_max));
         let diagonal = magnitude([hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]]);
         if !(diagonal > 0.0 && diagonal.is_finite()) {
-            return Err(EngineError::Params(format!("body `{}` has no size", short(&shape.name))));
+            return Err(EngineError::Params(format!("body `{}` has no size", short(shape.name))));
         }
         let volume = crate::units::geometry().to_si(Quantity::Volume, measure.volume).unwrap_or(f64::NAN);
         let skin = crate::units::geometry().to_si(Quantity::Area, measure.area).unwrap_or(f64::NAN);
@@ -279,7 +279,7 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let mut prepared: Vec<Prepared> = Vec::with_capacity(shapes.len());
     let mut least = 0.0;
     for (shape, (diagonal, volume, skin)) in shapes.into_iter().zip(sizes) {
-        let (material, material_name) = material(model, &shape.name, &mut warnings)?;
+        let (material, material_name) = material(model, shape.name, &mut warnings)?;
         let supports = supports(model, shape, step, &mut warnings, false)?;
         let length = |key: &str, default: f64, range: std::ops::RangeInclusive<f64>, why: &str| -> Result<f64> {
             let v = super::super::optional_number(p, key, default)?;
@@ -288,7 +288,7 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
             } else {
                 Err(EngineError::invalid(
                     key,
-                    format!("must be a length from {} to {} for body `{}` ({why})", shown(*range.start()), shown(*range.end()), short(&shape.name)),
+                    format!("must be a length from {} to {} for body `{}` ({why})", shown(*range.start()), shown(*range.end()), short(shape.name)),
                 ))
             }
         };
@@ -359,7 +359,7 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::Params(format!(
             "step `{}` holds none of the bodies: none of its boundary conditions supports a face of {}",
             short(&step.name),
-            listed(prepared.iter().map(|body| body.shape.name.as_str()))
+            listed(prepared.iter().map(|body| body.shape.name))
         )));
     }
 
@@ -371,8 +371,8 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
     // Two triangulations of one curved face lie each within its own tolerance of it.
     let reach = 2.0 * prepared.iter().map(|body| body.tolerance).fold(0.0, f64::max);
     let surfaces: Vec<&BoundarySurface> = prepared.iter().map(|body| &body.surface).collect();
-    let shapes: Vec<&Shape> = prepared.iter().map(|body| body.shape).collect();
-    let names: Vec<&str> = shapes.iter().map(|shape| shape.name.as_str()).collect();
+    let shapes: Vec<Solid> = prepared.iter().map(|body| body.shape).collect();
+    let names: Vec<&str> = shapes.iter().map(|shape| shape.name).collect();
     let searched = joined && !model.connections_found();
     let found = if searched {
         let touches = find_bonds(&surfaces, reach).map_err(grid_error)?;
@@ -446,6 +446,10 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
         && prepared.iter().flat_map(|body| &body.supports).all(|s| s.value.iter().zip(s.fixed).all(|(v, fixed)| !fixed || *v == 0.0))
     {
         warnings.push(format!("step `{}` neither loads a body nor moves a support: nothing deforms them", step.name));
+    }
+    let imported = prepared.iter().filter(|body| body.shape.imported()).count();
+    if imported > 0 {
+        warnings.push(imported_note(imported));
     }
 
     fieldcraft_model::progress::stage("grid solve", None, "");
@@ -556,8 +560,8 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
             (a, b) => a.or(b),
         };
         values.extend(own);
-        faces.extend(body.shape.faces().iter().map(|f| f.name.clone()));
-        face_bodies.extend(body.shape.faces().iter().map(|_| body.shape.name.clone()));
+        face_bodies.extend(body.shape.face_names().iter().map(|_| body.shape.name.to_string()));
+        faces.extend(body.shape.face_names());
     }
     let missing = values.iter().filter(|v| v.is_none()).count();
     if missing > 0 {
@@ -596,14 +600,14 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
         if body.thin && rounds == 0 && !left_out {
             warnings.push(format!(
                 "body `{}` is thin for its grid (cells of {}): where a bend or a thin wall carries the load, the deflection can be up to a tenth too small; rounds of refinement (`adapt`) or a smaller `cell_size` show how far the result is from settled",
-                short(&body.shape.name),
+                short(body.shape.name),
                 shown(body.options.cell_size),
             ));
         }
         if solution.stats.holding > 0 && open_gaps {
             warnings.push(format!(
                 "body `{}`: where a narrow gap ends, {} cells still join its two sides over more than five widths of the gap",
-                short(&body.shape.name),
+                short(body.shape.name),
                 solution.stats.holding
             ));
         }
@@ -627,9 +631,9 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let pulls: Vec<[f64; 3]> = applied.iter().chain(&reaction_terms).map(|f| [magnitude(*f); 3]).collect();
     let mut reactions = Vec::new();
     for (body, solution) in prepared.iter().zip(&solutions) {
-        let face_name = |face: u32| body.shape.faces().get(face as usize).map_or_else(|| face.to_string(), |f| f.name.clone());
+        let face_name = |face: u32| body.shape.face_name(face).unwrap_or_else(|| face.to_string());
         reactions.extend(solution.reactions.iter().map(|r| FaceReaction {
-            body: body.shape.name.clone(),
+            body: body.shape.name.to_string(),
             face: face_name(r.face),
             force: settled(r.force, &pulls),
         }));

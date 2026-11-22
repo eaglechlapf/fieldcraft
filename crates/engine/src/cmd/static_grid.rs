@@ -1,5 +1,6 @@
 //! `solve.static.grid`: a linear static step of one body of the open design solved with no
-//! volume mesh, by the finite cell solver on a background grid ([`fieldcraft_fcm`]).
+//! volume mesh, by the finite cell solver on a background grid ([`fieldcraft_fcm`]). A surface
+//! mesh that was imported is a body too ([`Solid`]).
 //!
 //! The command reads what a mesh solve reads, without the mesh: the body's tessellation (the
 //! solver's whole knowledge of the geometry), the material of the body's solid section, and the
@@ -17,7 +18,7 @@ use fieldcraft_fcm::{
     Basis, Bond, Curved, Grip, Load as GridLoad, Material as GridMaterial, Motion, Options, Part, Solution, Solver, Support, assembly_unknowns,
     bond_areas, find_bonds, free_motions, solve_assembly,
 };
-use fieldcraft_geometry::{FaceSurface, Shape};
+use fieldcraft_geometry::FaceSurface;
 use fieldcraft_mesh::surface::{BoundarySurface, SurfaceOptions};
 use fieldcraft_model::units::Quantity;
 use fieldcraft_model::{
@@ -37,10 +38,10 @@ use crate::{CommandKind, CommandSpec, EngineError, Result, Session, StepResult};
 pub const STATIC_GRID: CommandSpec = CommandSpec {
     id: "solve.static.grid",
     label: "Solve Static Step on a Grid",
-    params: r#"{"step": "Load", "body": "Bracket", "cell_size": 4.0, "degree": 3, "basis": "auto", "refine": 1, "adapt": "auto", "settle": 0.05, "gaps": "open", "check_convergence": false, "connections": "model", "solver": "auto", "tolerance": 0.05, "sample_size": 1.0, "max_dofs": 6000000, "max_factor_entries": 400000000, "threads": 8} — solves a linear static step (the only one when `step` is left out) for one body of the open design, or for all its bodies together when `body` is left out, with no volume mesh, by the finite cell method. Several bodies are solved in one system, each on a grid of its own (when `cell_size` is left out, cells of a twentieth of its own diagonal, all larger by one factor when the bodies would otherwise have more unknowns between them than one compact body has at a twentieth, and larger again, with a warning, when a limit is still reached) with the material of its own section, and hold each other by the model's connections (`"connections": "model"`, the default; interaction.connection): where the faces a connection names touch, also in part, the two bodies are `bonded` (they move together) or `sliding` (they keep touching and slide along each other without friction; a face on a cylinder, a cone, a sphere or a torus slides along that surface, so a pin slides and turns in its hole), and a `free` connection joins nothing. A model that was never searched for connections is searched first: every two bodies whose faces lie on each other get a bonded connection, which the solve leaves in the model (`connections_added` names them) to be changed or deleted afterwards; later solves add none. The reply lists every connection under `connections` (`name`, `kind`, `bodies`, `faces` and the `area` over which the faces touch; one that joins nothing gets a warning); with `"connections": "none"` no body holds another and the model is left as it is. Every body must be held against sliding and turning, by boundary conditions of its own and by connections to bodies that are held: a solve that leaves a body a way to move is refused, naming the body and the way (a sliding connection holds only across its faces). The step's boundary conditions and loads may act on faces of any of the bodies (a total force on the faces of one). The reply then has `bodies` (each with its `cell_size`, `basis`, `unknowns`, `cells`, `levels`, `volume` and `strain_energy`) in place of one body's fields, and its `reactions` name the body of each face. `adapt` and `check_convergence` work on all the bodies together: a round divides the cells the assembly is least resolved in, in whichever body they are, and solves all of it again, until a round moves the strain energy of all the bodies by no more than `settle` (`"adapt": "auto"` runs up to two rounds when any body is thin for its grid); `convergence` compares with the solve of every body one degree lower, over the sampled points of all of them. For one body: the body's surface, triangulated within `tolerance` (a length; default 1/250 of the smallest cell, `cell_size` halved once for every level of `refine` and round of `adapt`, and at most 1e-3 of the body's bounding-box diagonal), is embedded in a grid of cubic cells of `cell_size` (a length; default 1/20 of the diagonal) carrying shape functions of polynomial `degree` (1 to 8, default 3): with `"basis": "tensor"` every product of the polynomials along the three axes up to the degree, with `"trunk"` only those of total degree up to it (half the unknowns a cell at degree 3; less accurate cell for cell, and as accurate in less time where the cells are divided), and with `"auto"`, the default, the trunk space for a body that is thin for its grid and the tensor product otherwise; the reply's `basis` names the one used. With `refine` (0 to 6 levels, default 1) a cell across which the surface is curved more tightly than it resolves (fewer than two cells to the radius of a fillet or hole at degree 4, four at degree 3) is divided into eight, level by level, so a coarse grid resolves a small feature without fine cells everywhere; `levels` in the reply counts the cells of each level. `refine` sees what the surface shows, not where the load goes: with `adapt` (0 to 6 rounds) the step is solved, the cells the solution is least resolved in are divided, and it is solved again, each round a whole solve; the rounds end early once one moves the solution by no more than `settle` (a fraction, default 0.05: the distance between two rounds' solutions in the energy norm, which is a change of the strain energy of 0.25 %; 0 runs every round), and a round too large to solve is left out. `"adapt": "auto"`, the default, runs up to two rounds for a body that is thin for its grid (a cell more than four of its mean thicknesses across: sheet metal, where a bend carries the load on cells far wider than the sheet is thick) and none otherwise; a round takes the cells it leaves as they are from the round before. The reply's `adapt` counts the rounds run, `settled` is the change of the strain energy in the last one, as a fraction (null without a round), and `thin` says whether the body is thin for the grid; a warning tells when the result was still changing as the rounds ended. Material on the two sides of a gap that is narrower than a cell (the open corner of a sheet metal part, a slit, the fins of a heat sink) is kept apart, as it is in the part, with unknowns of its own on each side, and the cells where such a gap ends are divided (up to four times) until they are no more than two and a half widths of the gap across, so that the cell at the root holds the two sides together over no more than that; `gap_cells` in the reply counts the cells that hold several such pieces. `"gaps": "joined"` solves the part as if every such gap were welded shut wherever a cell reaches across it. The body takes the isotropic elastic material of its solid section (a section on a set that names the body); the step's boundary conditions fix displacement components of whole faces (fixed, displacement, symmetry about a global plane) and its loads act on whole faces (force as a total, traction, pressure) or on the body (gravity): each must act on a set of geometry faces of this body. Refused, changing nothing: another kind of boundary condition or load, a set of nodes, elements, edges or vertices, a reference point, an orthotropic material, a cell of a partitioned body, and a model with contacts, ties, couplings, point masses or springs. Keeps the result in the session, sampled at the vertices of the body's surface refined to `sample_size` (a length; default `cell_size`/`degree`; where cells are divided, as much finer as the cells are), where results.contour, results.deformed and solve.probe read it (its points are labelled above every mesh label); it is not written to model files. Returns the `unknowns`, the `cells` that hold material (under `grid` the grid's `cells` along x, y and z, those `inside` the part and those its surface `cut`s), the run time in `seconds`, the largest von Mises stress and displacement with where they are (`at`, and the `face`), the reaction of every supported face, the applied and reaction totals, the `volume` the solver integrated against the surface's (`surface_volume`), the strain energy and `warnings`. With `check_convergence` (degree 2 or more) the step is also solved one degree lower on the same grid, and `convergence` gives how far the two solutions are apart, each a fraction: `peak_von_mises` (the change of the largest von Mises stress over the sampled points), `von_mises` (the largest change at any one point, of the peak) and `strain_energy`; an indicator of convergence, not a bound of the error. `solver` chooses how the unknowns are solved for: `"direct"` by the sparse factorization, whose result is the same to the last digit on every machine and whose work grows with the square of the unknowns of a compact part; `"iterative"` by taking the unknowns every cell has to itself out exactly and solving the rest by conjugate gradients with a two-level preconditioner (the linear shape functions, and the shape functions around every vertex of the grid), whose work grows with the unknowns and whose result is right to a residual of 1e-9 of the load (displacements to about nine digits); `"auto"`, the default, the factorization for systems under 50,000 unknowns and for those it is predicted to solve in less work, the iteration for the others and for those whose factor would not fit `max_factor_entries` or whose stiffness has more than 180 million entries; the iteration takes a stiffness of as many entries as `max_factor_entries` allows a factor (about 5 GB of memory and 7 to 9 s for every million unknowns of a compact part at degree 3). It takes 30 to 40 rounds where no cell is divided, on thin parts as on compact ones, and a hundred to a few hundred where divided cells lie beside undivided ones. What it does not settle in 400 rounds (a material that hardly changes its volume at all) is factored after all, and what is too large to factor is iterated for up to 2000 rounds. The reply's `solver` says which solved it (`"factorization"` or `"iteration"`), with the `iterations` and the `residual` they ended at. `max_dofs` caps the unknowns and may only be lowered; `max_factor_entries` and `threads` as for solve.static. A stress peak at a hole or a fillet is within about 1 % with two cells per radius of the smallest stressed feature at degree 4, or four at degree 3, which `refine` gives where the surface is curved; displacements and reactions need far less (docs/grid-static.md)"#,
+    params: r#"{"step": "Load", "body": "Bracket", "cell_size": 4.0, "degree": 3, "basis": "auto", "refine": 1, "adapt": "auto", "settle": 0.05, "gaps": "open", "check_convergence": false, "connections": "model", "solver": "auto", "tolerance": 0.05, "sample_size": 1.0, "max_dofs": 6000000, "max_factor_entries": 400000000, "threads": 8} — solves a linear static step (the only one when `step` is left out) for one body of the open design, or for all its bodies together when `body` is left out, with no volume mesh, by the finite cell method. Imported surface meshes (geometry.import.mesh: closed surfaces whose triangles carry face tags, from any CAD system) are bodies as well, their faces named by their tags (`"0"`, `"1"`, …) and their curved faces as fine as the file's triangles, whatever `tolerance` (the reply warns). Several bodies are solved in one system, each on a grid of its own (when `cell_size` is left out, cells of a twentieth of its own diagonal, all larger by one factor when the bodies would otherwise have more unknowns between them than one compact body has at a twentieth, and larger again, with a warning, when a limit is still reached) with the material of its own section, and hold each other by the model's connections (`"connections": "model"`, the default; interaction.connection): where the faces a connection names touch, also in part, the two bodies are `bonded` (they move together) or `sliding` (they keep touching and slide along each other without friction; a face on a cylinder, a cone, a sphere or a torus slides along that surface, so a pin slides and turns in its hole), and a `free` connection joins nothing. A model that was never searched for connections is searched first: every two bodies whose faces lie on each other get a bonded connection, which the solve leaves in the model (`connections_added` names them) to be changed or deleted afterwards; later solves add none. The reply lists every connection under `connections` (`name`, `kind`, `bodies`, `faces` and the `area` over which the faces touch; one that joins nothing gets a warning); with `"connections": "none"` no body holds another and the model is left as it is. Every body must be held against sliding and turning, by boundary conditions of its own and by connections to bodies that are held: a solve that leaves a body a way to move is refused, naming the body and the way (a sliding connection holds only across its faces). The step's boundary conditions and loads may act on faces of any of the bodies (a total force on the faces of one). The reply then has `bodies` (each with its `cell_size`, `basis`, `unknowns`, `cells`, `levels`, `volume` and `strain_energy`) in place of one body's fields, and its `reactions` name the body of each face. `adapt` and `check_convergence` work on all the bodies together: a round divides the cells the assembly is least resolved in, in whichever body they are, and solves all of it again, until a round moves the strain energy of all the bodies by no more than `settle` (`"adapt": "auto"` runs up to two rounds when any body is thin for its grid); `convergence` compares with the solve of every body one degree lower, over the sampled points of all of them. For one body: the body's surface, triangulated within `tolerance` (a length; default 1/250 of the smallest cell, `cell_size` halved once for every level of `refine` and round of `adapt`, and at most 1e-3 of the body's bounding-box diagonal), is embedded in a grid of cubic cells of `cell_size` (a length; default 1/20 of the diagonal) carrying shape functions of polynomial `degree` (1 to 8, default 3): with `"basis": "tensor"` every product of the polynomials along the three axes up to the degree, with `"trunk"` only those of total degree up to it (half the unknowns a cell at degree 3; less accurate cell for cell, and as accurate in less time where the cells are divided), and with `"auto"`, the default, the trunk space for a body that is thin for its grid and the tensor product otherwise; the reply's `basis` names the one used. With `refine` (0 to 6 levels, default 1) a cell across which the surface is curved more tightly than it resolves (fewer than two cells to the radius of a fillet or hole at degree 4, four at degree 3) is divided into eight, level by level, so a coarse grid resolves a small feature without fine cells everywhere; `levels` in the reply counts the cells of each level. `refine` sees what the surface shows, not where the load goes: with `adapt` (0 to 6 rounds) the step is solved, the cells the solution is least resolved in are divided, and it is solved again, each round a whole solve; the rounds end early once one moves the solution by no more than `settle` (a fraction, default 0.05: the distance between two rounds' solutions in the energy norm, which is a change of the strain energy of 0.25 %; 0 runs every round), and a round too large to solve is left out. `"adapt": "auto"`, the default, runs up to two rounds for a body that is thin for its grid (a cell more than four of its mean thicknesses across: sheet metal, where a bend carries the load on cells far wider than the sheet is thick) and none otherwise; a round takes the cells it leaves as they are from the round before. The reply's `adapt` counts the rounds run, `settled` is the change of the strain energy in the last one, as a fraction (null without a round), and `thin` says whether the body is thin for the grid; a warning tells when the result was still changing as the rounds ended. Material on the two sides of a gap that is narrower than a cell (the open corner of a sheet metal part, a slit, the fins of a heat sink) is kept apart, as it is in the part, with unknowns of its own on each side, and the cells where such a gap ends are divided (up to four times) until they are no more than two and a half widths of the gap across, so that the cell at the root holds the two sides together over no more than that; `gap_cells` in the reply counts the cells that hold several such pieces. `"gaps": "joined"` solves the part as if every such gap were welded shut wherever a cell reaches across it. The body takes the isotropic elastic material of its solid section (a section on a set that names the body); the step's boundary conditions fix displacement components of whole faces (fixed, displacement, symmetry about a global plane) and its loads act on whole faces (force as a total, traction, pressure) or on the body (gravity): each must act on a set of geometry faces of this body. Refused, changing nothing: another kind of boundary condition or load, a set of nodes, elements, edges or vertices, a reference point, an orthotropic material, a cell of a partitioned body, and a model with contacts, ties, couplings, point masses or springs. Keeps the result in the session, sampled at the vertices of the body's surface refined to `sample_size` (a length; default `cell_size`/`degree`; where cells are divided, as much finer as the cells are), where results.contour, results.deformed and solve.probe read it (its points are labelled above every mesh label); it is not written to model files. Returns the `unknowns`, the `cells` that hold material (under `grid` the grid's `cells` along x, y and z, those `inside` the part and those its surface `cut`s), the run time in `seconds`, the largest von Mises stress and displacement with where they are (`at`, and the `face`), the reaction of every supported face, the applied and reaction totals, the `volume` the solver integrated against the surface's (`surface_volume`), the strain energy and `warnings`. With `check_convergence` (degree 2 or more) the step is also solved one degree lower on the same grid, and `convergence` gives how far the two solutions are apart, each a fraction: `peak_von_mises` (the change of the largest von Mises stress over the sampled points), `von_mises` (the largest change at any one point, of the peak) and `strain_energy`; an indicator of convergence, not a bound of the error. `solver` chooses how the unknowns are solved for: `"direct"` by the sparse factorization, whose result is the same to the last digit on every machine and whose work grows with the square of the unknowns of a compact part; `"iterative"` by taking the unknowns every cell has to itself out exactly and solving the rest by conjugate gradients with a two-level preconditioner (the linear shape functions, and the shape functions around every vertex of the grid), whose work grows with the unknowns and whose result is right to a residual of 1e-9 of the load (displacements to about nine digits); `"auto"`, the default, the factorization for systems under 50,000 unknowns and for those it is predicted to solve in less work, the iteration for the others and for those whose factor would not fit `max_factor_entries` or whose stiffness has more than 180 million entries; the iteration takes a stiffness of as many entries as `max_factor_entries` allows a factor (about 5 GB of memory and 7 to 9 s for every million unknowns of a compact part at degree 3). It takes 30 to 40 rounds where no cell is divided, on thin parts as on compact ones, and a hundred to a few hundred where divided cells lie beside undivided ones. What it does not settle in 400 rounds (a material that hardly changes its volume at all) is factored after all, and what is too large to factor is iterated for up to 2000 rounds. The reply's `solver` says which solved it (`"factorization"` or `"iteration"`), with the `iterations` and the `residual` they ended at. `max_dofs` caps the unknowns and may only be lowered; `max_factor_entries` and `threads` as for solve.static. A stress peak at a hole or a fillet is within about 1 % with two cells per radius of the smallest stressed feature at degree 4, or four at degree 3, which `refine` gives where the surface is curved; displacements and reactions need far less (docs/grid-static.md)"#,
     form: Some(super::forms::SOLVE_STATIC_GRID),
     kind: CommandKind::Model,
-    requires: &[Requirement::Design, Requirement::Material, Requirement::Section, Requirement::Step],
+    requires: &[Requirement::Geometry, Requirement::Material, Requirement::Section, Requirement::Step],
     run,
 };
 
@@ -147,11 +148,11 @@ fn solved_by(iterations: usize) -> &'static str {
 }
 
 /// The diagonal of a body's bounding box, in the model's unit (the geometry's is millimetres).
-pub(super) fn diagonal(shape: &Shape) -> Result<f64> {
+pub(super) fn diagonal(shape: Solid) -> Result<f64> {
     let measure = shape.measure()?;
     let (lo, hi) = (crate::units::geometry_point(measure.bbox_min), crate::units::geometry_point(measure.bbox_max));
     let diagonal = magnitude([hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]]);
-    if diagonal > 0.0 && diagonal.is_finite() { Ok(diagonal) } else { Err(EngineError::Params(format!("body `{}` has no size", short(&shape.name)))) }
+    if diagonal > 0.0 && diagonal.is_finite() { Ok(diagonal) } else { Err(EngineError::Params(format!("body `{}` has no size", short(shape.name)))) }
 }
 
 /// The tolerance a body of this diagonal is triangulated within when nothing is asked for: that
@@ -163,12 +164,18 @@ pub(super) fn default_tolerance(diagonal: f64) -> f64 {
 
 /// A body's surface, triangulated within `tolerance` (a length of the model), as the solver
 /// takes it.
-pub(super) fn surface(shape: &Shape, tolerance: f64) -> Result<BoundarySurface> {
+pub(super) fn surface(shape: Solid, tolerance: f64) -> Result<BoundarySurface> {
     let mesh = shape.tessellate(crate::units::to_geometry_length(tolerance))?;
     let positions: Vec<[f64; 3]> = mesh.positions.iter().map(|p| crate::units::geometry_point(*p)).collect();
     let options = SurfaceOptions { weld_distance: crate::units::geometry_length(mesh.weld_distance), ..SurfaceOptions::default() };
     BoundarySurface::new(&positions, &mesh.triangles, &mesh.tri_face, &options)
-        .map_err(|e| EngineError::context(format!("body `{}`: its surface cannot bound a solid", short(&shape.name)), e))
+        .map_err(|e| EngineError::context(format!("body `{}`: its surface cannot bound a solid", short(shape.name)), e))
+}
+
+/// What a reply says of bodies that are imported surface meshes.
+pub(super) fn imported_note(bodies: usize) -> String {
+    let which = if bodies == 1 { "the body is an imported surface mesh: its" } else { "the bodies are imported surface meshes: their" };
+    format!("{which} curved faces are as fine as the file's triangles, whatever `tolerance` is asked for")
 }
 
 /// The solver's error as the engine's: its kinds are the implicit solver's.
@@ -194,32 +201,29 @@ pub(super) fn grid_error(e: fieldcraft_fcm::Error) -> EngineError {
 
 /// The bodies to solve: `body`, or every body of the design. A cell of a partitioned body is
 /// refused: its cut faces join it to its neighbours, which a solve of the cell alone leaves free.
-fn bodies<'a>(s: &'a Session, p: &Value) -> Result<Vec<&'a Shape>> {
-    let design = s.design.as_deref().ok_or_else(|| EngineError::Params("no design is open (geometry.open)".into()))?;
-    let shapes: Vec<&Shape> = match opt::<String>(p, "body")? {
-        Some(name) => vec![design.body(&name).ok_or_else(|| {
-            EngineError::invalid(
-                "body",
-                format!("the open design has no body `{}` (its bodies: {})", short(&name), listed(design.bodies.iter().map(|b| b.name.as_str()))),
-            )
-        })?],
-        None => design.bodies.iter().collect(),
-    };
-    if shapes.is_empty() {
-        return Err(EngineError::Params("the open design has no bodies".into()));
+fn bodies<'a>(s: &'a Session, p: &Value) -> Result<Vec<Solid<'a>>> {
+    let all = Solid::all(s);
+    if all.is_empty() {
+        return Err(EngineError::Params("there is no body: open a design (geometry.open) or import a surface mesh (geometry.import.mesh)".into()));
     }
+    let shapes: Vec<Solid> = match opt::<String>(p, "body")? {
+        Some(name) => vec![all.iter().copied().find(|body| body.name == name).ok_or_else(|| {
+            EngineError::invalid("body", format!("there is no body `{}` (the bodies: {})", short(&name), listed(all.iter().map(|b| b.name))))
+        })?],
+        None => all,
+    };
     if shapes.len() > fieldcraft_fcm::assembly::MAX_PARTS {
         return Err(refused(format!(
-            "the design has {} bodies; the grid solves up to {} together (name one `body`)",
+            "there are {} bodies; the grid solves up to {} together (name one `body`)",
             shapes.len(),
             fieldcraft_fcm::assembly::MAX_PARTS
         )));
     }
     for shape in &shapes {
-        if let Some(source) = design.source_of(&shape.name).filter(|source| *source != shape.name) {
+        if let Some(source) = s.design.as_deref().and_then(|design| design.source_of(shape.name)).filter(|source| *source != shape.name) {
             return Err(refused(format!(
                 "body `{}` is a cell of the partitioned body `{}`: its cut faces join it to the other cells, and the grid solves a whole body on its own (suppress or delete the partition)",
-                short(&shape.name),
+                short(shape.name),
                 short(source)
             )));
         }
@@ -293,7 +297,7 @@ fn material<'a>(model: &'a Model, body: &str, warnings: &mut Vec<String>) -> Res
 /// `what` ("boundary condition `Clamp`"). The set must name whole faces of this body and
 /// nothing else; with `alone` off (several bodies are solved) it may name faces of other
 /// bodies as well, and none of this one.
-fn faces(model: &Model, shape: &Shape, set: &str, what: &str, alone: bool) -> Result<Vec<u32>> {
+fn faces(model: &Model, shape: Solid, set: &str, what: &str, alone: bool) -> Result<Vec<u32>> {
     let definition = model.set(set).ok_or_else(|| EngineError::Params(format!("{what}: no set `{}`", short(set))))?;
     if !(definition.nodes.is_empty() && definition.elements.is_empty() && definition.faces.is_empty() && definition.edges.is_empty()) {
         return Err(refused(format!(
@@ -312,7 +316,7 @@ fn faces(model: &Model, shape: &Shape, set: &str, what: &str, alone: bool) -> Re
                 "{what}: set `{}` names body `{}`; the grid solves body `{}` on its own",
                 short(set),
                 short(&g.body),
-                short(&shape.name)
+                short(shape.name)
             )));
         }
         let Entity::Face(face) = &g.entity else {
@@ -323,13 +327,13 @@ fn faces(model: &Model, shape: &Shape, set: &str, what: &str, alone: bool) -> Re
             )));
         };
         let before = out.len();
-        for (index, f) in shape.faces().iter().enumerate() {
-            if GeometryRef::face(shape.name.as_str(), f.name.as_str()).is_ok_and(|tag| g.selects(&tag)) {
+        for (index, name) in shape.face_names().iter().enumerate() {
+            if GeometryRef::face(shape.name, name.as_str()).is_ok_and(|tag| g.selects(&tag)) {
                 out.push(u32::try_from(index).map_err(|_| EngineError::Params("the body has too many faces".into()))?);
             }
         }
         if out.len() == before {
-            return Err(EngineError::Params(format!("{what}: body `{}` has no face `{}`", short(&shape.name), short(face))));
+            return Err(EngineError::Params(format!("{what}: body `{}` has no face `{}`", short(shape.name), short(face))));
         }
     }
     if out.is_empty() && (alone || definition.geometry.is_empty()) {
@@ -358,7 +362,7 @@ struct Held<'a> {
 }
 
 /// The step's boundary conditions as supports of faces, one per face.
-fn supports(model: &Model, shape: &Shape, step: &Step, warnings: &mut Vec<String>, alone: bool) -> Result<Vec<Support>> {
+fn supports(model: &Model, shape: Solid, step: &Step, warnings: &mut Vec<String>, alone: bool) -> Result<Vec<Support>> {
     let mut held: BTreeMap<u32, Held> = BTreeMap::new();
     for name in &step.boundary_conditions {
         let Some(bc) = model.boundary_condition(name) else { continue };
@@ -397,7 +401,7 @@ fn supports(model: &Model, shape: &Shape, step: &Step, warnings: &mut Vec<String
                         short(by),
                         short(name),
                         k + 1,
-                        short(shape.faces().get(face as usize).map_or("", |f| f.name.as_str()))
+                        short(&shape.face_name(face).unwrap_or_default())
                     )));
                 }
                 (*fixed, *value, *by) = (true, v, name.as_str());
@@ -408,7 +412,7 @@ fn supports(model: &Model, shape: &Shape, step: &Step, warnings: &mut Vec<String
         return Err(EngineError::Params(format!(
             "step `{}` holds body `{}` nowhere: none of its boundary conditions supports a face of the body",
             short(&step.name),
-            short(&shape.name)
+            short(shape.name)
         )));
     }
     Ok(held.into_iter().map(|(face, h)| Support { face, fixed: h.fixed, value: h.value }).collect())
@@ -434,7 +438,7 @@ fn face_areas(surface: &BoundarySurface) -> BTreeMap<u32, (f64, [f64; 3])> {
 /// (which needs the volume the solver integrates): one force per loaded face.
 fn loads(
     model: &Model,
-    shape: &Shape,
+    shape: Solid,
     step: &Step,
     areas: &BTreeMap<u32, (f64, [f64; 3])>,
     density: f64,
@@ -466,7 +470,7 @@ fn loads(
                 {
                     return Err(refused(format!(
                         "{what} acts on faces of bodies `{}` and `{}`: a total force is given to the faces of one body (one load for each body)",
-                        short(&shape.name),
+                        short(shape.name),
                         short(&other.body)
                     )));
                 }
@@ -728,7 +732,7 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::invalid("check_convergence", "compares with the solution one degree lower: it needs a degree of 2 or more"));
     }
     let shapes = bodies(s, p)?;
-    let [shape] = shapes.as_slice() else {
+    let [shape] = *shapes.as_slice() else {
         // Several bodies: solved together, bonded where they touch.
         return assembly::run(s, p);
     };
@@ -736,7 +740,7 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let step = model.select_step(opt::<String>(p, "step")?.as_deref(), |procedure| matches!(procedure, Procedure::Static {}), "static")?;
     refuse_interactions(model)?;
     let mut warnings = Vec::new();
-    let (material, material_name) = material(model, &shape.name, &mut warnings)?;
+    let (material, material_name) = material(model, shape.name, &mut warnings)?;
     let supports = supports(model, shape, step, &mut warnings, true)?;
 
     // Sizes: the geometry is in millimetres, the model and the solver in SI.
@@ -744,7 +748,7 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let (lo, hi) = (crate::units::geometry_point(measure.bbox_min), crate::units::geometry_point(measure.bbox_max));
     let diagonal = magnitude([hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]]);
     if !(diagonal > 0.0 && diagonal.is_finite()) {
-        return Err(EngineError::Params(format!("body `{}` has no size", short(&shape.name))));
+        return Err(EngineError::Params(format!("body `{}` has no size", short(shape.name))));
     }
     // A length parameter within `range`, which the message shows in the display units with why.
     let shown = |v: f64| crate::units::shown(s.units(), crate::units::si(), Quantity::Length, v);
@@ -787,7 +791,7 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let positions: Vec<[f64; 3]> = mesh.positions.iter().map(|p| crate::units::geometry_point(*p)).collect();
     let options = SurfaceOptions { weld_distance: crate::units::geometry_length(mesh.weld_distance), ..SurfaceOptions::default() };
     let surface = BoundarySurface::new(&positions, &mesh.triangles, &mesh.tri_face, &options)
-        .map_err(|e| EngineError::context(format!("body `{}`: its surface cannot bound a solid", short(&shape.name)), e))?;
+        .map_err(|e| EngineError::context(format!("body `{}`: its surface cannot bound a solid", short(shape.name)), e))?;
     let areas = face_areas(&surface);
     let (loads, mut applied) = loads(model, shape, step, &areas, material.density, material_name, true)?;
     if loads.is_empty() && supports.iter().all(|s| s.value.iter().zip(s.fixed).all(|(v, fixed)| !fixed || *v == 0.0)) {
@@ -847,14 +851,14 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     let sum = |terms: &[[f64; 3]]| terms.iter().fold([0.0; 3], |t, f| [t[0] + f[0], t[1] + f[1], t[2] + f[2]]);
-    let face_name = |face: u32| shape.faces().get(face as usize).map_or_else(|| face.to_string(), |f| f.name.clone());
+    let face_name = |face: u32| shape.face_name(face).unwrap_or_else(|| face.to_string());
     // Round-off is read against everything that pulls on the part, loads and reactions alike,
     // whatever its direction: a component below a billionth of their magnitudes is 0.
     let pulls: Vec<[f64; 3]> = applied.iter().chain(solution.reactions.iter().map(|r| &r.force)).map(|f| [magnitude(*f); 3]).collect();
     let reactions: Vec<FaceReaction> = solution
         .reactions
         .iter()
-        .map(|r| FaceReaction { body: shape.name.clone(), face: face_name(r.face), force: settled(r.force, &pulls) })
+        .map(|r| FaceReaction { body: shape.name.to_string(), face: face_name(r.face), force: settled(r.force, &pulls) })
         .collect();
     let reaction_terms: Vec<[f64; 3]> = solution.reactions.iter().map(|r| r.force).collect();
     let (applied_total, reaction_total) = (settled(sum(&applied), &pulls), settled(sum(&reaction_terms), &pulls));
@@ -909,17 +913,19 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
             stats.holding
         ));
     }
-    let design_bodies = s.design.as_deref().map_or(0, |d| d.bodies.len());
-    if design_bodies > 1 {
-        warnings
-            .push(format!("the design has {design_bodies} bodies: body `{}` was solved on its own, free wherever it touches another", shape.name));
+    let all_bodies = Solid::all(s).len();
+    if all_bodies > 1 {
+        warnings.push(format!("there are {all_bodies} bodies: body `{}` was solved on its own, free wherever it touches another", shape.name));
+    }
+    if shape.imported() {
+        warnings.push(imported_note(1));
     }
 
     let nodes: Vec<u32> = (0..values.len()).map(|v| GRID_LABELS.saturating_add(u32::try_from(v).unwrap_or(u32::MAX))).collect();
     let stress: Vec<[f64; 6]> = values.iter().map(|v| v.map_or([f64::NAN; 6], |(_, s)| s)).collect();
     let (shown, tri_face) = display(&sampled);
     let result = GridResult {
-        body: shape.name.clone(),
+        body: shape.name.to_string(),
         result: fieldcraft_solver::StepResult::Static(StaticResult {
             step: step.name.clone(),
             nodes,
@@ -945,8 +951,8 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
         }),
         display: shown,
         tri_face,
-        faces: shape.faces().iter().map(|f| f.name.clone()).collect(),
-        face_bodies: shape.faces().iter().map(|_| shape.name.clone()).collect(),
+        face_bodies: shape.face_names().iter().map(|_| shape.name.to_string()).collect(),
+        faces: shape.face_names(),
         reactions,
     };
     let fieldcraft_solver::StepResult::Static(sampled_values) = &result.result else {
@@ -1017,5 +1023,7 @@ fn sample(solution: &Solution, points: &[[f64; 3]]) -> Vec<Option<([f64; 3], [f6
 }
 
 mod assembly;
+mod solid;
+pub(super) use solid::Solid;
 #[cfg(test)]
 mod tests;

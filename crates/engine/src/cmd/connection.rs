@@ -10,8 +10,8 @@
 
 use std::collections::BTreeSet;
 
+use super::static_grid::Solid;
 use fieldcraft_fcm::{Touch, find_bonds};
-use fieldcraft_geometry::Shape;
 use fieldcraft_mesh::surface::BoundarySurface;
 use fieldcraft_model::{Connection, ConnectionKind, GeometryRef, MAX_NAME_LEN, Model, suggest_name};
 use serde_json::{Value, json};
@@ -83,20 +83,24 @@ pub const FIND: CommandSpec = CommandSpec {
     params: r#"{"tolerance": 0.05 (a length: faces closer than this touch; default 1/5000 of the largest body's bounding-box diagonal, twice what a solve at its defaults triangulates that body within), "kind": "bonded" | "sliding" | "free" (of the connections it adds; default bonded)} — looks for the faces of every two bodies of the open design that lie on each other, facing each other: flat faces that touch, also in part, and curved ones (a pin in its hole) within the tolerance; an edge or a corner resting on a face is none. For the touching faces of two bodies that no connection joins yet a connection is added, named after the two bodies; connections that are there stay as they are, whatever their kind. Replies the names `added` and every connection of the model (`name`, `kind`, `bodies`, `faces`). A solve of several bodies on a grid runs this once by itself, on a model that was never searched; run it again after the design changed, or to get back connections that were deleted"#,
     form: Some(super::forms::CONNECTION_FIND),
     kind: CommandKind::Model,
-    requires: &[Requirement::Design],
+    requires: &[Requirement::Geometry],
     run: find,
 };
 
-/// Refuse a connection that names a body or a face the open design does not have.
+/// Refuse a connection that names a body or a face the geometry (the open design, or the
+/// imported surface meshes) does not have.
 fn in_design(s: &Session, connection: &Connection) -> Result<()> {
-    let Some(design) = s.design.as_deref() else { return Ok(()) };
+    let bodies = Solid::all(s);
+    if bodies.is_empty() {
+        return Ok(());
+    }
     for (key, side) in [("first", &connection.first), ("second", &connection.second)] {
         for face in side {
-            let Some(shape) = design.body(&face.body) else {
-                return Err(EngineError::invalid(key, format!("the open design has no body `{}`", cut(&face.body))));
+            let Some(shape) = bodies.iter().find(|body| body.name == face.body) else {
+                return Err(EngineError::invalid(key, format!("there is no body `{}`", cut(&face.body))));
             };
             if let Some(named) = face.entity.name()
-                && !shape.faces().is_empty()
+                && !shape.face_names().is_empty()
                 && shape.face_index(named).is_none()
             {
                 return Err(EngineError::invalid(key, format!("body `{}` has no face `{}`", cut(&face.body), cut(named))));
@@ -126,13 +130,11 @@ pub(super) fn listed(name: &str, connection: &Connection) -> Value {
 /// The connections to add for faces that touch: for every two bodies of `shapes` (in the order
 /// of the surfaces the `touches` were found on), one that joins the pairs of faces no
 /// connection of the model joins yet, of the kind `kind`, under a name of its own.
-pub(super) fn new_connections(model: &Model, shapes: &[&Shape], touches: &[Touch], kind: ConnectionKind) -> Result<Vec<(String, Connection)>> {
+pub(super) fn new_connections(model: &Model, shapes: &[Solid], touches: &[Touch], kind: ConnectionKind) -> Result<Vec<(String, Connection)>> {
     let mut added: Vec<(String, Connection)> = Vec::new();
     for touch in touches {
         let (Some(a), Some(b)) = (shapes.get(touch.bond.first.0), shapes.get(touch.bond.second.0)) else { continue };
-        let face = |shape: &Shape, tag: u32| {
-            shape.faces().get(tag as usize).and_then(|face| GeometryRef::face(shape.name.as_str(), face.name.as_str()).ok())
-        };
+        let face = |shape: &Solid, tag: u32| shape.face_name(tag).and_then(|name| GeometryRef::face(shape.name, name.as_str()).ok());
         let (mut first, mut second) = (BTreeSet::new(), BTreeSet::new());
         for (fa, fb, _) in &touch.pairs {
             let (Some(on_a), Some(on_b)) = (face(a, *fa), face(b, *fb)) else { continue };
@@ -146,7 +148,7 @@ pub(super) fn new_connections(model: &Model, shapes: &[&Shape], touches: &[Touch
             continue;
         }
         // A name after the two bodies, with a number when it is taken.
-        let base = suggest_name(&format!("{}-{}", tidy(&a.name), tidy(&b.name))).unwrap_or_else(|| "Connection".into());
+        let base = suggest_name(&format!("{}-{}", tidy(a.name), tidy(b.name))).unwrap_or_else(|| "Connection".into());
         let taken = |name: &str| model.connection(name).is_some() || added.iter().any(|(other, _)| other == name);
         let mut name = base.clone();
         // One more number than there are names taken ends it.
@@ -175,11 +177,15 @@ fn find(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::invalid("tolerance", "must be a positive length".to_string()));
     }
     let added = {
-        let design = s.design.as_deref().ok_or_else(|| EngineError::Params("no design is open (geometry.open)".into()))?;
-        let shapes: Vec<&Shape> = design.bodies.iter().collect();
+        let shapes = Solid::all(s);
+        if shapes.is_empty() {
+            return Err(EngineError::Params(
+                "there is no body: open a design (geometry.open) or import a surface mesh (geometry.import.mesh)".into(),
+            ));
+        }
         if shapes.len() > fieldcraft_fcm::assembly::MAX_PARTS {
             return Err(EngineError::Params(format!(
-                "the design has {} bodies; connections are found among up to {}",
+                "there are {} bodies; connections are found among up to {}",
                 shapes.len(),
                 fieldcraft_fcm::assembly::MAX_PARTS
             )));
@@ -192,7 +198,7 @@ fn find(s: &mut Session, p: &Value) -> Result<Value> {
         for shape in &shapes {
             fieldcraft_model::progress::stage(&format!("{}: surface", shape.name), None, "");
             fieldcraft_model::progress::check()?;
-            let diagonal = super::static_grid::diagonal(shape)?;
+            let diagonal = super::static_grid::diagonal(*shape)?;
             // No finer than a body can be triangulated.
             let tolerance = asked
                 .map_or(super::static_grid::default_tolerance(diagonal), |reach| 0.5 * reach)
@@ -200,7 +206,7 @@ fn find(s: &mut Session, p: &Value) -> Result<Value> {
             if asked.is_none() {
                 reach = reach.max(2.0 * tolerance);
             }
-            surfaces.push(super::static_grid::surface(shape, tolerance)?);
+            surfaces.push(super::static_grid::surface(*shape, tolerance)?);
         }
         fieldcraft_model::progress::stage("connections", None, "");
         fieldcraft_model::progress::check()?;

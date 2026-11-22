@@ -52,7 +52,10 @@ the fillet face.
 
 ## Your own part
 
-1. **File ▸ Open** a `.solidcraft` design.
+1. **File ▸ Open** a `.solidcraft` design. A part or an assembly from another CAD system
+   comes in as a face-tagged 3MF surface mesh instead (**Import mesh…** on the start page,
+   `geometry.import.mesh`): each of its bodies is solved like a body of a design, its faces
+   are named by their numbers, and its curved faces are as fine as the file's triangles.
 2. **Properties**: a material (isotropic elastic), a set that names the body, a solid section on
    that set.
 3. Sets of faces: in the viewport choose *Select: Faces*, pick the faces, right click,

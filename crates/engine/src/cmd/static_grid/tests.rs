@@ -763,3 +763,88 @@ fn rounds_and_the_check_run_over_several_bodies() {
         assert!(s.execute("solve.static.grid", &bad).is_err(), "{bad}");
     }
 }
+
+/// Bodies that are imported surface meshes (`geometry.import.mesh`), not a design: steel, each
+/// a block with its faces named by their tags (`solid::tests::block_between`), held as by
+/// symmetry planes and pulled on the end of the last with [`PULL`]. The bodies lie end to end
+/// along x from 0, each `length` long.
+fn imported(blocks: usize, length: f64) -> Session {
+    let mut s = Session { limits: SessionLimits { max_grid_dofs: 8000, ..SessionLimits::default() }, ..Session::default() };
+    let name = |k: usize| if k == 0 { "Block".to_string() } else { format!("Block {}", k + 1) };
+    for k in 0..blocks {
+        let x = k as f64 * length;
+        s.surfaces.push(std::sync::Arc::new(solid::tests::block_between(&name(k), [x, 0.0, 0.0], [x + length, 10.0, 10.0])));
+    }
+    let on = |tag: u32| -> Vec<Value> { (0..blocks).map(|k| json!({"body": name(k), "face": tag.to_string()})).collect() };
+    let all: Vec<Value> = (0..blocks).map(|k| json!({"body": name(k)})).collect();
+    s.run_script(&json!([
+        {"command": "model.set.create", "params": {"name": "all", "geometry": all}},
+        {"command": "model.material.create", "params": {"name": "Steel", "elastic": {"type": "isotropic", "young": YOUNG, "poisson": POISSON}, "density": 7.85e-9}},
+        {"command": "model.section.create", "params": {"name": "Solid", "set": "all", "material": "Steel", "kind": {"type": "solid"}}},
+        {"command": "model.set.create", "params": {"name": "x0", "geometry": [{"body": "Block", "face": "0"}]}},
+        {"command": "model.set.create", "params": {"name": "x1", "geometry": [{"body": name(blocks - 1), "face": "1"}]}},
+        {"command": "model.set.create", "params": {"name": "y0", "geometry": on(2)}},
+        {"command": "model.set.create", "params": {"name": "z0", "geometry": on(4)}},
+        {"command": "model.boundary_condition.create", "params": {"name": "HoldX", "type": "symmetry", "target": {"set": "x0"}, "plane": "x"}},
+        {"command": "model.boundary_condition.create", "params": {"name": "HoldY", "type": "displacement", "target": {"set": "y0"}, "values": [null, 0, null, null, null, null]}},
+        {"command": "model.boundary_condition.create", "params": {"name": "HoldZ", "type": "symmetry", "target": {"set": "z0"}, "plane": "z"}},
+        {"command": "model.load.create", "params": {"name": "Pull", "type": "pressure", "set": "x1", "magnitude": -PULL}},
+        {"command": "model.step.create", "params": {"name": "Pull", "procedure": {"type": "static"}, "boundary_conditions": ["HoldX", "HoldY", "HoldZ"], "loads": ["Pull"]}},
+    ]))
+    .unwrap();
+    s
+}
+
+/// A body that is an imported surface mesh is solved like one of a design: the pulled block's
+/// uniform stress and its stretch, with its faces by their tags in the reply.
+#[test]
+fn an_imported_surface_mesh_is_solved_like_a_design_body() {
+    let mut s = imported(1, 20.0);
+    assert!(s.design.is_none());
+    let r = s.execute("solve.static.grid", &json!({"cell_size": 5, "degree": 2})).unwrap();
+    assert_eq!(r["body"], "Block");
+    let stress = r["max_von_mises"]["value"].as_f64().unwrap();
+    assert!((stress - PULL).abs() < STRESS * PULL, "{stress}");
+    let travel = r["max_displacement"]["value"].as_f64().unwrap();
+    // The end moves by PULL/E of the length; the corner farthest from the three planes also
+    // draws in by Poisson's ratio of that across the two widths.
+    let (along, across) = (PULL / YOUNG * 20.0, POISSON * PULL / YOUNG * 10.0);
+    let expected = (along * along + 2.0 * across * across).sqrt();
+    assert!((travel - expected).abs() < TRAVEL * expected, "{travel} against {expected}");
+    // The faces are named by their tags; the reply says what an imported mesh is.
+    let reactions = r["reactions"].as_array().unwrap();
+    assert!(reactions.iter().any(|x| x["face"] == "0") && reactions.iter().any(|x| x["face"] == "4"), "{reactions:?}");
+    let warnings = r["warnings"].as_array().unwrap();
+    assert!(warnings.iter().any(|w| w.as_str().is_some_and(|w| w.contains("imported surface mesh"))), "{warnings:?}");
+
+    // What it does not have is refused by name: a body, a face that is no tag of it.
+    let e = s.execute("solve.static.grid", &json!({"body": "Other"})).unwrap_err().to_string();
+    assert!(e.contains("no body `Other`") && e.contains("Block"), "{e}");
+    s.execute("model.set.create", &json!({"name": "nowhere", "geometry": [{"body": "Block", "face": "9"}]})).unwrap();
+    s.execute("model.load.create", &json!({"name": "Lost", "type": "pressure", "set": "nowhere", "magnitude": 1})).unwrap();
+    s.execute("model.step.edit", &json!({"name": "Pull", "loads": ["Pull", "Lost"]})).unwrap();
+    let e = s.execute("solve.static.grid", &json!({"cell_size": 5, "degree": 2})).unwrap_err().to_string();
+    assert!(e.contains("no face `9`"), "{e}");
+    // With neither a design nor a surface there is nothing to solve.
+    let mut none = Session::default();
+    let e = none.execute("solve.static.grid", &json!({})).unwrap_err().to_string();
+    assert!(e.contains("an open design or an imported surface"), "{e}");
+}
+
+/// Two imported surfaces that touch are bonded there like two bodies of a design: the
+/// connection is found, named after them and kept, and the pull goes through it.
+#[test]
+fn imported_surface_meshes_are_bonded_where_they_touch() {
+    let mut s = imported(2, 10.0);
+    let r = s.execute("solve.static.grid", &json!({"cell_size": 5, "degree": 2})).unwrap();
+    assert_eq!(r["bodies"].as_array().map(Vec::len), Some(2));
+    assert_eq!(r["connections_added"].as_array().map(Vec::len), Some(1), "{}", r["connections_added"]);
+    let connection = s.model.connections().values().next().unwrap();
+    assert_eq!((connection.first.len(), connection.second.len()), (1, 1));
+    let stress = r["max_von_mises"]["value"].as_f64().unwrap();
+    assert!((stress - PULL).abs() < 0.02 * PULL, "{stress}");
+    // The connections can be found without a solve as well.
+    let mut again = imported(2, 10.0);
+    let found = again.execute("interaction.connection.find", &json!({})).unwrap();
+    assert_eq!(again.model.connections().len(), 1, "{found}");
+}
