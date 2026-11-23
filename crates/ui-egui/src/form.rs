@@ -381,7 +381,7 @@ impl Form<'_> {
                 let value = obj.get(f.key).cloned();
                 let style = self.style;
                 let help = f.help_text(self.cx.units);
-                let new = fields::row(ui, &style, f.label, f.required, &help, |ui| self.scalar(ui, f, value.as_ref(), &path));
+                let new = fields::row_with_picture(ui, &style, f.label, f.required, &help, f.picture, |ui| self.scalar(ui, f, value.as_ref(), &path));
                 if let Some(new) = new {
                     match new {
                         Value::Null => obj.remove(f.key),

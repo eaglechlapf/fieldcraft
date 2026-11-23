@@ -50,6 +50,7 @@ pub mod navigation;
 pub mod node_move;
 pub mod palette;
 pub mod path_panel;
+mod pictures;
 pub mod privacy;
 pub mod reply;
 pub mod report;

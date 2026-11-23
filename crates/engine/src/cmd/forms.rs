@@ -2805,11 +2805,13 @@ pub const SOLVE_STATIC_GRID: &[Field] = &[
         .def("\"model\"")
         .advanced(),
     positive("cell_size", "Cell size", D::Length)
-        .help("The size of the grid's cubic cells, the same everywhere. For a stress peak at a hole or a fillet within about 1 %: two cells per radius of the smallest stressed feature at degree 4, or four at degree 3. Displacements and reactions need far less. Empty: chosen for the part, a twentieth of each body's diagonal (larger together when the bodies are many).")
-        .hint("automatic"),
+        .help("The size of the grid's cubic cells. The part is set in a grid of them, cut by its surface: smaller cells resolve more and take longer. For a stress peak at a hole or a fillet, four cells to its radius. Empty: a twentieth of each body's diagonal.")
+        .hint("automatic")
+        .picture("grid.cell_size"),
     int("adapt", "Adaptive rounds", 0, super::static_grid::MAX_REFINE)
-        .help("Solves, divides the cells the solution is least resolved in and solves again, this many times at most; the rounds end early once one changes the result by little. Each round costs a solve, and the reply says how much the last one still changed the strain energy. Empty: two rounds for a body that is thin for the grid (sheet metal), none otherwise.")
-        .hint("automatic"),
+        .help("Solves, divides the cells where the result is least resolved (a stress peak at an inside corner), and solves again, this many times at most. Each round is a whole solve. Empty: two rounds for sheet metal, none otherwise.")
+        .hint("automatic")
+        .picture("grid.adapt"),
     int("degree", "Degree", 1, super::static_grid::MAX_DEGREE)
         .help("The polynomial degree of the shape functions on every cell. With one cell per radius of a hole or fillet the stress peak is good to about 10 % at degree 3, 6.5 % at degree 4 and 3 % at degree 5.")
         .def("3")
@@ -2819,16 +2821,18 @@ pub const SOLVE_STATIC_GRID: &[Field] = &[
         .def("\"auto\"")
         .advanced(),
     int("refine", "Refinement levels", 0, super::static_grid::MAX_REFINE)
-        .help("Divides the cells across which the surface is curved more tightly than they resolve (a fillet or hole with fewer than two cells to its radius at degree 4, four at degree 3) into eight, this many times at most. A coarse grid then resolves a small feature without fine cells everywhere. 0 keeps the grid the same everywhere.")
+        .help("Divides the cells where the surface curves tightly (a hole, a fillet) into eight, this many times at most, so a small feature is resolved without small cells everywhere. 0 keeps the grid the same everywhere.")
         .def("1")
+        .picture("grid.refine")
         .advanced(),
     range("settle", "Settled within", D::None, 0.0, 1.0)
         .help("The adaptive rounds end once one moves the solution by no more than this fraction, measured in the energy norm: 0.05 is a change of the strain energy of 0.25 %. 0 runs every round.")
         .def("0.05")
         .advanced(),
     choice("gaps", "Narrow gaps", &[("open", "Open"), ("joined", "Joined")])
-        .help("Open: material on the two sides of a gap narrower than a cell (the open corner of a sheet metal part, a slit, the fins of a heat sink) is kept apart, as it is in the part, and the cells where such a gap ends are divided. Joined: the part is solved as if such gaps were welded shut.")
+        .help("Open: the two sides of a gap narrower than a cell (a slit, the open corner of sheet metal, the fins of a heat sink) stay apart, as in the part, and the cells where the gap ends are divided. Joined: such gaps are solved as if welded shut.")
         .def("\"open\"")
+        .picture("grid.gaps")
         .advanced(),
     flag("check_convergence", "Check convergence")
         .help("Also solves one degree lower on the same grid and reports how much the peak von Mises stress and the strain energy changed: an indicator of convergence, not a bound of the error.")
@@ -2838,12 +2842,14 @@ pub const SOLVE_STATIC_GRID: &[Field] = &[
         .def("\"auto\"")
         .advanced(),
     positive("tolerance", "Chordal tolerance", D::Length)
-        .help("Largest distance between the triangulated surface, which is all the solver knows of the body, and the true curved surface. Small cells resolve the facets of a fillet as notches, so it is far below the smallest cell. Empty: 1/250 of the smallest cell.")
+        .help("How far the flat triangles that stand for a curved surface may lie from it: they are all the solver knows of the part's shape. Empty: 1/250 of the smallest cell.")
         .hint("automatic")
+        .picture("grid.tolerance")
         .advanced(),
     positive("sample_size", "Result sampling", D::Length)
-        .help("The results are read at points of the body's surface no farther apart than this, for the contours. Where cells are divided, the points are as much closer as the cells are smaller. Empty: the cell size over the degree.")
+        .help("How far apart the points of the surface are where the results are read for the contours; closer where the cells are smaller. Empty: the cell size over the degree.")
         .hint("automatic")
+        .picture("grid.sampling")
         .advanced(),
     MAX_DOFS.advanced(),
     MAX_FACTOR.advanced(),

@@ -33,7 +33,9 @@ browser hides and shows them.
    of the body's bounding-box diagonal (4.39 mm here), and the rounds are chosen for the part:
    two for sheet metal, none here. Everything else is under **Advanced settings**, folded until
    you open it (a number beside the heading counts the settings changed there, and it opens by
-   itself when one of them has a problem): the degree is 3, and **Refinement levels** is 1, so
+   itself when one of them has a problem). The info icon beside a setting shows its help, with a
+   picture of what it does for the cell size, the rounds, the refinement levels, narrow gaps, the
+   chordal tolerance and the result sampling. The degree is 3, and **Refinement levels** is 1, so
    the cells at the fillet and the holes are divided once, to 2.2 mm. Tick **Check
    convergence** there to solve one degree lower as well and see how much the result still
    changed.

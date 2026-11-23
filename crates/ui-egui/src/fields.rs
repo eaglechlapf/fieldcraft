@@ -61,6 +61,13 @@ pub fn label_galley(ui: &Ui, label: &str, color: Color32, wrap: f32) -> std::syn
 /// column wraps onto [`LABEL_LINES`] lines; the marks always follow it inside the column.
 /// Hovering the label or the icon shows the label and `help`.
 pub fn row<R>(ui: &mut Ui, s: &Style, label: &str, required: bool, help: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
+    row_with_picture(ui, s, label, required, help, "", add)
+}
+
+/// [`row`], whose help shows the picture `picture` ([`crate::pictures`]) above the label and
+/// `help`, on hovering the label or the icon and in the popover a click on the icon opens.
+pub fn row_with_picture<R>(ui: &mut Ui, s: &Style, label: &str, required: bool, help: &str, picture: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let picture = if crate::pictures::NAMES.contains(&picture) { picture } else { "" };
     ui.horizontal(|ui| {
         let ink = solidcraft_theme::Tokens::get().dialog_label;
         let galley = label_galley(ui, label, ink, s.label_width - marks_width(required, !help.is_empty()));
@@ -68,7 +75,11 @@ pub fn row<R>(ui: &mut Ui, s: &Style, label: &str, required: bool, help: &str, a
         let text_rect = egui::Align2::LEFT_CENTER.anchor_size(rect.left_center(), galley.size());
         let tip = if help.is_empty() { label.to_string() } else { format!("{label}\n{help}") };
         response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, label));
-        response.backing_on_hover_text(&tip);
+        if picture.is_empty() {
+            response.backing_on_hover_text(&tip);
+        } else {
+            response.backing_on_hover_ui(|ui| pictured_help(ui, label, help, picture));
+        }
         // The marks sit after the label's last line.
         let last = galley.rows.last().map_or(egui::Rect::ZERO, |r| r.rect());
         let mark_y = text_rect.top() + last.center().y;
@@ -86,11 +97,52 @@ pub fn row<R>(ui: &mut Ui, s: &Style, label: &str, required: bool, help: &str, a
             // its place.
             let mut mark_ui =
                 ui.new_child(egui::UiBuilder::new().max_rect(mark).layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)));
-            kit::help_icon(&mut mark_ui, &tip);
+            if picture.is_empty() {
+                kit::help_icon(&mut mark_ui, &tip);
+            } else {
+                help_mark(&mut mark_ui, &tip, &|ui| pictured_help(ui, label, help, picture));
+            }
         }
         add(ui)
     })
     .inner
+}
+
+/// A help with a picture: the picture across the tip, then the label and the help text.
+fn pictured_help(ui: &mut Ui, label: &str, help: &str, picture: &str) {
+    let width = ui.spacing().tooltip_width.clamp(crate::pictures::WIDTH, crate::pictures::MOST_WIDTH);
+    ui.set_max_width(width);
+    crate::pictures::show(ui, picture, width);
+    ui.add_space(solidcraft_theme::Tokens::get().space_4);
+    ui.label(RichText::new(label).strong());
+    if !help.is_empty() {
+        ui.add(egui::Label::new(help).wrap());
+    }
+}
+
+/// The help icon of a help that is more than text: the kit's mark (a circled i), drawing `body`
+/// on hover and in the popover a click opens. `tip` names it for assistive technology.
+fn help_mark(ui: &mut Ui, tip: &str, body: &dyn Fn(&mut Ui)) -> egui::Response {
+    let t = solidcraft_theme::Tokens::get();
+    let size = t.space_12 + 1.0;
+    let (rect, response) = ui.allocate_exact_size(vec2(size, size), egui::Sense::click());
+    let width = ui.spacing().tooltip_width.clamp(crate::pictures::WIDTH, crate::pictures::MOST_WIDTH);
+    let popover =
+        kit::Container::new(ui.ctx(), kit::Surface::Popup).menu(&response).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).width(width);
+    let open = popover.is_open();
+    let ink = if open || response.hovered() || response.has_focus() { t.form_ink } else { t.form_dim };
+    let p = ui.painter();
+    p.circle_stroke(rect.center(), size * 0.5 - 0.5, egui::Stroke::new(1.0, ink));
+    p.circle_filled(egui::pos2(rect.center().x, rect.top() + size * 0.3), 0.9, ink);
+    p.line_segment(
+        [egui::pos2(rect.center().x, rect.top() + size * 0.46), egui::pos2(rect.center().x, rect.bottom() - size * 0.24)],
+        egui::Stroke::new(1.2, ink),
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), tip));
+    popover.show(|ui| body(ui));
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    // The popover already shows the help; a tooltip on top of it would show it twice.
+    if open { response } else { response.backing_on_hover_ui(|ui| body(ui)) }
 }
 
 /// The width of `unit` after a field ([`unit`]), with the space before it; 0 without one.
