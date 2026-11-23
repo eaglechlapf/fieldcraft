@@ -2802,42 +2802,52 @@ pub const SOLVE_STATIC_GRID: &[Field] = &[
         .hint("every body"),
     choice("connections", "Connections", &[("model", "The model's"), ("none", "None")])
         .help("Several bodies are solved together. The model's: the bodies hold each other by the model's connections (bonded, sliding or free); a model that was never searched for them is searched first, and every two bodies whose faces touch are bonded there. None: no body holds another, and each needs supports of its own.")
-        .def("\"model\""),
+        .def("\"model\"")
+        .advanced(),
     positive("cell_size", "Cell size", D::Length)
         .help("The size of the grid's cubic cells, the same everywhere. For a stress peak at a hole or a fillet within about 1 %: two cells per radius of the smallest stressed feature at degree 4, or four at degree 3. Displacements and reactions need far less.")
         .hint("1/20 of the diagonal"),
-    int("degree", "Degree", 1, super::static_grid::MAX_DEGREE)
-        .help("The polynomial degree of the shape functions on every cell. With one cell per radius of a hole or fillet the stress peak is good to about 10 % at degree 3, 6.5 % at degree 4 and 3 % at degree 5.")
-        .def("3"),
-    choice("basis", "Shape functions", &[("auto", "Automatic"), ("tensor", "Full"), ("trunk", "Reduced")])
-        .help("Full: every product of the polynomials along the three axes up to the degree. Reduced: only those of total degree up to the degree, half the unknowns a cell at degree 3; less accurate cell for cell, and as accurate in less time where cells are divided. Automatic: reduced for a body that is thin for the grid (sheet metal), full otherwise.")
-        .def("\"auto\""),
-    int("refine", "Refinement levels", 0, super::static_grid::MAX_REFINE)
-        .help("Divides the cells across which the surface is curved more tightly than they resolve (a fillet or hole with fewer than two cells to its radius at degree 4, four at degree 3) into eight, this many times at most. A coarse grid then resolves a small feature without fine cells everywhere. 0 keeps the grid the same everywhere.")
-        .def("1"),
     int("adapt", "Adaptive rounds", 0, super::static_grid::MAX_REFINE)
         .help("Solves, divides the cells the solution is least resolved in and solves again, this many times at most; the rounds end early once one changes the result by little. Each round costs a solve, and the reply says how much the last one still changed the strain energy. Empty: two rounds for a body that is thin for the grid (sheet metal), none otherwise.")
         .hint("automatic"),
+    int("degree", "Degree", 1, super::static_grid::MAX_DEGREE)
+        .help("The polynomial degree of the shape functions on every cell. With one cell per radius of a hole or fillet the stress peak is good to about 10 % at degree 3, 6.5 % at degree 4 and 3 % at degree 5.")
+        .def("3")
+        .advanced(),
+    choice("basis", "Shape functions", &[("auto", "Automatic"), ("tensor", "Full"), ("trunk", "Reduced")])
+        .help("Full: every product of the polynomials along the three axes up to the degree. Reduced: only those of total degree up to the degree, half the unknowns a cell at degree 3; less accurate cell for cell, and as accurate in less time where cells are divided. Automatic: reduced for a body that is thin for the grid (sheet metal), full otherwise.")
+        .def("\"auto\"")
+        .advanced(),
+    int("refine", "Refinement levels", 0, super::static_grid::MAX_REFINE)
+        .help("Divides the cells across which the surface is curved more tightly than they resolve (a fillet or hole with fewer than two cells to its radius at degree 4, four at degree 3) into eight, this many times at most. A coarse grid then resolves a small feature without fine cells everywhere. 0 keeps the grid the same everywhere.")
+        .def("1")
+        .advanced(),
     range("settle", "Settled within", D::None, 0.0, 1.0)
         .help("The adaptive rounds end once one moves the solution by no more than this fraction, measured in the energy norm: 0.05 is a change of the strain energy of 0.25 %. 0 runs every round.")
-        .def("0.05"),
+        .def("0.05")
+        .advanced(),
     choice("gaps", "Narrow gaps", &[("open", "Open"), ("joined", "Joined")])
         .help("Open: material on the two sides of a gap narrower than a cell (the open corner of a sheet metal part, a slit, the fins of a heat sink) is kept apart, as it is in the part, and the cells where such a gap ends are divided. Joined: the part is solved as if such gaps were welded shut.")
-        .def("\"open\""),
+        .def("\"open\"")
+        .advanced(),
     flag("check_convergence", "Check convergence")
-        .help("Also solves one degree lower on the same grid and reports how much the peak von Mises stress and the strain energy changed: an indicator of convergence, not a bound of the error."),
+        .help("Also solves one degree lower on the same grid and reports how much the peak von Mises stress and the strain energy changed: an indicator of convergence, not a bound of the error.")
+        .advanced(),
     choice("solver", "Solver", &[("auto", "Automatic"), ("direct", "Factorization"), ("iterative", "Iteration")])
         .help("How the unknowns are solved for. Factorization: exact to rounding, its time grows with the square of the unknowns of a compact part. Iteration: its time grows with the unknowns, and its result is right to about nine digits. Automatic: the factorization for small systems, the iteration for the others and for those whose factor would not fit.")
-        .def("\"auto\""),
+        .def("\"auto\"")
+        .advanced(),
     positive("tolerance", "Chordal tolerance", D::Length)
         .help("Largest distance between the triangulated surface, which is all the solver knows of the body, and the true curved surface. Small cells resolve the facets of a fillet as notches, so it is far below the smallest cell.")
-        .hint("smallest cell / 250"),
+        .hint("smallest cell / 250")
+        .advanced(),
     positive("sample_size", "Result sampling", D::Length)
         .help("The results are read at points of the body's surface no farther apart than this, for the contours. Where cells are divided, the points are as much closer as the cells are smaller.")
-        .hint("cell size / degree"),
-    MAX_DOFS,
-    MAX_FACTOR,
-    THREADS,
+        .hint("cell size / degree")
+        .advanced(),
+    MAX_DOFS.advanced(),
+    MAX_FACTOR.advanced(),
+    THREADS.advanced(),
 ];
 pub const SOLVE_NONLINEAR: &[Field] = &[
     STEP,

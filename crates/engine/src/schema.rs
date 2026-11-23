@@ -43,6 +43,9 @@ pub struct Field {
     /// pattern relative to the value: what they measure, converted like any other number of the
     /// form ([`crate::units`]).
     pub numbers: Numbers,
+    /// A setting most uses leave as it is: a form shows it under Advanced settings, folded until
+    /// opened. The command takes it like any other.
+    pub advanced: bool,
 }
 
 /// Numbers inside a JSON value: (JSON pointer pattern, dimension). A `*` segment matches any key
@@ -540,10 +543,15 @@ impl Dim {
 // ---- Building fields (const, so schemas are static tables) ----
 
 const fn field(key: &'static str, label: &'static str, kind: Kind) -> Field {
-    Field { key, label, kind, required: false, default: None, hint: "", help: "", notes: &[], numbers: &[] }
+    Field { key, label, kind, required: false, default: None, hint: "", help: "", notes: &[], numbers: &[], advanced: false }
 }
 
 impl Field {
+    /// Shown under Advanced settings ([`Field::advanced`]).
+    pub const fn advanced(self) -> Field {
+        Field { advanced: true, ..self }
+    }
+
     /// Required.
     pub const fn req(self) -> Field {
         Field { required: true, ..self }

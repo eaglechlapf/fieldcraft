@@ -28,10 +28,15 @@ browser hides and shows them.
    **Solve**, and click **Grid Static** in the *Implicit* panel, beside *Static*. Or press
    Ctrl+K (⌘K) and type `grid`.
 3. Leave the form as it is and click **OK**. The solve runs in the background, with Cancel, and
-   takes about 4 seconds. Left empty, the cell size is 1/20 of the body's bounding-box diagonal
-   (4.39 mm here); the degree is 3, and **Refinement levels** is 1: the cells at the fillet and
-   the holes are divided once, to 2.2 mm. Tick **Check convergence** to solve one degree lower
-   as well and see how much the result still changed.
+   takes about 4 seconds. The form shows four settings: the **Step**, the **Body** (every body
+   when empty), the **Cell size** and the **Adaptive rounds**. Left empty, the cell size is 1/20
+   of the body's bounding-box diagonal (4.39 mm here), and the rounds are chosen for the part:
+   two for sheet metal, none here. Everything else is under **Advanced settings**, folded until
+   you open it (a number beside the heading counts the settings changed there, and it opens by
+   itself when one of them has a problem): the degree is 3, and **Refinement levels** is 1, so
+   the cells at the fillet and the holes are divided once, to 2.2 mm. Tick **Check
+   convergence** there to solve one degree lower as well and see how much the result still
+   changed.
 4. The Results workspace comes up with the von Mises stress on the bracket and its legend. The
    card on the right lists the summary: the largest displacement and stress and where they
    are, the applied and reaction forces, cell size, degree, unknowns, cells, the volume in the
@@ -81,6 +86,9 @@ mesh; each solve replaces the step's result.
 (`engine.execute`) the command replies with its summary. It never opens a form.
 
 ## Parameters
+
+The form shows `step`, `body`, `cell_size` and `adapt`; the others are under **Advanced
+settings**. Scripts, the command line and MCP take every parameter alike.
 
 | Parameter | Default | |
 |---|---|---|

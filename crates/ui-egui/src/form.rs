@@ -304,8 +304,41 @@ impl Form<'_> {
         }
     }
 
+    /// The fields of one object: the others first, then those marked advanced
+    /// ([`Field::advanced`]) under Advanced settings, folded until opened. The heading counts the
+    /// advanced settings changed from their defaults, and opens by itself when one of them has a
+    /// problem to show.
     fn each_field(&mut self, ui: &mut Ui, fields: &'static [Field], common: &[Field], obj: &mut Map<String, Value>, prefix: &str, depth: usize) {
-        for f in fields {
+        let basic: Vec<&'static Field> = fields.iter().filter(|f| !f.advanced).collect();
+        self.draw_fields(ui, &basic, common, obj, prefix, depth);
+        let advanced: Vec<&'static Field> = fields.iter().filter(|f| f.advanced).collect();
+        if advanced.is_empty() {
+            return;
+        }
+        let changed = |f: &Field| {
+            let default = f.default.and_then(|d| serde_json::from_str::<Value>(d).ok());
+            obj.get(f.key).is_some_and(|v| !v.is_null() && Some(v) != default.as_ref())
+        };
+        let set = advanced.iter().filter(|f| changed(f)).count();
+        let id = ("fc_form_advanced", self.cx.salt, prefix.to_owned());
+        let shown = |path: &str| match self.cx.refused {
+            Some((key, _)) if key == path || key.starts_with(&format!("{path}/")) => true,
+            _ => {
+                (self.cx.attempted || self.cx.touched.contains(path))
+                    && self.problems.keys().any(|key| key == path || key.starts_with(&format!("{path}/")))
+            }
+        };
+        if advanced.iter().any(|f| shown(&join(prefix, f.key))) {
+            let open = ui.make_persistent_id(id.clone());
+            ui.ctx().data_mut(|d| d.insert_persisted(open, true));
+        }
+        kit::section_count(ui, id, "Advanced settings", false, (set > 0).then_some(set), |ui| {
+            self.draw_fields(ui, &advanced, common, obj, prefix, depth);
+        });
+    }
+
+    fn draw_fields(&mut self, ui: &mut Ui, fields: &[&'static Field], common: &[Field], obj: &mut Map<String, Value>, prefix: &str, depth: usize) {
+        for f in fields.iter().copied() {
             if let Kind::Variants { tag, variants } = f.kind
                 && f.key.is_empty()
             {
@@ -2375,6 +2408,58 @@ pub(crate) mod tests {
 
     fn mm() -> DisplaySystem {
         DisplaySystem::new(fieldcraft_model::units::Preset::MmTonneS)
+    }
+
+    /// The labels one frame of `fields` draws with `params`, `problems` shown as after OK.
+    fn drawn_labels(fields: &'static [Field], params: Value, problems: &[(String, String)]) -> Vec<String> {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut params = params.as_object().cloned().unwrap_or_default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let touched = BTreeSet::new();
+            let names = |c: Collection| vec![name_of(c)];
+            let cx = Context {
+                units: &mm(),
+                names: &names,
+                salt: Id::unique("advanced"),
+                touched: &touched,
+                attempted: true,
+                refused: None,
+                problems,
+                picked: Picked::default(),
+                selection: None,
+            };
+            show(ui, &Tokens::get(false), &cx, fields, &mut params);
+        });
+        out.textures_delta.clear();
+        out.platform_output.accesskit_update.iter().flat_map(|u| u.nodes.iter().filter_map(|(_, n)| n.label().map(str::to_string))).collect()
+    }
+
+    /// The grid solve's form shows what a mechanical engineer sets (the step, the body, the cell
+    /// size and the rounds) and folds the rest under Advanced settings, which opens by itself when
+    /// a setting in it has a problem. A form without advanced settings draws every field.
+    #[test]
+    fn advanced_settings_are_folded_until_needed() {
+        let grid = fieldcraft_engine::commands().iter().find(|c| c.id == "solve.static.grid").and_then(|c| c.form).expect("the grid solve's form");
+        let has = |labels: &[String], label: &str| labels.iter().any(|l| l.starts_with(label));
+        let folded = drawn_labels(grid, json!({}), &[]);
+        for basic in ["Step", "Body", "Cell size", "Adaptive rounds"] {
+            assert!(has(&folded, basic), "{basic}: {folded:?}");
+        }
+        for advanced in ["Degree", "Shape functions", "Solver", "Chordal tolerance", "Max DOFs", "Threads"] {
+            assert!(!has(&folded, advanced), "{advanced}: {folded:?}");
+        }
+        assert!(grid.iter().filter(|f| f.advanced).count() >= 10 && grid.iter().filter(|f| !f.advanced).count() == 4);
+        // A problem with a folded setting opens the fold.
+        let refused = drawn_labels(grid, json!({"degree": 99}), &[("degree".into(), "Degree: at most 8".into())]);
+        assert!(has(&refused, "Degree") && has(&refused, "Solver"), "{refused:?}");
+        // Every field of a form with none marked advanced is drawn as it was.
+        let plain = fieldcraft_engine::commands().iter().find(|c| c.id == "solve.static").and_then(|c| c.form).expect("the static solve's form");
+        assert!(plain.iter().all(|f| !f.advanced));
+        let all = drawn_labels(plain, json!({}), &[]);
+        for f in plain {
+            assert!(has(&all, f.label), "{}: {all:?}", f.label);
+        }
     }
 
     /// A number shows its unit in the display system; a vector's components are captioned.
