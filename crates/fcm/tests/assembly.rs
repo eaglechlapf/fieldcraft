@@ -430,6 +430,14 @@ fn faces_that_touch_are_found() {
     for tolerance in [0.0, -1.0, f64::NAN] {
         assert!(matches!(find_bonds(&[&pin, &sleeve], tolerance), Err(Error::Invalid(_))));
     }
+    // How far the facets are from the round faces is read from the triangles: the sagitta of a
+    // side of the polygon, of the widest facets a body has (the sleeve's outside), and nothing
+    // for a body of flat faces. The two bodies' together are a tolerance that finds the bond.
+    let sagitta = |sides: f64, radius: f64| radius * (1.0 - (std::f64::consts::PI / sides).cos());
+    let (of_pin, of_sleeve) = (fieldcraft_fcm::facet_deviation(&pin), fieldcraft_fcm::facet_deviation(&sleeve));
+    assert!((of_pin / sagitta(24.0, 0.2) - 1.0).abs() < 1e-12 && (of_sleeve / sagitta(40.0, 0.5) - 1.0).abs() < 1e-12, "{of_pin} and {of_sleeve}");
+    assert_eq!(fieldcraft_fcm::facet_deviation(&plate), 0.0);
+    assert_eq!(find_bonds(&[&pin, &sleeve], of_pin + of_sleeve).unwrap().len(), 1);
 }
 
 /// A pin bonded in the hole of a sleeve that is clamped on its outside, pulled along its axis:

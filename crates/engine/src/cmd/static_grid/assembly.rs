@@ -361,7 +361,23 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
         fieldcraft_model::progress::stage(&format!("{}: surface", shape.name), None, "");
         fieldcraft_model::progress::check()?;
         let mesh = shape.tessellate(crate::units::to_geometry_length(tolerance))?;
-        sized.push((shape, material, material_name, supports, cell_size, thin, basis, tolerance, sample_size, volume, skin, mesh));
+        // What an imported mesh is triangulated within is read from it, once its surface is
+        // built: only a tolerance that was asked for is taken as it is.
+        let measured = shape.imported() && p.get("tolerance").is_none();
+        sized.push((
+            shape,
+            material,
+            material_name,
+            supports,
+            cell_size,
+            thin,
+            basis,
+            (tolerance, measured.then_some(diagonal)),
+            sample_size,
+            volume,
+            skin,
+            mesh,
+        ));
     }
     // The bodies' surfaces, each on a thread of its own: of an imported mesh of many triangles
     // that is most of the work before the solve.
@@ -374,6 +390,10 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
         sized.into_iter().zip(surfaces)
     {
         let surface = surface?;
+        let tolerance = match tolerance {
+            (_, Some(diagonal)) => imported_tolerance(&surface, diagonal),
+            (asked, None) => asked,
+        };
         let areas = face_areas(&surface);
         let (loads, applied) = loads(model, shape, step, &areas, material.density, material_name, false)?;
         least += 3.0 * (degree as f64).powi(3) * volume / cell_size.powi(3);

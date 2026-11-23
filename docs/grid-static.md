@@ -573,7 +573,11 @@ two hold each other where those faces touch:
 
 Whole faces are named; where they touch is found by the solve. Flat faces touch to rounding,
 curved ones (a pin in a hole) within the triangulations' tolerance, and faces that overlap in
-part are connected over the part.
+part are connected over the part. The triangles of an imported surface mesh are the file's,
+whatever a solve asks for, so its tolerance is read from them: the largest sagitta of a facet
+over the curve between it and its neighbour (a chord over the angle θ between the two
+normals, as wide as the facet, lies (w / 2) tan(θ / 4) from its arc). Its faces touch another
+body's within the same distance in every solve, with or without rounds of refinement.
 
 **They are found for you, once.** The first solve of a design with several bodies looks for
 the faces of every two bodies that lie on each other, facing each other (an edge or a corner

@@ -117,8 +117,8 @@ mod solve;
 mod space;
 
 pub use assembly::{
-    Bond, Kept, Motion, Part, Touch, assembly_unknowns, assembly_unknowns_keeping, bond_areas, find_bonds, free_motions, solve_assembly,
-    solve_assembly_keeping,
+    Bond, Kept, Motion, Part, Touch, assembly_unknowns, assembly_unknowns_keeping, bond_areas, facet_deviation, find_bonds, free_motions,
+    solve_assembly, solve_assembly_keeping,
 };
 pub use cell::{Curved, Grip};
 pub use solve::{Basis, Change, Load, Material, Options, Reaction, Solution, Solver, Stats, Support, solve};

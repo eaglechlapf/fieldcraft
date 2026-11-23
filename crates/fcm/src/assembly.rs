@@ -982,6 +982,53 @@ pub struct Touch {
     pub pairs: Vec<(u32, u32, f64)>,
 }
 
+/// How far the triangles of `surface` lie from the curved faces they sample, as the triangles
+/// themselves show it: the largest sagitta of a facet, 0 for a body of flat faces. Two bodies
+/// that touch on a curved face were triangulated each on its own, so their triangles there are
+/// up to this far from the face, each body's by its own measure: what [`Bond::tolerance`] must
+/// allow for a mesh whose triangulation was not ours to choose (an imported one).
+///
+/// Across an edge that is no feature edge two facets of one face turn by the angle θ between
+/// their normals. Both are chords of the face's curve there, as wide as the triangle is high
+/// over the edge, w, and a chord of that width over that angle lies (w / 2) tan(θ / 4) from its
+/// arc (the sagitta of a circular segment).
+pub fn facet_deviation(surface: &BoundarySurface) -> f64 {
+    let (points, triangles) = (surface.points(), surface.triangles());
+    let corners = |triangle: usize| -> Option<[[f64; 3]; 3]> {
+        let t = triangles.get(triangle)?;
+        Some([*points.get(t[0] as usize)?, *points.get(t[1] as usize)?, *points.get(t[2] as usize)?])
+    };
+    // A triangle's normal, of the length of twice its area.
+    let normal = |c: &[[f64; 3]; 3]| cross(sub(c[1], c[0]), sub(c[2], c[0]));
+    let feature = grid::feature_flags(surface);
+    let mut most = 0.0f64;
+    for (index, (across, flags)) in surface.neighbors().iter().zip(&feature).enumerate() {
+        let Some(own) = corners(index) else { continue };
+        let own_normal = normal(&own);
+        for edge in 0..3 {
+            // Every edge once, from its lower triangle.
+            let other = across[edge] as usize;
+            if flags[edge] || other <= index {
+                continue;
+            }
+            let Some(other_normal) = corners(other).map(|c| normal(&c)) else { continue };
+            let (doubled, other_doubled) = (dot(own_normal, own_normal).sqrt(), dot(other_normal, other_normal).sqrt());
+            let along = sub(own[(edge + 1) % 3], own[edge]);
+            let length = dot(along, along).sqrt();
+            if !(doubled > 0.0 && other_doubled > 0.0 && length > 0.0) {
+                continue;
+            }
+            let turn = (dot(own_normal, other_normal) / (doubled * other_doubled)).clamp(-1.0, 1.0).acos();
+            let width = doubled.max(other_doubled) / length;
+            let sagitta = 0.5 * width * (0.25 * turn).tan();
+            if sagitta.is_finite() {
+                most = most.max(sagitta);
+            }
+        }
+    }
+    most
+}
+
 /// A face touches another over at least this share of the smaller of the two: less is an edge
 /// or a corner that rests on a face, which is no bond.
 const LEAST_SHARE: f64 = 0.01;

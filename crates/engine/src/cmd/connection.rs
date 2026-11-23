@@ -203,10 +203,13 @@ fn find(s: &mut Session, p: &Value) -> Result<Value> {
             let tolerance = asked
                 .map_or(super::static_grid::default_tolerance(diagonal), |reach| 0.5 * reach)
                 .max(super::static_grid::MIN_RELATIVE_TOLERANCE * diagonal);
+            let surface = super::static_grid::surface(*shape, tolerance)?;
             if asked.is_none() {
+                // An imported mesh lies within what its own triangles show, as in the solve.
+                let tolerance = if shape.imported() { super::static_grid::imported_tolerance(&surface, diagonal) } else { tolerance };
                 reach = reach.max(2.0 * tolerance);
             }
-            surfaces.push(super::static_grid::surface(*shape, tolerance)?);
+            surfaces.push(surface);
         }
         fieldcraft_model::progress::stage("connections", None, "");
         fieldcraft_model::progress::check()?;

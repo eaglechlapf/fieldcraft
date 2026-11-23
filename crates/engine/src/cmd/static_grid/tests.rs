@@ -844,6 +844,12 @@ fn imported_surface_meshes_are_bonded_where_they_touch() {
     assert_eq!((connection.first.len(), connection.second.len()), (1, 1));
     let stress = r["max_von_mises"]["value"].as_f64().unwrap();
     assert!((stress - PULL).abs() < 0.02 * PULL, "{stress}");
+    // What an imported mesh is triangulated within is read from its triangles, so the faces
+    // that touch are the same whatever rounds of refinement a solve asks for.
+    let within = |r: &Value| -> Vec<f64> { r["bodies"].as_array().unwrap().iter().map(|b| b["tolerance"].as_f64().unwrap()).collect() };
+    let rounds = s.execute("solve.static.grid", &json!({"cell_size": 5, "degree": 2, "adapt": 2, "settle": 0})).unwrap();
+    assert_eq!((within(&rounds), &rounds["connections"][0]["area"]), (within(&r), &r["connections"][0]["area"]));
+    assert!(within(&r).iter().all(|tolerance| *tolerance > 0.0), "{r}");
     // The connections can be found without a solve as well.
     let mut again = imported(2, 10.0);
     let found = again.execute("interaction.connection.find", &json!({})).unwrap();
