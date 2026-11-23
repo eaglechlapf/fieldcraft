@@ -2805,8 +2805,8 @@ pub const SOLVE_STATIC_GRID: &[Field] = &[
         .def("\"model\"")
         .advanced(),
     positive("cell_size", "Cell size", D::Length)
-        .help("The size of the grid's cubic cells, the same everywhere. For a stress peak at a hole or a fillet within about 1 %: two cells per radius of the smallest stressed feature at degree 4, or four at degree 3. Displacements and reactions need far less.")
-        .hint("1/20 of the diagonal"),
+        .help("The size of the grid's cubic cells, the same everywhere. For a stress peak at a hole or a fillet within about 1 %: two cells per radius of the smallest stressed feature at degree 4, or four at degree 3. Displacements and reactions need far less. Empty: chosen for the part, a twentieth of each body's diagonal (larger together when the bodies are many).")
+        .hint("automatic"),
     int("adapt", "Adaptive rounds", 0, super::static_grid::MAX_REFINE)
         .help("Solves, divides the cells the solution is least resolved in and solves again, this many times at most; the rounds end early once one changes the result by little. Each round costs a solve, and the reply says how much the last one still changed the strain energy. Empty: two rounds for a body that is thin for the grid (sheet metal), none otherwise.")
         .hint("automatic"),
@@ -2838,12 +2838,12 @@ pub const SOLVE_STATIC_GRID: &[Field] = &[
         .def("\"auto\"")
         .advanced(),
     positive("tolerance", "Chordal tolerance", D::Length)
-        .help("Largest distance between the triangulated surface, which is all the solver knows of the body, and the true curved surface. Small cells resolve the facets of a fillet as notches, so it is far below the smallest cell.")
-        .hint("smallest cell / 250")
+        .help("Largest distance between the triangulated surface, which is all the solver knows of the body, and the true curved surface. Small cells resolve the facets of a fillet as notches, so it is far below the smallest cell. Empty: 1/250 of the smallest cell.")
+        .hint("automatic")
         .advanced(),
     positive("sample_size", "Result sampling", D::Length)
-        .help("The results are read at points of the body's surface no farther apart than this, for the contours. Where cells are divided, the points are as much closer as the cells are smaller.")
-        .hint("cell size / degree")
+        .help("The results are read at points of the body's surface no farther apart than this, for the contours. Where cells are divided, the points are as much closer as the cells are smaller. Empty: the cell size over the degree.")
+        .hint("automatic")
         .advanced(),
     MAX_DOFS.advanced(),
     MAX_FACTOR.advanced(),

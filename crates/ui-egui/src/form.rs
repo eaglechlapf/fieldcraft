@@ -2412,6 +2412,12 @@ pub(crate) mod tests {
 
     /// The labels one frame of `fields` draws with `params`, `problems` shown as after OK.
     fn drawn_labels(fields: &'static [Field], params: Value, problems: &[(String, String)]) -> Vec<String> {
+        drawn_form(fields, params, problems).0
+    }
+
+    /// The labels and the hints of the empty text boxes one frame of `fields` draws with
+    /// `params`, `problems` shown as after OK.
+    fn drawn_form(fields: &'static [Field], params: Value, problems: &[(String, String)]) -> (Vec<String>, Vec<String>) {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         let mut params = params.as_object().cloned().unwrap_or_default();
@@ -2429,10 +2435,15 @@ pub(crate) mod tests {
                 picked: Picked::default(),
                 selection: None,
             };
-            show(ui, &Tokens::get(false), &cx, fields, &mut params);
+            // As wide as the context panel draws a form.
+            ui.vertical(|ui| {
+                ui.set_max_width(crate::context::inner_width());
+                show(ui, &Tokens::get(false), &cx, fields, &mut params);
+            });
         });
         out.textures_delta.clear();
-        out.platform_output.accesskit_update.iter().flat_map(|u| u.nodes.iter().filter_map(|(_, n)| n.label().map(str::to_string))).collect()
+        let nodes = || out.platform_output.accesskit_update.iter().flat_map(|u| u.nodes.iter().map(|(_, n)| n));
+        (nodes().filter_map(|n| n.label().map(str::to_string)).collect(), nodes().filter_map(|n| n.placeholder().map(str::to_string)).collect())
     }
 
     /// The grid solve's form shows what a mechanical engineer sets (the step, the body, the cell
@@ -2451,8 +2462,15 @@ pub(crate) mod tests {
         }
         assert!(grid.iter().filter(|f| f.advanced).count() >= 10 && grid.iter().filter(|f| !f.advanced).count() == 4);
         // A problem with a folded setting opens the fold.
-        let refused = drawn_labels(grid, json!({"degree": 99}), &[("degree".into(), "Degree: at most 8".into())]);
+        let (refused, hints) = drawn_form(grid, json!({"degree": 99}), &[("degree".into(), "Degree: at most 8".into())]);
         assert!(has(&refused, "Degree") && has(&refused, "Solver"), "{refused:?}");
+        // An empty number shows what it is left to (a hint too long for its box would show
+        // nothing at all): the cell size, the rounds, the tolerance and the sampling are
+        // automatic.
+        for f in grid.iter().filter(|f| matches!(f.kind, Kind::Number { .. } | Kind::Integer { .. }) && !f.hint.is_empty() && f.key != "degree") {
+            assert!(hints.iter().any(|h| h == f.hint), "{}: {:?} among {hints:?}", f.label, f.hint);
+        }
+        assert_eq!(hints.iter().filter(|h| *h == "automatic").count(), 4, "{hints:?}");
         // Every field of a form with none marked advanced is drawn as it was.
         let plain = fieldcraft_engine::commands().iter().find(|c| c.id == "solve.static").and_then(|c| c.form).expect("the static solve's form");
         assert!(plain.iter().all(|f| !f.advanced));
