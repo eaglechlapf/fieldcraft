@@ -246,14 +246,19 @@ pub struct Options {
     /// solves again. How well a cell resolves the solution is read from the solution itself:
     /// the strain energy of the part of it that only the functions of the highest degree carry
     /// in that cell (the hierarchic indicator of the p-version: B. Szabó, I. Babuška, *Finite
-    /// Element Analysis*, Wiley 1991; a field the lower degrees represent has none). The cells
-    /// that carry [`Options::SHARE`] of the sum, largest first, are divided (W. Dörfler, *A
-    /// convergent adaptive algorithm for Poisson's equation*, SIAM J. Numer. Anal.
-    /// 33(3):1106–1124, 1996), each round at most one level deeper than the last, so a stress
-    /// that is singular (a sharp re-entrant edge, the end of a support) takes a round's share
-    /// and no more. A round whose system would be too large is left out, and the solution
-    /// before it is the result ([`Stats::left_out`]). [`Stats::rounds`] counts the rounds, and
-    /// [`Stats::settled`] is how much the last one still changed the strain energy.
+    /// Element Analysis*, Wiley 1991; a field the lower degrees represent has none), or the
+    /// cell's whole strain energy where that is less: both bound what the lower degrees leave
+    /// of the solution in the cell, by dropping the highest functions or all of them. The
+    /// second keeps a cell that holds a sliver of material, where the highest functions and the
+    /// lower ones carry large parts that cancel, from taking a round's share alone and ending
+    /// the rounds as settled when dividing it changes nothing. The cells that carry
+    /// [`Options::SHARE`] of the sum, largest first, are divided (W. Dörfler, *A convergent
+    /// adaptive algorithm for Poisson's equation*, SIAM J. Numer. Anal. 33(3):1106–1124, 1996),
+    /// each round at most one level deeper than the last, so a stress that is singular (a sharp
+    /// re-entrant edge, the end of a support) takes a round's share and no more. A round whose
+    /// system would be too large is left out, and the solution before it is the result
+    /// ([`Stats::left_out`]). [`Stats::rounds`] counts the rounds, and [`Stats::settled`] is
+    /// how much the last one still changed the strain energy.
     ///
     /// The indicator ranks the cells of one solution; it is not a measure of the error. Summed
     /// over the part it is no fraction of the strain energy: in a cell that holds a thin slab
@@ -2135,7 +2140,10 @@ fn solve_at(
             for (row, x) in k.chunks_exact(n).zip(&local) {
                 energy += x * row.iter().zip(&local).map(|(a, b)| a * b).sum::<f64>();
             }
-            // And of what the functions of the highest degree alone carry ([`Options::adapt`]).
+            // And of what the functions of the highest degree alone carry ([`Options::adapt`]),
+            // or the cell's whole energy where that is less: both bound what the lower degrees
+            // leave of the solution in the cell (dropping the highest, or dropping all), and in
+            // a sliver of material the highest and the lower ones carry large parts that cancel.
             let highest = |unknown: usize| top.get(unknown / 3).copied().unwrap_or(false);
             let mut surplus = 0.0;
             for (r, (row, x)) in k.chunks_exact(n).zip(&local).enumerate() {
@@ -2143,7 +2151,7 @@ fn solve_at(
                     surplus += x * row.iter().zip(&local).enumerate().filter(|(c, _)| highest(*c)).map(|(_, (a, b))| a * b).sum::<f64>();
                 }
             }
-            (0.5 * energy, 0.5 * surplus)
+            (0.5 * energy, 0.5 * surplus.min(energy.max(0.0)))
         });
         for (energy, most) in energies {
             strain_energy += energy;

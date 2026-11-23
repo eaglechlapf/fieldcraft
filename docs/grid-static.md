@@ -174,10 +174,14 @@ look at it.
 With **Adaptive rounds** (`adapt`) the step is solved, the cells the solution is least resolved
 in are divided into eight, and the step is solved again, as many times as there are rounds. How
 well a cell resolves the solution is read from the solution itself: the strain energy of the
-part of it that only the functions of the highest degree carry in that cell, which is none
-where the lower degrees already represent the field (the hierarchic indicator of the p-version:
-Szabó & Babuška, *Finite Element Analysis*, 1991). The cells that carry nine tenths of the sum
-are divided, largest first (Dörfler, 1996). Each round is a whole solve on a larger system.
+part of it that only the functions of the highest degree carry in that cell, which is none where
+the lower degrees already represent the field (the hierarchic indicator of the p-version: Szabó
+& Babuška, *Finite Element Analysis*, 1991), or the cell's whole strain energy where that is
+less. Both bound what the lower degrees leave of the solution in the cell (by dropping the
+highest functions, or all of them), and the second keeps a cell that holds a sliver of material
+from taking every round: there the highest functions and the lower ones carry large parts that
+cancel. The cells that carry nine tenths of the sum are divided, largest first (Dörfler, 1996).
+Each round is a whole solve on a larger system.
 
 The rounds end early once one moves the solution by no more than `settle`: the distance between
 two rounds' solutions in the energy norm, relative to the solution, which is the square root of
@@ -218,16 +222,16 @@ trunk space of Szabó and Babuška carries only those of total degree up to the 
 cell: it still holds every polynomial of that degree, and lacks the products beyond it. Cell
 for cell it is the less accurate, and on cells that are the same everywhere it needs about two
 degrees more for the same stress. Where the cells are divided as the part needs it, smaller
-cells make up for what it lacks, and it is the cheaper way to the same accuracy:
+cells make up for what it lacks, and it is the cheaper way to about the same accuracy:
 
 | | Tensor product | Trunk space |
 |---|---|---|
 | Hole of one cell's radius, cells divided twice there, degree 3: stress at the hole over six grid positions | ± 0.7 %, 78 000 unknowns | ± 1.1 %, 24 000 unknowns |
 | the same, trunk space at degree 4 | | ± 0.5 %, 42 000 unknowns |
-| Tray hung by one wall, two rounds: sag | −0.6 %, 322 000 unknowns, 17 s | −1.1 %, 145 000 unknowns, 9 s |
-| Tray bolted, two rounds: sag | −0.2 % after one round (the second does not fit), 12 s | 0.0 %, 156 000 unknowns, 10 s |
-| Sample bracket as the form opens, degree 3: peak on the fillet | 212.5 MPa (−0.2 %), 145 000 unknowns, 3.7 s | 210.5 MPa (−1.2 %), 40 000 unknowns, 1.3 s |
-| the same, trunk space at degree 4 | | 212.4 MPa (−0.3 %), 73 000 unknowns, 2.4 s |
+| Tray hung by one wall, two rounds: sag | −0.2 %, 513 000 unknowns, 20 s | −1.8 %, 165 000 unknowns, 9 s |
+| Tray bolted, two rounds: sag | +0.4 %, 874 000 unknowns, 30 s | +0.2 %, 266 000 unknowns, 12 s |
+| Sample bracket as the form opens, degree 3: peak on the fillet | 212.5 MPa (−0.2 %), 145 000 unknowns, 2.1 s | 210.5 MPa (−1.2 %), 40 000 unknowns, 1.3 s |
+| the same, trunk space at degree 4 | | 212.4 MPa (−0.3 %), 73 000 unknowns, 1.5 s |
 
 The form's **Shape functions** is *Automatic*: the trunk space for a body that is thin for the
 grid, where the rounds divide the cells anyway, and the tensor product otherwise, which is what
@@ -292,7 +296,7 @@ with the default triangulation:
 | 4 mm | 0 | 4 mm | 3 | 80 340 | 1.5 s | 210.8 MPa | −1.0 % |
 | 4 mm | 0 | 4 mm | 4 | 183 573 | 5.5 s | 210.9 MPa | −1.0 % |
 | 3 mm | 0 | 3 mm | 3 | 153 699 | 3.3 s | 208.1 MPa | −2.3 % |
-| **4.39 mm (the default)** | **1** | **2.2 mm** | **3** | **145 077** | **3.6 s** | **212.5 MPa** | **−0.2 %** |
+| **4.39 mm (the default)** | **1** | **2.2 mm** | **3** | **145 077** | **2.1 s** | **212.5 MPa** | **−0.2 %** |
 | 8 mm | 1 | 4 mm | 3 | 51 816 | 1.2 s | 201.3 MPa | −5.5 % |
 | 8 mm | 2 | 2 mm | 3 | 144 348 | 4.1 s | 211.6 MPa | −0.6 % |
 | 12 mm | 2 | 3 mm | 3 | 94 893 | 2.4 s | 217.7 MPa | +2.2 % |
@@ -469,7 +473,7 @@ the other nothing.
 walls 50 mm high bent up from its floor (inside bend radius 2 mm), holes in the floor and the
 walls, and four open corners, where the ends of two walls are 2 mm apart. The form as it opens
 gives cells of 25 mm, a dozen sheet thicknesses. The reference is FieldCraft's own mesh solve of
-the same model on quadratic tetrahedra of 4 mm (920 000 unknowns; 44 s to mesh and 20 s to
+the same model on quadratic tetrahedra of 4 mm (920 000 unknowns; 44 s to mesh and 16 s to
 solve, and only with `max_factor_entries` raised to 1.5 billion: with the default the mesh
 solve is refused). Both are read at the same point, the mesh's node on the passage's edge at
 (30, 0, 2): hung by one wall the sag changes by 0.02 mm for every millimetre there, and the
@@ -480,19 +484,19 @@ mesh solve gives 2.104 and 2.106 mm on tetrahedra of 3 and 2.5 mm.
 | Mesh solve (reference) | 0.1532 mm | 2.105 mm |
 | Grid, gaps joined | 0.1508 mm (−1.6 %), 3 s | 0.027 mm (−98.7 %), 3 s |
 | Grid, gaps open, no cells divided where they end (the solver's option, not the form's) | 0.1518 mm (−0.9 %) | 1.054 mm (−50 %) |
-| Grid, gaps open, tensor product, no round that follows the solution (`"basis": "tensor", "adapt": 0`) | 0.1520 mm (−0.8 %), 4.3 s | 1.914 mm (−9.1 %), 4.5 s |
+| Grid, gaps open, tensor product, no round that follows the solution (`"basis": "tensor", "adapt": 0`) | 0.1520 mm (−0.8 %), 3.9 s | 1.914 mm (−9.1 %), 3.7 s |
 | the same on cells of 12.5 mm | | 2.042 mm (−3.0 %), 9 s |
-| Grid, gaps open, tensor product, rounds that follow the solution (`"basis": "tensor"`) | 0.1530 mm (−0.2 %), 12 s | 2.093 mm (−0.6 %), 17 s |
-| Grid, gaps open, trunk space, no round (`"adapt": 0`) | 0.1497 mm (−2.3 %), 2.3 s | 1.834 mm (−12.9 %), 2.3 s |
-| **Grid as the form opens** (gaps open, trunk space, rounds that follow the solution) | **0.1532 mm (0.0 %), 10 s** | **2.082 mm (−1.1 %), 9 s** |
+| Grid, gaps open, tensor product, rounds that follow the solution (`"basis": "tensor"`) | 0.1538 mm (+0.4 %), 30 s | 2.100 mm (−0.2 %), 20 s |
+| Grid, gaps open, trunk space, no round (`"adapt": 0`) | 0.1497 mm (−2.3 %), 2.0 s | 1.834 mm (−12.9 %), 2.1 s |
+| **Grid as the form opens** (gaps open, trunk space, rounds that follow the solution) | **0.1536 mm (+0.2 %), 12 s** | **2.066 mm (−1.8 %), 9 s** |
 
 **Against the mesh solve in time.** Asked for tetrahedra of 25 down to 4 mm, the mesher gives
 this tray 156 000 quadratic elements every time: the sheet's thickness and its bends set the
-size, not the request. Meshing takes 44 s and the solve 20 s (918 000 unknowns, with the
-factor's cap raised), 64 s against the grid's 9 s as the form opens, for results 1 % apart. On
-the sample bracket, a thick part, it is the other way round: tetrahedra of the default size
-(4.39 mm, 35 000 unknowns) mesh and solve in 2.6 s and read 212.6 MPa on the fillet, where the
-grid takes 3.7 s for 212.5 MPa; finer meshes of it read between −1.5 % and +1.5 % of 213 MPa
+size, not the request. Meshing takes 44 s and the solve 16 s (918 000 unknowns, with the
+factor's cap raised), 60 s against the grid's 9 s as the form opens, for results 2 % apart. On
+the sample bracket, a thick part, the two are close: tetrahedra of the default size
+(4.39 mm, 37 000 unknowns) mesh and solve in 2.8 s and read 212.6 MPa on the fillet, where the
+grid takes 2.1 s for 212.5 MPa; finer meshes of it read between −1.5 % and +1.5 % of 213 MPa
 (tetrahedra of 3, 2, 1.5 and 1 mm, 4 to 140 s). The grid's case is the part a mesher has to
 work for (thin sheet, small features on a large part), and the part that is not meshed at all.
 
@@ -510,15 +514,15 @@ the bend divided once, 2 % divided twice and 0.7 % divided three times. Dividing
 every bend and hole that far is more than the solver holds (cells of 12.5 mm divided once are
 3 % low with 400 000 unknowns), which is what the rounds that follow the solution are for:
 they divide the cells of the bend that carries the load. In the trunk space, which a thin
-body takes, the tray hung by one wall is 1.1 % low after two of them with 145 000 unknowns,
-and 0.5 % above the mesh solve after three (`"adapt": 3`, 219 000 unknowns, 18 s), which is
-about as well as the mesh solve itself is known; bolted, the sag is within 0.1 % after two. The von Mises stress at seven points of the floor (measured once, not kept as
+body takes, the tray hung by one wall is 1.8 % low after two of them with 165 000 unknowns,
+and 0.4 % above the mesh solve after three (`"adapt": 3`, 315 000 unknowns, 19 s), which is
+about as well as the mesh solve itself is known; bolted, the sag is within 0.2 % after two. The von Mises stress at seven points of the floor (measured once, not kept as
 a test) is within 1 % of the mesh solve's at six of them and 4 % low at one, where it is up
 to 14 % low without the rounds.
 
 Each round still divides a cell along all three axes where a bend needs it across the bend
 only. So the rounds buy accuracy at a price: the default takes 9 s on this tray where a solve
-without them takes 2.3 s, and the reply's warning says when the result was still changing as
+without them takes 2.1 s, and the reply's warning says when the result was still changing as
 they ended (here by 4 % of the strain energy in the last round). Cells that follow the sheet
 (divided across a bend only) are the next step for it.
 
