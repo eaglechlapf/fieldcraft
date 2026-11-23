@@ -13,11 +13,14 @@ use super::*;
 const ENLARGE: usize = 3;
 
 /// How often the unknowns are counted to fit the default cells to their budget: a count shows
-/// how far the cells are from it, and the next ones are that much larger.
-const FIT: usize = 4;
+/// how far the cells are from it, two of them how fast the unknowns fall as the cells grow, and
+/// the next cells are as much larger as that takes: the third count is at the budget where the
+/// unknowns fall evenly, and the others are for where they do not.
+const FIT: usize = 6;
 
-/// The least a round of fitting enlarges the cells by: what the cells cut by the surfaces, whose
-/// number falls more slowly than the others', leave over of the step before.
+/// The least a round of fitting enlarges the cells by: a count moves by about as much from one
+/// cell size to the next, as whole cells leave the grids, and a smaller step may leave it
+/// where it is.
 const FIT_STEP: f64 = 1.03;
 
 /// The unknowns a compact body has at the default cell size: a cube's, with cells
@@ -495,21 +498,38 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let mut kept = fieldcraft_fcm::Kept::default();
     // The default cells: a twentieth of each body's own diagonal, and all of them larger by one
     // factor when the bodies would have more unknowns between them than one compact body has.
-    // The unknowns are counted on the bodies' grids, with nothing added up or solved.
+    // The unknowns are those of the bodies' cells, counted on their grids with nothing
+    // integrated, added up or solved (`fieldcraft_fcm::assembly_unknowns`).
     if default_cells {
         let budget = compact_unknowns(degree);
         // Counted against the solver's own limit: a lower one refuses the solve below, which
         // then says that it made the cells larger.
         let countable = Limits { max_dofs: Limits::MAX_DOFS, ..limits };
+        // The count before this one, and the factor between its cells and these.
+        let mut before: Option<(f64, f64)> = None;
         for _ in 0..FIT {
             fieldcraft_model::progress::check()?;
             let parts = parts_of(&prepared);
-            let by = match with_threads(threads, || assembly_unknowns_keeping(&parts, &bonds, &countable, &mut kept)) {
+            let unknowns = match with_threads(threads, || assembly_unknowns_keeping(&parts, &bonds, &countable, &mut kept)) {
                 Ok(unknowns) if unknowns as f64 <= budget => break,
-                Ok(unknowns) => (unknowns as f64 / budget).cbrt().max(FIT_STEP),
-                Err(fieldcraft_fcm::Error::Limit(_)) => 2f64.cbrt(),
+                Ok(unknowns) => unknowns as f64,
+                Err(fieldcraft_fcm::Error::Limit(_)) => {
+                    before = None;
+                    grow(&mut prepared, 2f64.cbrt());
+                    continue;
+                }
                 Err(e) => return Err(grid_error(e)),
             };
+            // The unknowns fall as a power of the cells' size: its cube in a compact body, its
+            // square in a sheet thinner than its cells, and something between in an assembly of
+            // both. The two counts there are give it; one alone is taken for a compact body's,
+            // which makes the step too short and never too long.
+            let power = match before {
+                Some((more, by)) if more > unknowns && by > 1.0 => ((more / unknowns).ln() / by.ln()).clamp(1.0, 3.0),
+                _ => 3.0,
+            };
+            let by = (unknowns / budget).powf(1.0 / power).max(FIT_STEP);
+            before = Some((unknowns, by));
             grow(&mut prepared, by);
         }
     }

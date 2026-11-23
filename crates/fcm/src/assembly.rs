@@ -744,10 +744,20 @@ fn refuse_free(motions: &[Motion]) -> Result<()> {
     )))
 }
 
-/// The unknowns [`solve_assembly`] would solve for: the bodies' grids are built, their cells
-/// sorted and the cut ones integrated, which tells the pieces of material in a cell apart;
-/// nothing is added up or solved. For choosing cell sizes that fit a budget before the work
-/// is done; a solve on the same cells takes what was worked out from [`Kept`].
+/// The unknowns of the bodies' cells: their grids are built, the surfaces sorted into them and
+/// the cells divided where a surface turns ([`Options::refine`]); nothing is integrated, added
+/// up or solved. For choosing cell sizes that fit a budget before the work is done; a solve on
+/// the same cells takes what was worked out from [`Kept`].
+///
+/// [`solve_assembly`] solves for these where every cell holds one piece of material. Pieces it
+/// tells apart in a cell ([`Options::separate`]) and cells it divides where a gap between them
+/// ends ([`Options::gaps`]) come on top, and are left out here for two reasons. They are known
+/// only once the cut cells are integrated, which is most of the work before a solve. And
+/// whether a gap's end is divided depends on where the grid lies on the part: a function holds
+/// the two sides of a gap together when its cells reach around the gap's root, which they do on
+/// one grid and not on another. The fork of `tests/gap.rs` has 27 183 unknowns on cells of
+/// 19.8 mm and 54 219 on cells of 20.2 mm; without the gap's end 3 234 on both, and the count
+/// falls evenly as the cells grow, which is what a cell size can be fitted to.
 pub fn assembly_unknowns(parts: &[Part], bonds: &[Bond], limits: &Limits) -> Result<usize> {
     assembly_unknowns_keeping(parts, bonds, limits, &mut Kept::default())
 }

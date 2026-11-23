@@ -16,7 +16,7 @@
 mod common;
 
 use common::{AT_X0, AT_Y0, AT_Z0, AT_Z1, INNER, ROOT, TIP_UPPER, fork, quarter_tube};
-use fieldcraft_fcm::{Load, Material, Options, Solution, Support, solve};
+use fieldcraft_fcm::{Load, Material, Options, Part, Solution, Support, assembly_unknowns, solve};
 use fieldcraft_solver::Limits;
 
 const STEEL: Material = Material { young: 210e9, poisson: 0.3, density: 7850.0 };
@@ -114,6 +114,24 @@ fn cells_are_divided_where_the_gap_ends() {
 }
 
 /// The same bits on one thread and on several, with islands and cells divided where the gap ends.
+/// A count of the unknowns is of the cells as they are before a cut cell is integrated: every
+/// cell one piece of material, none divided where the gap ends, whatever the solve is asked
+/// to do there. The solve has more: the prongs' unknowns apart, and the cells at the root.
+#[test]
+fn the_unknowns_are_counted_before_the_pieces_in_a_cell_are_told_apart() {
+    let surface = fork(ROOT_LENGTH, LENGTH, THICKNESS, GAP, DEPTH);
+    let supports = [Support { face: ROOT, fixed: [true; 3], value: [0.0; 3] }];
+    let loads = [Load::Traction { face: TIP_UPPER, traction: [STRESS, 0.0, 0.0] }];
+    let count = |options: Options| {
+        let part = Part { surface: &surface, material: STEEL, supports: &supports, loads: &loads, options, curved: &[] };
+        assembly_unknowns(&[part], &[], &Limits::default()).unwrap()
+    };
+    let joined = pulled(&Options { separate: false, ..options(0) }).stats.unknowns;
+    assert_eq!([count(options(0)), count(options(3)), count(Options { separate: false, ..options(0) })], [joined; 3]);
+    let (apart, divided) = (pulled(&options(0)).stats.unknowns, pulled(&options(3)).stats.unknowns);
+    assert!(joined < apart && apart < divided, "{joined}, {apart} and {divided} unknowns");
+}
+
 #[test]
 fn the_result_with_islands_does_not_depend_on_the_threads() {
     let run = |threads: usize| {

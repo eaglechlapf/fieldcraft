@@ -1313,7 +1313,9 @@ pub(crate) struct Round {
     before: Option<(usize, usize)>,
     /// What the body's solves keep for each other.
     memory: Arc<Memory>,
-    /// Whether the unknowns are only counted: they are not put in an order then.
+    /// Whether the unknowns are only counted ([`crate::assembly_unknowns`]): no cut cell is
+    /// integrated then, so every cell is one piece of material and none is divided where a gap
+    /// ends, and the unknowns are not put in an order.
     counting: bool,
 }
 
@@ -1646,9 +1648,11 @@ fn solve_at(
     let (second_rule, third_rule) = (gauss_legendre(2 * p + 1), gauss_legendre(3 * p + 2));
     let mut cuts: Vec<Option<Arc<CutLeaf>>> = Vec::new();
     // The cut cells of the solve before ([`Options::reuse`]), when they were integrated as
-    // this one's are, on this grid.
+    // this one's are, on this grid. A count of the unknowns integrates none and leaves them
+    // where they are.
+    let counting = round.counting;
     let cuts_of: CutsOf = (of_surface.of, grid, [finest, p, options.depth], [options.separate, options.exact]);
-    let before = std::mem::take(&mut *round.memory.cuts.lock().map_err(in_use)?);
+    let before = if counting { Cuts::default() } else { std::mem::take(&mut *round.memory.cuts.lock().map_err(in_use)?) };
     let reused = (options.reuse && before.of == Some(cuts_of)).then_some(&before.cells);
     let mut links: Vec<[u32; 4]> = Vec::new();
     // What the ends of gaps may cost: as many cells again as hold material, or [`GAP_CELLS`]
@@ -1659,7 +1663,7 @@ fn solve_at(
     // that are already small beside larger ones take a round more for every level between
     // them: as many rounds as the levels asked for and the levels there are.
     let rounds = if options.gaps == 0 { 0 } else { (options.gaps + tree.deepest()).min(2 * MAX_REFINE) };
-    for round in 0..=rounds {
+    for round in 0..if counting { 0 } else { rounds + 1 } {
         cuts.resize(tree.nodes.len(), None);
         let mut todo = Vec::new();
         for (node, cell) in tree.nodes.iter().enumerate() {
@@ -1739,7 +1743,7 @@ fn solve_at(
     cuts.resize(tree.nodes.len(), None);
     drop(before);
     // For the solve after this one.
-    if options.reuse {
+    if options.reuse && !counting {
         let cells = (tree.nodes.iter().zip(&cuts)).filter_map(|(cell, leaf)| Some(((cell.level, cell.ijk), Arc::clone(leaf.as_ref()?)))).collect();
         *round.memory.cuts.lock().map_err(in_use)? = Cuts { of: Some(cuts_of), cells };
     }
@@ -1760,7 +1764,7 @@ fn solve_at(
         &shapes.modes,
         p,
         &|node| cut_of(node as usize).map_or(1, CutLeaf::islands),
-        options.separate.then_some(&links[..]),
+        (options.separate && !counting).then_some(&links[..]),
     );
     let separated = space.told_apart;
     let elements = space.elements.len();
