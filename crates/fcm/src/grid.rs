@@ -316,35 +316,51 @@ pub struct Sorted {
     pub pieces: Vec<Vec<Piece>>,
 }
 
+/// Triangles one task sorts into the cells ([`sort_surface`]).
+const SORTED_AT_ONCE: usize = 2048;
+
 /// Sort triangles (already snapped to the grid, [`Grid::snap`]) into the grid's cells.
 pub fn sort_surface(grid: &Grid, triangles: &[[[f64; 3]; 3]]) -> Sorted {
     let mut sorted = Sorted { touching: vec![Vec::new(); grid.len()], pieces: vec![Vec::new(); grid.len()] };
     let half = [0.5 * grid.spacing * (1.0 + GROW); 3];
-    for (t, triangle) in triangles.iter().enumerate() {
-        let normal = cross(sub(triangle[1], triangle[0]), sub(triangle[2], triangle[0]));
-        let mut ranges = [(0usize, 0usize); 3];
-        for a in 0..3 {
-            let (lo, hi) = (triangle[0][a].min(triangle[1][a]).min(triangle[2][a]), triangle[0][a].max(triangle[1][a]).max(triangle[2][a]));
-            ranges[a] = grid.range(a, lo, hi);
-        }
-        for k in ranges[2].0..=ranges[2].1 {
-            for j in ranges[1].0..=ranges[1].1 {
-                for i in ranges[0].0..=ranges[0].1 {
-                    let ijk = [i, j, k];
-                    let (lo, hi) = (grid.lo(ijk), grid.hi(ijk));
-                    let centre = [0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1]), 0.5 * (lo[2] + hi[2])];
-                    if !overlaps(triangle, centre, half) {
-                        continue;
-                    }
-                    let cell = grid.index(ijk);
-                    if let Some(list) = sorted.touching.get_mut(cell) {
-                        list.push(t as u32);
-                    }
-                    if let Some(pieces) = sorted.pieces.get_mut(cell) {
-                        own_pieces(triangle, t as u32, normal, lo, hi, pieces);
+    // The triangles by the block: the cells each reaches and the pieces they own of it, found
+    // on any thread and put into the cells' lists in the triangles' order.
+    let found = fieldcraft_parallel::map(triangles.len().div_ceil(SORTED_AT_ONCE), |block| {
+        let (mut reached, mut pieces): (Vec<(usize, u32, usize)>, Vec<Piece>) = (Vec::new(), Vec::new());
+        for (t, triangle) in triangles.iter().enumerate().skip(block * SORTED_AT_ONCE).take(SORTED_AT_ONCE) {
+            let normal = cross(sub(triangle[1], triangle[0]), sub(triangle[2], triangle[0]));
+            let mut ranges = [(0usize, 0usize); 3];
+            for a in 0..3 {
+                let (lo, hi) = (triangle[0][a].min(triangle[1][a]).min(triangle[2][a]), triangle[0][a].max(triangle[1][a]).max(triangle[2][a]));
+                ranges[a] = grid.range(a, lo, hi);
+            }
+            for k in ranges[2].0..=ranges[2].1 {
+                for j in ranges[1].0..=ranges[1].1 {
+                    for i in ranges[0].0..=ranges[0].1 {
+                        let ijk = [i, j, k];
+                        let (lo, hi) = (grid.lo(ijk), grid.hi(ijk));
+                        let centre = [0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1]), 0.5 * (lo[2] + hi[2])];
+                        if !overlaps(triangle, centre, half) {
+                            continue;
+                        }
+                        own_pieces(triangle, t as u32, normal, lo, hi, &mut pieces);
+                        reached.push((grid.index(ijk), t as u32, pieces.len()));
                     }
                 }
             }
+        }
+        (reached, pieces)
+    });
+    for (reached, pieces) in found {
+        let mut from = 0;
+        for (cell, t, to) in reached {
+            if let Some(list) = sorted.touching.get_mut(cell) {
+                list.push(t);
+            }
+            if let (Some(list), Some(own)) = (sorted.pieces.get_mut(cell), pieces.get(from..to)) {
+                list.extend_from_slice(own);
+            }
+            from = to;
         }
     }
     sorted

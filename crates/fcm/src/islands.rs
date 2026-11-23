@@ -597,19 +597,89 @@ fn width(first: &Held, first_island: u16, second: &Held, second_island: u16) -> 
             .collect()
     };
     let (a, b) = (of(first, first_island), of(second, second_island));
-    let mut least = f64::INFINITY;
-    for (from, to) in [(&a, &b), (&b, &a)] {
-        for piece in from {
+    // What the distances may round by: far below any gap, far above the last digits of the
+    // coordinates.
+    let size = a.iter().chain(&b).flat_map(|piece| piece.corners).flatten().fold(0.0f64, |most, x| most.max(x.abs()));
+    let slack = (ROUNDING * size) * (ROUNDING * size);
+    let least = nearer(&b, &a, nearer(&a, &b, f64::INFINITY, slack), slack);
+    least.sqrt()
+}
+
+/// What a distance is taken to round by at most, as a fraction of the coordinates.
+const ROUNDING: f64 = 1e-9; // unit-factors: a ratio of two lengths
+/// How many times the least squared distance found a bound has to be for a piece to be left
+/// out: a little more than once, for the rounding of the two.
+const BEYOND: f64 = 1.000_001; // unit-factors: a ratio of two squared lengths
+
+/// The least squared distance from the corners and the middle of each piece of `from` to the
+/// pieces of `to`, or `least` when none is below it. Every distance that could be the least is
+/// worked out as it always was; the pieces whose box lies farther from a point than the least
+/// found so far are left out, which finds them along the axis the pieces spread farthest on.
+/// That is what makes a dense surface affordable: two islands of a thousand pieces each are
+/// four million distances from every point to every piece.
+fn nearer(from: &[Piece], to: &[Piece], mut least: f64, slack: f64) -> f64 {
+    let boxes: Vec<([f64; 3], [f64; 3])> = to
+        .iter()
+        .map(|piece| {
             let [p, q, r] = piece.corners;
-            let middle = [0, 1, 2].map(|i| (p[i] + q[i] + r[i]) / 3.0);
-            for x in [p, q, r, middle] {
-                for other in to {
-                    least = least.min(distance_squared(x, &other.corners));
+            ([0, 1, 2].map(|i| p[i].min(q[i]).min(r[i])), [0, 1, 2].map(|i| p[i].max(q[i]).max(r[i])))
+        })
+        .collect();
+    let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+    for (low, high) in &boxes {
+        for i in 0..3 {
+            lo[i] = lo[i].min(low[i]);
+            hi[i] = hi[i].max(high[i]);
+        }
+    }
+    let axis = if hi[0] - lo[0] >= hi[1] - lo[1] && hi[0] - lo[0] >= hi[2] - lo[2] {
+        0
+    } else if hi[1] - lo[1] >= hi[2] - lo[2] {
+        1
+    } else {
+        2
+    };
+    // The pieces by the middle of their box along the axis, and how far a box reaches from it.
+    let middle = |piece: usize| boxes.get(piece).map_or(0.0, |(low, high)| 0.5 * (low[axis] + high[axis]));
+    let mut order: Vec<usize> = (0..to.len()).collect();
+    order.sort_by(|a, b| middle(*a).total_cmp(&middle(*b)).then(a.cmp(b)));
+    let middles: Vec<f64> = order.iter().map(|piece| middle(*piece)).collect();
+    let reach = boxes.iter().fold(0.0f64, |most, (low, high)| most.max(0.5 * (high[axis] - low[axis])));
+    let beyond = |bound: f64, least: f64| bound > BEYOND * least + slack;
+    for piece in from {
+        let [p, q, r] = piece.corners;
+        let centre = [0, 1, 2].map(|i| (p[i] + q[i] + r[i]) / 3.0);
+        for x in [p, q, r, centre] {
+            let measure = |at: usize, least: &mut f64| {
+                let Some((other, (low, high))) = order.get(at).and_then(|piece| Some((to.get(*piece)?, boxes.get(*piece)?))) else { return };
+                let mut bound = 0.0;
+                for i in 0..3 {
+                    let apart = (low[i] - x[i]).max(x[i] - high[i]).max(0.0);
+                    bound += apart * apart;
                 }
+                if !beyond(bound, *least) {
+                    *least = least.min(distance_squared(x, &other.corners));
+                }
+            };
+            // From the pieces beside the point outwards, each way until the boxes lie too far.
+            let start = middles.partition_point(|middle| *middle < x[axis]);
+            for (at, middle) in middles.iter().enumerate().skip(start) {
+                let apart = middle - x[axis] - reach;
+                if apart > 0.0 && beyond(apart * apart, least) {
+                    break;
+                }
+                measure(at, &mut least);
+            }
+            for (at, middle) in middles.iter().enumerate().take(start).rev() {
+                let apart = x[axis] - middle - reach;
+                if apart > 0.0 && beyond(apart * apart, least) {
+                    break;
+                }
+                measure(at, &mut least);
             }
         }
     }
-    least.sqrt()
+    least
 }
 
 /// The two sides of a gap: two islands (`[node, island, node, island]`) that lie in one cell or
@@ -684,6 +754,63 @@ pub(crate) fn sides<'a>(tree: &Tree, links: &[[u32; 4]], held: &(dyn Fn(usize) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_width_of_a_gap_is_the_least_of_all_the_distances() {
+        // Two sheets of triangles a little apart, tilted and shifted against each other, in
+        // several sizes; every distance worked out for comparison.
+        let sheet = |n: usize, at: f64, tilt: f64, shift: f64, seed: usize| -> Vec<Piece> {
+            let mut pieces = Vec::new();
+            for i in 0..n {
+                for j in 0..n {
+                    let point = |di: usize, dj: usize| {
+                        let (x, y) = ((i + di) as f64 / n as f64 + shift, (j + dj) as f64 / n as f64);
+                        let wave = 0.01 * (((i + di) * 7 + (j + dj) * 13 + seed) as f64).sin();
+                        [x, y, at + tilt * x + wave]
+                    };
+                    pieces.push(Piece { corners: [point(0, 0), point(1, 0), point(0, 1)], triangle: 0 });
+                    pieces.push(Piece { corners: [point(1, 0), point(1, 1), point(0, 1)], triangle: 0 });
+                }
+            }
+            pieces
+        };
+        let every = |a: &[Piece], b: &[Piece]| {
+            let mut least = f64::INFINITY;
+            for (from, to) in [(a, b), (b, a)] {
+                for piece in from {
+                    let [p, q, r] = piece.corners;
+                    for x in [p, q, r, [0, 1, 2].map(|i| (p[i] + q[i] + r[i]) / 3.0)] {
+                        for other in to {
+                            least = least.min(distance_squared(x, &other.corners));
+                        }
+                    }
+                }
+            }
+            least.sqrt()
+        };
+        for (n, m, apart, tilt, shift) in [
+            (1, 1, 0.3, 0.0, 0.0),
+            (6, 9, 0.05, 0.02, 0.0),
+            (12, 5, 0.2, -0.3, 0.4),
+            (9, 9, 0.0, 0.0, 0.0),
+            (7, 11, 0.5, 0.0, 3.0),
+            (10, 3, 1e-7, 0.0, 0.1),
+        ] {
+            let (a, b) = (sheet(n, 0.0, 0.0, 0.0, 1), sheet(m, apart, tilt, shift, 5));
+            // As islands 0 and 1 of one cell, and as the one island of each of two cells.
+            let both: Vec<Piece> = a.iter().chain(&b).copied().collect();
+            let of_piece: Vec<u16> = (0..both.len()).map(|piece| u16::from(piece >= a.len())).collect();
+            let held = |pieces, of_piece| Held { lo: [0.0; 3], hi: [1.0; 3], pieces, of_piece };
+            let expected = every(&a, &b);
+            let one = held(&both[..], &of_piece[..]);
+            assert_eq!(width(&one, 0, &one, 1).to_bits(), expected.to_bits(), "{n} by {m}, {apart} apart");
+            assert_eq!(width(&held(&b[..], &[]), 0, &held(&a[..], &[]), 0).to_bits(), expected.to_bits(), "{n} by {m}, two cells");
+        }
+        // An island with no pieces is infinitely far.
+        let a = sheet(2, 0.0, 0.0, 0.0, 1);
+        let held = Held { lo: [0.0; 3], hi: [1.0; 3], pieces: &a, of_piece: &[] };
+        assert_eq!(width(&held, 0, &held, 1), f64::INFINITY);
+    }
 
     #[test]
     fn sets_join_and_find_the_lowest() {
