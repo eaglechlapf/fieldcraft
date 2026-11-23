@@ -982,6 +982,53 @@ pub struct Touch {
     pub pairs: Vec<(u32, u32, f64)>,
 }
 
+/// How far `x` is from the faces `faces` (their tags) of `surface`: infinite when it has none
+/// of them.
+pub fn distance_to_faces(surface: &BoundarySurface, faces: &[u32], x: [f64; 3]) -> f64 {
+    let points = surface.points();
+    let mut least = f64::INFINITY;
+    for (triangle, tag) in surface.triangles().iter().zip(surface.tri_face()) {
+        if !faces.contains(tag) {
+            continue;
+        }
+        let corner = |v: u32| points.get(v as usize).copied();
+        if let (Some(a), Some(b), Some(c)) = (corner(triangle[0]), corner(triangle[1]), corner(triangle[2])) {
+            least = least.min(crate::islands::distance_squared(x, &[a, b, c]));
+        }
+    }
+    least.sqrt()
+}
+
+/// Triangles of a body's surface that [`meet_in_notch`] looks at, at most.
+const MOST_NEAR: usize = 4096;
+
+/// Whether two bodies whose surfaces near a point are the triangles `first` and `second` meet
+/// there in a notch: a free face of the one and a free face of the other at a re-entrant
+/// corner of the two together, where each lies above the other's plane by more than `touching`
+/// (the end of a bracket that stands on a tube, the end of the upper plate of a lap joint). A
+/// triangle within `touching` of the other body's is where the two are bonded, and is no free
+/// face. Two bodies bonded flush, whose free faces go on in one plane, meet in no notch, and
+/// nor do two faces of one body at a convex edge. At most [`MOST_NEAR`] triangles of each are
+/// looked at, the first ones given.
+pub fn meet_in_notch(first: &[[[f64; 3]; 3]], second: &[[[f64; 3]; 3]], touching: f64) -> bool {
+    let (first, second) = (&first[..first.len().min(MOST_NEAR)], &second[..second.len().min(MOST_NEAR)]);
+    // The free triangles of one side against the other: their centroids and unit normals.
+    let free = |own: &[[[f64; 3]; 3]], other: &[[[f64; 3]; 3]]| -> Vec<([f64; 3], [f64; 3])> {
+        own.iter()
+            .filter_map(|triangle| {
+                let normal = cross(sub(triangle[1], triangle[0]), sub(triangle[2], triangle[0]));
+                let length = dot(normal, normal).sqrt();
+                let centre = [0, 1, 2].map(|a| (triangle[0][a] + triangle[1][a] + triangle[2][a]) / 3.0);
+                let bonded = other.iter().any(|near| crate::islands::distance_squared(centre, near) <= touching * touching);
+                (length > 0.0 && !bonded).then(|| (centre, normal.map(|x| x / length)))
+            })
+            .collect()
+    };
+    let (ours, theirs) = (free(first, second), free(second, first));
+    ours.iter()
+        .any(|(a, normal_a)| theirs.iter().any(|(b, normal_b)| dot(sub(*b, *a), *normal_a) > touching && dot(sub(*a, *b), *normal_b) > touching))
+}
+
 /// How far the triangles of `surface` lie from the curved faces they sample, as the triangles
 /// themselves show it: the largest sagitta of a facet, 0 for a body of flat faces. Two bodies
 /// that touch on a curved face were triangulated each on its own, so their triangles there are

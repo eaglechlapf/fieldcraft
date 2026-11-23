@@ -73,6 +73,77 @@ fn fitting_floor(budget: f64, cells: &[f64], counts: &[f64], powers: &[f64], lea
     above
 }
 
+/// A warning when the largest von Mises stress at the points of the `sampled` surface (of the
+/// bodies `of_body`, with their `values`) lies where two bodies are bonded and meet in a notch
+/// (`fieldcraft_fcm::meet_in_notch`, within a cell of it): where a bonded area ends in a corner
+/// the two bodies meet at an angle with no fillet, at whose root the elastic stress is
+/// unbounded (M. L. Williams, *Stress singularities resulting from various boundary conditions
+/// in angular corners of plates in extension*, J. Appl. Mech. 19(4):526–528, 1952), so the peak
+/// there grows with every refinement and is no value of the part's. On the plate with two
+/// clamps of docs/grid-static.md it was 27 MPa on coarse cells and 39 MPa on fine ones. Two
+/// bodies bonded flush meet in no notch.
+#[allow(clippy::too_many_arguments)]
+fn peak_at_bond(
+    prepared: &[Prepared],
+    solutions: &[fieldcraft_fcm::Solution],
+    sampled: &Sampled,
+    of_body: &[usize],
+    values: &[Option<([f64; 3], [f64; 6])>],
+    bonds: &[Bond],
+    names: &[&str],
+    shown: &dyn Fn(f64) -> String,
+) -> Option<String> {
+    // The largest stress, the first point of it in the bodies' order.
+    let (mut peak, mut most) = (None, f64::NEG_INFINITY);
+    for ((x, body), value) in sampled.points.iter().zip(of_body).zip(values) {
+        if let Some((_, stress)) = value {
+            let stress = fieldcraft_fem::von_mises(stress);
+            if stress > most {
+                (peak, most) = (Some((*x, *body)), stress);
+            }
+        }
+    }
+    let (x, body) = peak?;
+    // A cell of the body where the peak is, and what the bond takes for touching.
+    let cell = solutions.get(body).and_then(|solution| solution.cell_size(x)).or_else(|| prepared.get(body).map(|part| part.options.cell_size))?;
+    // Bonded ones: two bodies that slide carry no shear across their faces.
+    for (bond, name) in bonds.iter().zip(names).filter(|(bond, _)| matches!(bond.grip, Grip::Bonded)) {
+        let other = if bond.first.0 == body {
+            &bond.second
+        } else if bond.second.0 == body {
+            &bond.first
+        } else {
+            continue;
+        };
+        let Some(part) = prepared.get(other.0) else { continue };
+        if !(fieldcraft_fcm::distance_to_faces(&part.surface, &other.1, x) <= bond.tolerance + cell) {
+            continue;
+        }
+        // The sampled triangles of the two bodies within a cell of the peak.
+        let near = |of: usize| -> Vec<[[f64; 3]; 3]> {
+            let corner = |v: u32| sampled.points.get(v as usize).copied();
+            sampled
+                .triangles
+                .iter()
+                .filter(|t| of_body.get(t[0] as usize) == Some(&of))
+                .filter_map(|t| Some([corner(t[0])?, corner(t[1])?, corner(t[2])?]))
+                .filter(|t| t.iter().any(|c| (0..3).all(|a| (c[a] - x[a]).abs() <= cell)))
+                .collect()
+        };
+        if fieldcraft_fcm::meet_in_notch(&near(body), &near(other.0), bond.tolerance) {
+            let own = prepared.get(body).map_or("", |part| part.shape.name);
+            return Some(format!(
+                "the largest stress is where `{}` and `{}` are bonded (connection `{}`), within a cell ({}) of the bonded faces: where a bonded area ends in a corner (a bracket on a tube, a lap joint), the bodies meet in a sharp notch whose stress grows with every refinement and has no value of its own, as at the root of a weld that is not modelled; read the stress a few cells away from it, and give the joint the weld's shape to know the stress in it",
+                short(own),
+                short(part.shape.name),
+                short(name),
+                shown(cell),
+            ));
+        }
+    }
+    None
+}
+
 /// One body, ready for the solver.
 struct Prepared<'a> {
     shape: Solid<'a>,
@@ -467,13 +538,14 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let joints = joints(&connections, &shapes, reach)?;
     let touching = bond_areas(&parts_of(&prepared), &joints).map_err(grid_error)?;
     // What the solver joins: not what is free, and not faces that do not touch.
-    let mut bonds: Vec<Bond> = Vec::new();
+    let (mut bonds, mut bond_names): (Vec<Bond>, Vec<&str>) = (Vec::new(), Vec::new());
     for (((name, connection), bond), area) in connections.iter().zip(&joints).zip(&touching) {
         if connection.kind == ConnectionKind::Free {
             continue;
         }
         if *area > 0.0 {
             bonds.push(bond.clone());
+            bond_names.push(name);
         } else {
             let [first, second] = connection.bodies();
             warnings.push(format!(
@@ -658,7 +730,10 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
     // One surface of all the bodies: one body's points, triangles and faces after another's.
     let mut all = Sampled { points: Vec::new(), triangles: Vec::new(), tri_face: Vec::new(), capped: None };
     let (mut values, mut faces, mut face_bodies) = (Vec::new(), Vec::new(), Vec::new());
-    for (body, (sampled, own)) in prepared.iter().zip(sampled) {
+    // The body of each point.
+    let mut of_body: Vec<usize> = Vec::new();
+    for (index, (body, (sampled, own))) in prepared.iter().zip(sampled).enumerate() {
+        of_body.extend(sampled.points.iter().map(|_| index));
         let (first_point, first_face) = (u32::try_from(all.points.len()).unwrap_or(u32::MAX), u32::try_from(faces.len()).unwrap_or(u32::MAX));
         all.points.extend(sampled.points);
         all.triangles.extend(sampled.triangles.iter().map(|t| t.map(|v| v.saturating_add(first_point))));
@@ -670,6 +745,9 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
         values.extend(own);
         face_bodies.extend(body.shape.face_names().iter().map(|_| body.shape.name.to_string()));
         faces.extend(body.shape.face_names());
+    }
+    if let Some(warning) = peak_at_bond(&prepared, &solutions, &all, &of_body, &values, &bonds, &bond_names, &shown) {
+        warnings.push(warning);
     }
     let missing = values.iter().filter(|v| v.is_none()).count();
     if missing > 0 {

@@ -855,3 +855,31 @@ fn imported_surface_meshes_are_bonded_where_they_touch() {
     let found = again.execute("interaction.connection.find", &json!({})).unwrap();
     assert_eq!(again.model.connections().len(), 1, "{found}");
 }
+
+/// Two plates bonded where they overlap (a lap joint), the lower one clamped at its far end
+/// and the upper one pulled: the largest stress is at an end of the overlap, a sharp notch,
+/// and the reply says so. Two blocks bonded flush end to end and pulled
+/// (`imported_surface_meshes_are_bonded_where_they_touch`, `bodies_that_touch_are_solved_together`)
+/// have no notch, and no such warning.
+#[test]
+fn a_peak_where_a_bonded_area_ends_is_said_to_be_a_notch() {
+    let mut s = Session::default();
+    s.surfaces.push(std::sync::Arc::new(solid::tests::block_between("Lower", [0.0; 3], [40.0, 10.0, 5.0])));
+    s.surfaces.push(std::sync::Arc::new(solid::tests::block_between("Upper", [20.0, 0.0, 5.0], [60.0, 10.0, 10.0])));
+    s.run_script(&json!([
+        {"command": "model.set.create", "params": {"name": "all", "geometry": [{"body": "Lower"}, {"body": "Upper"}]}},
+        {"command": "model.material.create", "params": {"name": "Steel", "elastic": {"type": "isotropic", "young": YOUNG, "poisson": POISSON}, "density": 7.85e-9}},
+        {"command": "model.section.create", "params": {"name": "Solid", "set": "all", "material": "Steel", "kind": {"type": "solid"}}},
+        {"command": "model.set.create", "params": {"name": "x0", "geometry": [{"body": "Lower", "face": "0"}]}},
+        {"command": "model.set.create", "params": {"name": "x1", "geometry": [{"body": "Upper", "face": "1"}]}},
+        {"command": "model.boundary_condition.create", "params": {"name": "Clamp", "type": "fixed", "target": {"set": "x0"}}},
+        {"command": "model.load.create", "params": {"name": "Pull", "type": "pressure", "set": "x1", "magnitude": -PULL}},
+        {"command": "model.step.create", "params": {"name": "Pull", "procedure": {"type": "static"}, "boundary_conditions": ["Clamp"], "loads": ["Pull"]}},
+    ]))
+    .unwrap();
+    let r = s.execute("solve.static.grid", &json!({"cell_size": 2.5, "degree": 2})).unwrap();
+    let at = r["max_von_mises"]["at"][0].as_f64().unwrap();
+    assert!((at - 20.0).abs() < 2.5 || (at - 40.0).abs() < 2.5, "the peak at x = {at}: {r}");
+    let warnings = r["warnings"].as_array().unwrap();
+    assert!(warnings.iter().any(|w| w.as_str().unwrap().contains("sharp notch") && w.as_str().unwrap().contains("Lower-Upper")), "{warnings:?}");
+}

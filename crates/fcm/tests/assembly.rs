@@ -440,6 +440,68 @@ fn faces_that_touch_are_found() {
     assert_eq!(find_bonds(&[&pin, &sleeve], of_pin + of_sleeve).unwrap().len(), 1);
 }
 
+/// A block from `lo` to `hi` (faces tagged as [`block`]'s) with every face in triangles no wider than about `h`: a grid of squares on each.
+fn fine_block(lo: [f64; 3], hi: [f64; 3], h: f64) -> BoundarySurface {
+    let mut points: Vec<[f64; 3]> = Vec::new();
+    let (mut triangles, mut tags) = (Vec::new(), Vec::new());
+    // Each face: the axis it is normal to, which side, and two axes along it in the order that
+    // turns the normal outward.
+    let faces: [(usize, bool, usize, usize, u32); 6] =
+        [(0, false, 2, 1, 0), (0, true, 1, 2, 1), (1, false, 0, 2, 2), (1, true, 2, 0, 3), (2, false, 1, 0, 4), (2, true, 0, 1, 5)];
+    for (normal, high, u, v, tag) in faces {
+        let (nu, nv) = (((hi[u] - lo[u]) / h).ceil().max(1.0) as usize, ((hi[v] - lo[v]) / h).ceil().max(1.0) as usize);
+        let first = points.len() as u32;
+        for j in 0..=nv {
+            for i in 0..=nu {
+                let mut p = [0.0; 3];
+                p[normal] = if high { hi[normal] } else { lo[normal] };
+                p[u] = lo[u] + (hi[u] - lo[u]) * i as f64 / nu as f64;
+                p[v] = lo[v] + (hi[v] - lo[v]) * j as f64 / nv as f64;
+                points.push(p);
+            }
+        }
+        let at = |i: usize, j: usize| first + (j * (nu + 1) + i) as u32;
+        for j in 0..nv {
+            for i in 0..nu {
+                triangles.push([at(i, j), at(i + 1, j), at(i + 1, j + 1)]);
+                triangles.push([at(i, j), at(i + 1, j + 1), at(i, j + 1)]);
+                tags.extend([tag, tag]);
+            }
+        }
+    }
+    BoundarySurface::new(&points, &triangles, &tags, &SurfaceOptions::default()).unwrap()
+}
+
+/// Two bodies meet in a notch where a free face of the one rises from a free face of the other
+/// at a re-entrant corner: a short plate lying on a long one, at the short one's end. Bonded
+/// flush end to end they do not, and a plate's own convex edge is no notch.
+#[test]
+fn a_plate_on_a_plate_meets_it_in_a_notch_at_its_end() {
+    let triangles = |surface: &BoundarySurface, near: [f64; 3], within: f64| -> Vec<[[f64; 3]; 3]> {
+        let points = surface.points();
+        surface
+            .triangles()
+            .iter()
+            .map(|t| t.map(|v| points[v as usize]))
+            .filter(|t| t.iter().any(|c| (0..3).all(|a| (c[a] - near[a]).abs() <= within)))
+            .collect()
+    };
+    // Each block's faces in triangles no larger than `h`, so a face that is partly bonded has
+    // triangles on either side of where the bond ends.
+    let fine = |lo: [f64; 3], hi: [f64; 3]| fine_block(lo, hi, 0.05);
+    let (long, short) = (fine([0.0; 3], [2.0, 1.0, 0.2]), fine([0.0, 0.0, 0.2], [1.0, 1.0, 0.4]));
+    let end = [1.0, 0.5, 0.2];
+    assert!(fieldcraft_fcm::meet_in_notch(&triangles(&long, end, 0.2), &triangles(&short, end, 0.2), 1e-6));
+    // Far from the end, where the two only lie on each other, there is none.
+    let middle = [0.5, 0.5, 0.2];
+    assert!(!fieldcraft_fcm::meet_in_notch(&triangles(&long, middle, 0.2), &triangles(&short, middle, 0.2), 1e-6));
+    // Flush end to end: the free faces go on in one plane, also at the edges of the joint.
+    let (left, right) = (fine([0.0; 3], [1.0, 1.0, 0.2]), fine([1.0, 0.0, 0.0], [2.0, 1.0, 0.2]));
+    for at in [[1.0, 0.5, 0.2], [1.0, 1.0, 0.2], [1.0, 0.0, 0.0]] {
+        assert!(!fieldcraft_fcm::meet_in_notch(&triangles(&left, at, 0.2), &triangles(&right, at, 0.2), 1e-6), "at {at:?}");
+    }
+}
+
 /// A pin bonded in the hole of a sleeve that is clamped on its outside, pulled along its axis:
 /// the curved faces touch facet against facet, and the sleeve's support carries the pull.
 #[test]

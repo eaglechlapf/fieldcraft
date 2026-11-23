@@ -650,13 +650,16 @@ somewhat too stiff otherwise. The bodies that can still move are the null space 
 restraints on the six rigid motions of each body, found by a Cholesky decomposition with
 complete pivoting (Higham 1990).
 
-**The stress at the edge of a bond.** Where the side of one body meets the face of the other
-at the edge of a bonded area, the two form a sharp inside corner, and the stress of the elastic
+**The stress at the edge of a bond.** Where the side of one body meets the face of the other at
+the edge of a bonded area, the two form a sharp inside corner, and the stress of the elastic
 solution has no finite value there, as at any sharp inside corner of one part. The largest von
-Mises stress of an assembly is often at such an edge, and it rises with every refinement
-(27 to 39 MPa in the example above between coarse and fine cells, while the deflection of the
-clamps' tops moves by 2 %). Read the stress a cell away from the edge, or model the fillet or
-the weld that is there in the part.
+Mises stress of an assembly is often at such an edge, and it rises with every refinement (27 to
+39 MPa in the example above between coarse and fine cells, while the deflection of the clamps'
+tops moves by 2 %). When the largest stress is within a cell of such an edge, the reply says so
+in a warning: where a free face of one body rises from a free face of the other at an inside
+corner. Two bodies bonded flush, whose free faces go on in one plane, meet in no such corner.
+Read the stress a few cells away from the edge, or model the fillet or the weld that is there in
+the part.
 
 **Rounds and the convergence check** work on all the bodies together. A round of **Adaptive
 rounds** (`adapt`) ranks the cells of every body by the one indicator, divides those the
