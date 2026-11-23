@@ -2797,8 +2797,8 @@ const THREADS: Field = int("threads", "Threads", 1, 256).help("Threads to use; t
 pub const SOLVE_STATIC: &[Field] = &[STEP, MAX_DOFS, MAX_FACTOR, THREADS];
 pub const SOLVE_STATIC_GRID: &[Field] = &[
     STEP,
-    reference("body", "Body", C::Body)
-        .help("A body of the design to solve on its own. Empty: every body of the design, bonded where two of them touch.")
+    reference("body", "Body", C::Solid)
+        .help("A body of the design, or an imported surface mesh, to solve on its own. Empty: every body, bonded where two of them touch.")
         .hint("every body"),
     choice("connections", "Connections", &[("model", "The model's"), ("none", "None")])
         .help("Several bodies are solved together. The model's: the bodies hold each other by the model's connections (bonded, sliding or free); a model that was never searched for them is searched first, and every two bodies whose faces touch are bonded there. None: no body holds another, and each needs supports of its own.")

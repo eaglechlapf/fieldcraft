@@ -802,6 +802,9 @@ fn imported(blocks: usize, length: f64) -> Session {
 fn an_imported_surface_mesh_is_solved_like_a_design_body() {
     let mut s = imported(1, 20.0);
     assert!(s.design.is_none());
+    // The form's Body offers it, where the fields that take a design's bodies only do not.
+    assert_eq!(s.names(crate::schema::Collection::Solid), ["Block"]);
+    assert!(s.names(crate::schema::Collection::Body).is_empty());
     let r = s.execute("solve.static.grid", &json!({"cell_size": 5, "degree": 2})).unwrap();
     assert_eq!(r["body"], "Block");
     let stress = r["max_von_mises"]["value"].as_f64().unwrap();

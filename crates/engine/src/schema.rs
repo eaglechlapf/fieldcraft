@@ -262,6 +262,9 @@ pub enum Collection {
     SolvedStep,
     /// A body of the open design.
     Body,
+    /// A body of the open design or an imported surface mesh: what a command that solves bodies
+    /// without a volume mesh takes (`solve.static.grid`).
+    Solid,
     /// A datum plane, axis or point.
     Datum,
     /// A datum plane.
@@ -311,7 +314,7 @@ impl Collection {
             Collection::FluidDomain => "fluid domain",
             Collection::Step => "step",
             Collection::SolvedStep => "solved step",
-            Collection::Body => "body",
+            Collection::Body | Collection::Solid => "body",
             Collection::Datum => "datum",
             Collection::DatumPlane => "datum plane",
             Collection::DatumAxis => "datum axis",
@@ -352,6 +355,9 @@ impl Session {
             Collection::Step => Box::new(m.steps().iter().map(|s| s.name.as_str())),
             Collection::SolvedStep => Box::new(self.solved_steps()),
             Collection::Body => Box::new(self.design.iter().flat_map(|d| d.bodies.iter().map(|b| b.name.as_str()))),
+            Collection::Solid => Box::new(
+                self.design.iter().flat_map(|d| d.bodies.iter().map(|b| b.name.as_str())).chain(self.surfaces.iter().map(|s| s.name.as_str())),
+            ),
             Collection::Datum => Box::new(m.datums().keys().map(String::as_str)),
             Collection::DatumPlane => Box::new(m.datums().iter().filter(|(_, d)| d.plane().is_some()).map(|(n, _)| n.as_str())),
             Collection::DatumAxis => Box::new(m.datums().iter().filter(|(_, d)| d.axis().is_some()).map(|(n, _)| n.as_str())),

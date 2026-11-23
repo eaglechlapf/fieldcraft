@@ -682,7 +682,7 @@ impl Form<'_> {
             for n in shown {
                 let mut on = chosen.contains(n);
                 let r = kit::checkbox(ui, n, &mut on);
-                if r.hovered() && c == Collection::Body {
+                if r.hovered() && matches!(c, Collection::Body | Collection::Solid) {
                     self.out.hover_body = Some(n.clone());
                 }
                 if r.changed() {
@@ -715,7 +715,7 @@ impl Form<'_> {
                     ui.add_sized([width, ui.spacing().interact_size.y], egui::Label::new(n.as_str()).truncate());
                     fields::combo(ui, id.with(i), selected, &labels, fill(ui, &self.style))
                 });
-                if row.response.contains_pointer() && c == Collection::Body {
+                if row.response.contains_pointer() && matches!(c, Collection::Body | Collection::Solid) {
                     self.out.hover_body = Some(n.clone());
                 }
                 if let Some(k) = row.inner {
@@ -747,7 +747,7 @@ impl Form<'_> {
                     ui.add_sized([width, ui.spacing().interact_size.y], egui::Label::new(n.as_str()).truncate());
                     fields::text(ui, id.with(i), &mut text, hint, fill(ui, &self.style))
                 });
-                if row.response.contains_pointer() && c == Collection::Body {
+                if row.response.contains_pointer() && matches!(c, Collection::Body | Collection::Solid) {
                     self.out.hover_body = Some(n.clone());
                 }
                 if row.inner {
