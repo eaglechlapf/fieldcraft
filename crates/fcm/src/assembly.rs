@@ -107,15 +107,17 @@ const ITERATIVE_FROM: usize = 50_000;
 /// stiffness, by how many times cells are divided (not, once, twice, more): its set-up (the
 /// cells' own unknowns, the blocks' factors, what follows the far-reaching functions) and its
 /// rounds. Measured at degree 3 on 24 threads on the oracle's bracket, as the factorization's
-/// work for an entry times the iteration's time over the factorization's: 560 on cells of
-/// 2.2 mm (38 rounds), 620 on cells of 4.4 mm divided once (40 rounds), 1000 on cells of 8 mm
-/// divided twice (63 rounds), and with cells divided three times 1150 on cells of 16 mm (49
-/// rounds) and 2450 on cells of 8 mm (66 rounds).
+/// work for an entry times the iteration's time over the factorization's: about 450 on cells
+/// of 2.2 mm (32 rounds), 500 on cells of 4.4 mm divided once (35 rounds), 800 on cells of
+/// 8 mm divided twice (54 rounds), and with cells divided three times 1000 on cells of 16 mm
+/// (45 rounds) and 1850 on cells of 8 mm (58 rounds). Taken somewhat above those: a
+/// factorization that takes a little longer is exact.
 const ITERATION: [f64; 4] = [600.0, 600.0, 1000.0, 2400.0];
 /// How many times that where bodies are connected (47 to 85 rounds measured on three blocks
-/// bonded and sliding, for 40 of one body), and where a body has the trunk basis, which is what
-/// a caller gives one that is thin on its cells (225 rounds on a plate a tenth of its cells
-/// thick).
+/// bonded and sliding, for 40 of one body), and where a body is one of thin walls
+/// ([`solve::THIN`]): its coarse level is seven times as large and the trunk basis takes up to
+/// 84 rounds on a sheet a fiftieth of its cells thick. A plate of 217,000 unknowns takes 0.7 s
+/// by iteration for 1.4 s by factorization, one of 848,000 2.6 s for 8.3 s.
 const CONNECTED: f64 = 2.0;
 const THIN: f64 = 3.0;
 /// Poisson's ratio above which a body's system is left to the factorization: towards one half
@@ -123,6 +125,8 @@ const THIN: f64 = 3.0;
 /// one block).
 const NEARLY_INCOMPRESSIBLE: f64 = 0.499;
 
+/// Elements whose tied points one task adds up.
+const TIED: usize = 8;
 /// Bodies of one solve, at most (their solves are nested).
 pub const MAX_PARTS: usize = 64;
 /// Buckets along an axis of the box of a bond's faces, at most.
@@ -1070,7 +1074,7 @@ impl Stiffness {
 /// nearest point of that body's faces. The solutions come in the views' order.
 pub(crate) fn solve_system(
     views: &[&View],
-    partner: &dyn Fn(usize, u32, [f64; 3]) -> Option<(usize, [f64; 3])>,
+    partner: &(dyn Fn(usize, u32, [f64; 3]) -> Option<(usize, [f64; 3])> + Sync),
     limits: &Limits,
 ) -> Result<Vec<Solved>> {
     let mut offsets = Vec::with_capacity(views.len());
@@ -1085,77 +1089,90 @@ pub(crate) fn solve_system(
 
     // The bonds: the pairs of elements they couple.
     let mut pairs: BTreeMap<(usize, usize, usize, usize, bool), Pair> = BTreeMap::new();
+    let ats: Vec<_> = views.iter().map(|view| view.at).collect();
     for (first, view) in views.iter().enumerate() {
-        (view.tied)(&mut |point: &Tied| -> Result<()> {
-            let (second, y) = partner(first, point.tag, point.x).ok_or_else(|| broken("a tied point touches no body"))?;
-            let other = views.get(second).ok_or_else(|| broken("a bond's body is missing"))?;
-            let (element, values) = (other.at)(point.x, y).ok_or_else(|| {
-                Error::Invalid(format!(
-                    "body {first} touches body {second} at ({:.6e}, {:.6e}, {:.6e}), where the second has no cell: its faces named by the bond do not bound its material there",
-                    point.x[0], point.x[1], point.x[2]
-                ))
+        // Element by element, a few to a task: an element's points add up in their order
+        // whichever thread has them, and no two elements add to one pair.
+        let tied = view.tied;
+        let found = fieldcraft_parallel::map_grained(view.elements.len(), TIED, |own| -> Result<Vec<((usize, usize, bool), Pair)>> {
+            let mut pairs: BTreeMap<(usize, usize, bool), Pair> = BTreeMap::new();
+            tied(own, &mut |point: &Tied| -> Result<()> {
+                let (second, y) = partner(first, point.tag, point.x).ok_or_else(|| broken("a tied point touches no body"))?;
+                let at = ats.get(second).ok_or_else(|| broken("a bond's body is missing"))?;
+                let (element, values) = at(point.x, y).ok_or_else(|| {
+                    Error::Invalid(format!(
+                        "body {first} touches body {second} at ({:.6e}, {:.6e}, {:.6e}), where the second has no cell: its faces named by the bond do not bound its material there",
+                        point.x[0], point.x[1], point.x[2]
+                    ))
+                })?;
+                let (na, nb) = (point.values.len(), values.len());
+                if point.tractions.len() != 9 * na {
+                    return Err(broken("a tied point's tractions"));
+                }
+                let each = if point.along.is_some() { 6 } else { 1 };
+                let pair = pairs.entry((second, element, point.along.is_some())).or_insert_with(|| Pair {
+                    flux: vec![0.0; 9 * na * nb],
+                    mass: vec![0.0; each * na * nb],
+                    own: vec![0.0; each * nb * nb],
+                });
+                if pair.mass.len() != each * na * nb || pair.own.len() != each * nb * nb {
+                    return Err(broken("an element's functions changed"));
+                }
+                let w = point.weight;
+                for l in 0..3 {
+                    let Some(traction) = point.tractions.get(l * 3 * na..(l + 1) * 3 * na) else { continue };
+                    for (row, t) in traction.iter().enumerate() {
+                        let scaled = w * t;
+                        if scaled == 0.0 {
+                            continue;
+                        }
+                        if let Some(out) = pair.flux.get_mut((3 * row + l) * nb..(3 * row + l + 1) * nb) {
+                            for (slot, value) in out.iter_mut().zip(&values) {
+                                *slot += scaled * value;
+                            }
+                        }
+                    }
+                }
+                match point.along {
+                    None => {
+                        for (row, na_value) in pair.mass.chunks_exact_mut(nb.max(1)).zip(point.values) {
+                            for (slot, value) in row.iter_mut().zip(&values) {
+                                *slot += w * na_value * value;
+                            }
+                        }
+                        for (row, first_value) in pair.own.chunks_exact_mut(nb.max(1)).zip(&values) {
+                            for (slot, value) in row.iter_mut().zip(&values) {
+                                *slot += w * first_value * value;
+                            }
+                        }
+                    }
+                    Some(n) => {
+                        let across = [w * n[0] * n[0], w * n[0] * n[1], w * n[0] * n[2], w * n[1] * n[1], w * n[1] * n[2], w * n[2] * n[2]];
+                        for (row, na_value) in pair.mass.chunks_exact_mut(6 * nb.max(1)).zip(point.values) {
+                            for (six, value) in row.as_chunks_mut::<6>().0.iter_mut().zip(&values) {
+                                for (slot, weight) in six.iter_mut().zip(across) {
+                                    *slot += weight * na_value * value;
+                                }
+                            }
+                        }
+                        for (row, first_value) in pair.own.chunks_exact_mut(6 * nb.max(1)).zip(&values) {
+                            for (six, value) in row.as_chunks_mut::<6>().0.iter_mut().zip(&values) {
+                                for (slot, weight) in six.iter_mut().zip(across) {
+                                    *slot += weight * first_value * value;
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
             })?;
-            let (na, nb) = (point.values.len(), values.len());
-            if point.tractions.len() != 9 * na {
-                return Err(broken("a tied point's tractions"));
+            Ok(pairs.into_iter().collect())
+        });
+        for (own, list) in found.into_iter().enumerate() {
+            for ((second, element, sliding), pair) in list? {
+                pairs.insert((first, own, second, element, sliding), pair);
             }
-            let each = if point.along.is_some() { 6 } else { 1 };
-            let pair = pairs.entry((first, point.element, second, element, point.along.is_some())).or_insert_with(|| Pair {
-                flux: vec![0.0; 9 * na * nb],
-                mass: vec![0.0; each * na * nb],
-                own: vec![0.0; each * nb * nb],
-            });
-            if pair.mass.len() != each * na * nb || pair.own.len() != each * nb * nb {
-                return Err(broken("an element's functions changed"));
-            }
-            let w = point.weight;
-            for l in 0..3 {
-                let Some(traction) = point.tractions.get(l * 3 * na..(l + 1) * 3 * na) else { continue };
-                for (row, t) in traction.iter().enumerate() {
-                    let scaled = w * t;
-                    if scaled == 0.0 {
-                        continue;
-                    }
-                    if let Some(out) = pair.flux.get_mut((3 * row + l) * nb..(3 * row + l + 1) * nb) {
-                        for (slot, value) in out.iter_mut().zip(&values) {
-                            *slot += scaled * value;
-                        }
-                    }
-                }
-            }
-            match point.along {
-                None => {
-                    for (row, na_value) in pair.mass.chunks_exact_mut(nb.max(1)).zip(point.values) {
-                        for (slot, value) in row.iter_mut().zip(&values) {
-                            *slot += w * na_value * value;
-                        }
-                    }
-                    for (row, first_value) in pair.own.chunks_exact_mut(nb.max(1)).zip(&values) {
-                        for (slot, value) in row.iter_mut().zip(&values) {
-                            *slot += w * first_value * value;
-                        }
-                    }
-                }
-                Some(n) => {
-                    let across = [w * n[0] * n[0], w * n[0] * n[1], w * n[0] * n[2], w * n[1] * n[1], w * n[1] * n[2], w * n[2] * n[2]];
-                    for (row, na_value) in pair.mass.chunks_exact_mut(6 * nb.max(1)).zip(point.values) {
-                        for (six, value) in row.as_chunks_mut::<6>().0.iter_mut().zip(&values) {
-                            for (slot, weight) in six.iter_mut().zip(across) {
-                                *slot += weight * na_value * value;
-                            }
-                        }
-                    }
-                    for (row, first_value) in pair.own.chunks_exact_mut(6 * nb.max(1)).zip(&values) {
-                        for (six, value) in row.as_chunks_mut::<6>().0.iter_mut().zip(&values) {
-                            for (slot, weight) in six.iter_mut().zip(across) {
-                                *slot += weight * first_value * value;
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(())
-        })?;
+        }
     }
 
     // The pairs of elements the bonds couple, each once however it is held.
@@ -1258,7 +1275,7 @@ pub(crate) fn solve_system(
                 if !coupled.is_empty() {
                     iteration *= CONNECTED;
                 }
-                if views.iter().any(|view| view.trunk) {
+                if views.iter().any(|view| view.thin) {
                     iteration *= THIN;
                 }
                 entries > limits.max_factor_entries || (3 * total >= ITERATIVE_FROM && suits && work > iteration * stiffness_entries as f64)
@@ -1402,11 +1419,16 @@ pub(crate) fn solve_system(
             (u, factor.entries(), 0, 0.0)
         }
         Stiffness::Blocks(mut blocked) => {
-            let mut linear = vec![false; total];
+            // The functions of the coarse level: the linear ones, and in a body of thin walls the
+            // quadratic ones of the edges, without which it does not bend ([`iterative`]).
+            let (mut linear, mut coarse) = (vec![false; total], vec![false; total]);
             for (body, view) in views.iter().enumerate() {
                 for (function, flag) in view.linear.iter().enumerate().take(view.count) {
-                    if let Some(slot) = place.get(global(body, function)).and_then(|node| linear.get_mut(*node)) {
+                    let Some(node) = place.get(global(body, function)).copied() else { continue };
+                    let also = view.thin && view.quadratic.get(function) == Some(&true);
+                    if let (Some(slot), Some(of_coarse)) = (linear.get_mut(node), coarse.get_mut(node)) {
                         *slot = *flag;
+                        *of_coarse = *flag || also;
                     }
                 }
             }
@@ -1449,7 +1471,6 @@ pub(crate) fn solve_system(
             let blocks = iterative::patches(&lists, cells, &condensed.own, &reach, &extended);
             drop(lists);
             drop(reach);
-            let scale = load.iter().map(|entry| entry * entry).sum::<f64>().sqrt();
             let progress = fieldcraft_model::progress::current();
             let cancelled = || progress.as_ref().is_some_and(|p| p.is_cancelled());
             // With no factorization to fall back on, the iteration is given longer.
@@ -1459,8 +1480,7 @@ pub(crate) fn solve_system(
                 &blocked,
                 &condensed.own,
                 &condensed.load,
-                scale,
-                &linear,
+                &coarse,
                 &blocks,
                 &extended,
                 limits,

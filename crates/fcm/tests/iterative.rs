@@ -229,14 +229,50 @@ fn connected_bodies_by_iteration_are_those_by_factorization() {
     }
 }
 
-/// A material that hardly changes its volume at all is not the iteration's (at a Poisson's ratio
-/// of 0.4999 it still settles, in a hundred rounds): asked for, the rounds do not settle it and
-/// the factorization solves it after all, of what the cells' own unknowns left of the system.
-/// So ill-conditioned a system is solved to five digits either way, not to the same bits.
+/// A sheet a twentieth of its cells thick, clamped at one end and loaded across: the coarse
+/// level of a body of thin walls has the quadratic functions of the cells' edges, without which
+/// it cannot bend (four times the rounds, and none that settle a thinner sheet); and what is
+/// left is measured in energy, since so stiff a system rounds above a residual of 1e-9. The
+/// trunk basis takes more rounds the thinner the sheet, the tensor product does not.
+#[test]
+fn a_sheet_far_thinner_than_its_cells_is_iterated_like_a_compact_part() {
+    let supports = [Support { face: 0, fixed: [true; 3], value: [0.0; 3] }];
+    let loads = [Load::Traction { face: 1, traction: [0.0, 0.0, 1.0e3] }];
+    for (thickness, basis, most) in [
+        (0.005, fieldcraft_fcm::Basis::Trunk, 60),
+        (0.005, fieldcraft_fcm::Basis::Tensor, 40),
+        (0.002, fieldcraft_fcm::Basis::Tensor, 40),
+        (0.002, fieldcraft_fcm::Basis::Trunk, 120),
+    ] {
+        let surface = block([0.0; 3], [1.0, 0.9, thickness]);
+        let options = |solver: Solver| Options { degree: 3, basis, solver, offset: [0.31, 0.62, 0.13], ..Options::new(0.1) };
+        let direct = solve(&surface, &STEEL, &supports, &loads, &options(Solver::Direct), &Limits::default()).unwrap();
+        let iterated = solve(&surface, &STEEL, &supports, &loads, &options(Solver::Iterative), &Limits::default()).unwrap();
+        let points = [[1.0, 0.45, 0.5 * thickness], [0.5, 0.2, 0.5 * thickness], [0.25, 0.7, thickness]];
+        let (du, ds) = apart(&iterated, &direct, &points);
+        println!(
+            "{thickness} thick, {basis:?}: {} unknowns, {} rounds to {:.1e}; displacement {du:.1e}, stress {ds:.1e} apart",
+            direct.stats.unknowns, iterated.stats.iterations, iterated.stats.residual
+        );
+        assert!(
+            iterated.stats.iterations > 0 && iterated.stats.iterations < most,
+            "{thickness} thick, {basis:?}: {} rounds",
+            iterated.stats.iterations
+        );
+        // The factorization of so stiff a system is right to about as many digits itself.
+        assert!(du < 1e-5 && ds < 1e-4, "{thickness} thick, {basis:?}: displacement {du:.2e}, stress {ds:.2e}");
+    }
+}
+
+/// A material that does not change its volume at all is not the iteration's (at a Poisson's
+/// ratio of 0.499999 it still settles, in 335 rounds): asked for, the rounds do not settle it
+/// and the factorization solves it after all, of what the cells' own unknowns left of the
+/// system. So ill-conditioned a system is solved to three digits either way, not to the same
+/// bits.
 #[test]
 fn what_the_iteration_does_not_settle_is_factored() {
     let surface = block([0.0; 3], [1.0, 0.5, 0.5]);
-    let rubber = Material { young: 1.0e7, poisson: 0.499_999, density: 1000.0 };
+    let rubber = Material { young: 1.0e7, poisson: 0.499_999_9, density: 1000.0 };
     let supports = [Support { face: 0, fixed: [true; 3], value: [0.0; 3] }];
     let loads = [Load::Traction { face: 1, traction: [1.0e4, 0.0, 2.0e3] }];
     let options = |solver: Solver| Options { degree: 3, solver, offset: [0.31, 0.62, 0.13], ..Options::new(0.25) };
@@ -244,7 +280,7 @@ fn what_the_iteration_does_not_settle_is_factored() {
     let asked = solve(&surface, &rubber, &supports, &loads, &options(Solver::Iterative), &Limits::default()).unwrap();
     assert_eq!(asked.stats.iterations, 0);
     assert!(
-        (asked.strain_energy - direct.strain_energy).abs() < 1e-4 * direct.strain_energy,
+        (asked.strain_energy - direct.strain_energy).abs() < 2e-3 * direct.strain_energy,
         "{} against {}",
         asked.strain_energy,
         direct.strain_energy

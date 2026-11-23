@@ -92,6 +92,10 @@ pub(crate) struct Space {
     /// The linear ones of all levels are the trilinear elements of the refined grid, the
     /// coarse level of [`crate::iterative`].
     pub linear: Vec<bool>,
+    /// Whether each mode is the quadratic function of an edge of a cell of its level: of the
+    /// second degree along the edge and linear across it. A thin body's coarse level has them
+    /// too.
+    pub quadratic: Vec<bool>,
 }
 
 /// The modes of a cell of degree `p`, each by its index along the three axes: the full tensor
@@ -404,6 +408,7 @@ impl Space {
             joined: None,
             xyz: Vec::new(),
             linear: Vec::new(),
+            quadratic: Vec::new(),
         };
         for leaf in tree.leaves() {
             if !tree.nodes.get(leaf as usize).is_some_and(|cell| cell.material()) {
@@ -465,6 +470,9 @@ impl Space {
                 let steps = (1u64 << level) as f64;
                 space.xyz.push([x as f64 / steps, y as f64 / steps, z as f64 / steps]);
                 space.linear.push(dx == 0 && dy == 0 && dz == 0);
+                let mut degrees = [dx, dy, dz];
+                degrees.sort_unstable();
+                space.quadratic.push(degrees == [0, 0, 2]);
             }
             space.functions.push(found);
         };
@@ -627,7 +635,7 @@ impl Space {
         }
         let mut position = vec![usize::MAX; self.count];
         let mut xyz = Vec::with_capacity(self.count);
-        let mut linear = Vec::with_capacity(self.count);
+        let (mut linear, mut quadratic) = (Vec::with_capacity(self.count), Vec::with_capacity(self.count));
         for (k, &mode) in order.iter().enumerate() {
             let slot = position.get_mut(mode).ok_or_else(broken)?;
             if *slot != usize::MAX {
@@ -636,12 +644,14 @@ impl Space {
             *slot = k;
             xyz.push(self.xyz.get(mode).copied().ok_or_else(broken)?);
             linear.push(self.linear.get(mode).copied().ok_or_else(broken)?);
+            quadratic.push(self.quadratic.get(mode).copied().ok_or_else(broken)?);
         }
         for mode in &mut self.functions {
             *mode = position.get(*mode).copied().ok_or_else(broken)?;
         }
         self.xyz = xyz;
         self.linear = linear;
+        self.quadratic = quadratic;
         Ok(())
     }
 }

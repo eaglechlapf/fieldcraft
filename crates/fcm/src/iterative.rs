@@ -24,6 +24,28 @@
 //! to the other in one step, which is what keeps the count of rounds from growing with the
 //! number of cells.
 //!
+//! **A body of thin walls** has the quadratic functions of the cells' edges in its coarse
+//! level too. A wall much thinner than its cells bends, and linear functions cannot follow
+//! that: where the slope of the wall changes along a cell they shear it, at a stiffness
+//! that is the square of the cell's size over the wall's thickness too high (the locking of
+//! fully integrated low-order elements in thin plates: O. C. Zienkiewicz, R. L. Taylor,
+//! J. M. Too, *Reduced integration technique in general analysis of plates and shells*, Int.
+//! J. Numer. Methods Eng. 3(2):275–290, 1971). Measured on a clamped plate of 20 by 18 cells
+//! under a load across it: the linear functions hold 3 % of the energy of what is to be found
+//! where the plate is a tenth of a cell thick, with the edges' quadratic functions 99.9 %; and
+//! the rounds, by how full of material the cells are (trunk basis, and tensor product):
+//!
+//! | Fill | 0.60 | 0.45 | 0.36 | 0.27 | 0.18 | 0.09 |
+//! |---|---|---|---|---|---|---|
+//! | Linear, trunk | 37 | 35 | 41 | 52 | 74 | 140 |
+//! | With the edges, trunk | 35 | 31 | 31 | 32 | 32 | 33 |
+//! | Linear, tensor | 29 | 25 | 33 | 39 | 51 | 84 |
+//! | With the edges, tensor | 27 | 23 | 19 | 20 | 20 | 21 |
+//!
+//! The larger coarse level has four times the unknowns and seven times the factor, which is
+//! little for a wall (its cells lie side by side in a sheet) and much for a compact part, so
+//! it is a thin body's alone ([`crate::solve::THIN`]).
+//!
 //! **The local level** is one block for every vertex of the grid: the functions that reach no
 //! cell but the eight around it, which are the vertex's own linear function and those of the
 //! edges and faces that meet there. Each block's matrix is factored densely (additive Schwarz
@@ -52,10 +74,11 @@
 //! eight cells at most ([`AROUND`]), and a farther-reaching function is taken together with
 //! what follows it ([`crate::extended`]): that leaves it orthogonal to the functions within
 //! its reach, and it is in a block with the other such functions around its vertex. Measured
-//! on the bracket above at degree 3: 40 rounds with its cells divided once at its fillet and
-//! holes, 63 divided twice, 49 to 66 divided three times, and 42 at degree 4 divided once.
+//! on the bracket above at degree 3: 35 rounds with its cells divided once at its fillet and
+//! holes, 54 divided twice, 45 to 58 divided three times, and 36 at degree 4 divided once.
 //! With the far-reaching functions in blocks of the single cells they reach instead, it was
-//! 117 rounds divided once, 233 twice, and 174 at degree 4 (J. N. Jomo, F. de Prenter,
+//! 117 rounds divided once, 233 twice, and 174 at degree 4, where this took 40, 63 and 42 to
+//! the same residual (J. N. Jomo, F. de Prenter,
 //! M. Elhaddad, D. D'Angella, C. V. Verhoosel, S. Kollmannsberger, J. S. Kirschke, V. Nübel,
 //! E. H. van Brummelen, E. Rank, *Robust and parallel scalable iterative solutions for
 //! large-scale finite cell analyses*, Finite Elem. Anal. Des. 163:14–30, 2019, iterate on such
@@ -64,16 +87,12 @@
 //! **Connected bodies.** Two bodies that a connection holds together are coupled stiffly
 //! across it. Every two cells it couples are a block, with the functions of both, and the
 //! functions of the cells that lead across it are taken with those of the cells that follow
-//! ([`crate::extended`]): 53 rounds for three bonded blocks and 51 where they slide, for 85
-//! and 78 with the blocks of two cells alone.
+//! ([`crate::extended`]): 47 rounds for three bonded blocks and 48 where they slide (85 and
+//! 78 with the blocks of two cells alone, where this took 53 and 51 to the same residual).
 //!
 //! # What it is not good at
-//! **Walls much thinner than the cells.** A body of sheet on cells many times its thickness
-//! takes more rounds, and more the thinner it is: 225 for a plate a tenth of its cells thick on
-//! the trunk space, 111 with the tensor product. The coarse level is what lacks: its linear
-//! functions are too stiff in the bending of a wall inside a cell. Such a body's factorization
-//! is cheap, a wall being all surface, and the choice between the two counts it so
-//! ([`crate::assembly`]).
+//! **A sheet a hundredth of its cells thick** on the trunk basis: 160 rounds, for 29 with the
+//! tensor product.
 //!
 //! **A material that hardly changes its volume** (Poisson's ratio near one half), whose
 //! stiffness against that one kind of strain dwarfs the rest. Such a system, and any other the
@@ -95,14 +114,19 @@ use crate::extended::Extended;
 use crate::packed;
 use crate::{Error, Result};
 
-/// The residual at which the iteration is done, relative to the load: the unknowns are then
-/// right to about as many digits, which is more than the shape functions resolve of the part.
-pub(crate) const SETTLED: f64 = 1e-9; // unit-factors: a ratio of two forces
+/// What is left at which the iteration is done ([`solve`]): the unknowns are then right to
+/// about as many digits in the energy norm, which is more than the shape functions resolve of
+/// the part.
+pub(crate) const SETTLED: f64 = 1e-9; // unit-factors: a ratio of the roots of two energies
 
 /// How far above the tolerance the true residual may end, when the recurrence's is below it:
-/// the sums of a stiff system (a thin part on coarse cells) round at about this many times the
-/// tolerance, and no further round brings the residual under it.
+/// the sums of a stiff system round at a few times the tolerance.
 const ROUNDING: f64 = 10.0;
+
+/// What may be left when the true residual stays where it is from one look to the next: what
+/// rounding leaves of a system as stiff as a sheet a hundredth of its cells thick (1.4e-8
+/// measured) is taken, anything coarser is not.
+const ROUGH: f64 = 1e-6; // unit-factors: a ratio of the roots of two energies
 
 /// Rounds after which a system is left to the factorization: about ten times what a system
 /// the two levels suit takes at the tolerance (30 to 40).
@@ -128,7 +152,7 @@ pub(crate) struct Outcome {
     pub u: Vec<f64>,
     /// The rounds taken.
     pub iterations: usize,
-    /// The residual they ended at, relative to the load.
+    /// What they left, measured in energy against the whole ([`solve`]).
     pub residual: f64,
     /// Entries of the coarse level's factor.
     pub coarse_entries: usize,
@@ -264,18 +288,32 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
 
 /// Solve `matrix` u = `load` on the nodes that are not `own` to a cell (three unknowns each;
 /// the others' rows and columns are left out, and `load` is zero there) by the iteration of
-/// the module's head, to the residual `settled` of `scale`, the size of the whole load, in at
-/// most `most` rounds. `linear` says which nodes carry a linear shape function, `blocks` lists
-/// the nodes of every block of the local level ([`patches`]), and `extended` has the
-/// far-reaching nodes the blocks take with what follows them. `Ok(None)` when the rounds
-/// did not settle it, or a step broke down: the system is then the factorization's.
+/// the module's head, until what is left is `settled` of the whole, in at most `most` rounds.
+/// `coarse` says which nodes carry a function of the coarse level, `blocks` lists the nodes
+/// of every block of the local level ([`patches`]), and `extended` has the far-reaching nodes
+/// the blocks take with what follows them. `Ok(None)` when the rounds did not settle it, or a
+/// step broke down: the system is then the factorization's.
+///
+/// What is left is measured in energy: √(rᵀ M⁻¹ r / uᵀ K u), the residual r in the norm of
+/// the approximate inverse against the energy the unknowns have. With M close to K that is
+/// the error in the energy norm, which is what a displacement or a stress is wrong by (a
+/// stopping criterion in energy for finite elements: M. Arioli, *A stopping criterion for the
+/// conjugate gradient algorithm in a finite element method framework*, Numer. Math.
+/// 97:1–24, 2004). The size of r itself is no measure for a thin part: its stiffness across a
+/// wall is many orders above its stiffness in bending, a residual of 1e-9 of the load lies
+/// below what rounding leaves of it (as it does for a factorization), and rounds were spent
+/// on it until they ran out.
+///
+/// The residual of the recurrence drifts from the true one (A. Greenbaum, *Estimating the
+/// attainable accuracy of recursively computed residual methods*, SIAM J. Matrix Anal. Appl.
+/// 18(3):535–551, 1997), so the true one decides at the end. When it stays where it was at
+/// the look before, rounding leaves no more, and it is taken if it is below [`ROUGH`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn solve(
     matrix: &Blocked,
     own: &[bool],
     load: &[f64],
-    scale: f64,
-    linear: &[bool],
+    coarse: &[bool],
     blocks: &[Vec<usize>],
     extended: &Extended,
     limits: &Limits,
@@ -284,19 +322,23 @@ pub(crate) fn solve(
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Option<Outcome>> {
     let n = 3 * matrix.nodes();
-    if load.len() != n || linear.len() != matrix.nodes() {
+    if load.len() != n || coarse.len() != matrix.nodes() {
         return Err(Error::Internal("the iteration's system and its load differ in size".into()));
     }
-    if !(scale > 0.0) || !scale.is_finite() || load.iter().all(|entry| *entry == 0.0) {
+    if load.iter().any(|entry| !entry.is_finite()) {
+        return Ok(None);
+    }
+    if load.iter().all(|entry| *entry == 0.0) {
         // No load: nothing moves.
-        return Ok(scale.is_finite().then(|| Outcome { u: vec![0.0; n], iterations: 0, residual: 0.0, coarse_entries: 0 }));
+        return Ok(Some(Outcome { u: vec![0.0; n], iterations: 0, residual: 0.0, coarse_entries: 0 }));
     }
     let taken = |node: usize| own.get(node).copied().unwrap_or(false);
 
-    // The coarse level: the linear functions' part of the matrix, factored.
+    // The coarse level: its functions' part of the matrix, factored.
     let mut place = vec![usize::MAX; matrix.nodes()];
+    let of_coarse = coarse;
     let mut coarse = Vec::new();
-    for (node, _) in linear.iter().enumerate().filter(|(node, linear)| **linear && !taken(*node)) {
+    for (node, _) in of_coarse.iter().enumerate().filter(|(node, of_coarse)| **of_coarse && !taken(*node)) {
         if let Some(slot) = place.get_mut(node) {
             *slot = coarse.len() / 3;
         }
@@ -313,8 +355,8 @@ pub(crate) fn solve(
         }
         ptr.push(idx.len());
     }
-    drop(place);
     let coarse_matrix = Csr { n: coarse.len(), ptr, idx, val };
+    drop(place);
     let coarse_factor = match Factor::new(&UpperColumns::from_symmetric(&coarse_matrix), limits.max_factor_entries) {
         Ok(factor) => Some(factor),
         // Without linear functions there is no coarse level; one that cannot be factored is
@@ -399,7 +441,9 @@ pub(crate) fn solve(
     let mut p = z.clone();
     let mut rz = dot(&r, &z);
     let mut ap = vec![0.0; n];
-    let mut residual = 1.0;
+    // The energy of the unknowns so far, twice: uᵀ K u, the sum of the steps' own.
+    let mut energy = 0.0;
+    let mut before: Option<f64> = None;
     for iteration in 1..=most {
         if iteration % LOOK == 0 && cancelled() {
             return Err(Error::Internal("cancelled".into()));
@@ -411,41 +455,52 @@ pub(crate) fn solve(
             return Ok(None);
         }
         let alpha = rz / curvature;
+        energy += alpha * rz;
         for ((x, d), (res, a)) in u.iter_mut().zip(&p).zip(r.iter_mut().zip(&ap)) {
             *x += alpha * d;
             *res -= alpha * a;
         }
-        residual = dot(&r, &r).sqrt() / scale;
-        if !residual.is_finite() {
+        apply(&r, &mut z)?;
+        let next = dot(&r, &z);
+        if !next.is_finite() || !energy.is_finite() {
             return Ok(None);
         }
-        if residual <= settled {
+        if (next.max(0.0) / energy).sqrt() <= settled {
             // The residual of the recurrence drifts from the true one over many rounds: the
-            // true one decides.
+            // true one decides, measured the same way against the energy the unknowns have.
             matrix.mul_kept(own, &u, &mut ap);
             for ((res, b), a) in r.iter_mut().zip(load).zip(&ap) {
                 *res = b - a;
             }
-            residual = dot(&r, &r).sqrt() / scale;
-            if residual <= ROUNDING * settled {
-                return Ok(Some(Outcome { u, iterations: iteration, residual, coarse_entries: coarse_factor.as_ref().map_or(0, Factor::entries) }));
+            apply(&r, &mut z)?;
+            let (left, whole) = (dot(&r, &z), dot(load, &u));
+            if !(whole > 0.0) || !left.is_finite() {
+                return Ok(None);
+            }
+            let measure = (left.max(0.0) / whole).sqrt();
+            // No closer than at the look before: what rounding leaves of so stiff a system.
+            let stays = before.is_some_and(|before| measure > 0.5 * before) && measure <= ROUGH;
+            before = Some(measure);
+            if measure <= ROUNDING * settled || stays {
+                return Ok(Some(Outcome {
+                    u,
+                    iterations: iteration,
+                    residual: measure,
+                    coarse_entries: coarse_factor.as_ref().map_or(0, Factor::entries),
+                }));
             }
             // Further off than rounding explains: on from the true residual, with a fresh
             // direction.
-            apply(&r, &mut z)?;
             p.copy_from_slice(&z);
-            rz = dot(&r, &z);
+            rz = left;
             continue;
         }
-        apply(&r, &mut z)?;
-        let next = dot(&r, &z);
         let beta = next / rz;
         rz = next;
         for (d, zi) in p.iter_mut().zip(&z) {
             *d = zi + beta * *d;
         }
     }
-    let _ = residual;
     Ok(None)
 }
 
@@ -489,10 +544,6 @@ mod tests {
         (Csr { n, ptr, idx, val }, load)
     }
 
-    fn size(load: &[f64]) -> f64 {
-        dot(load, load).sqrt()
-    }
-
     #[test]
     fn the_iteration_solves_what_the_factorization_does() {
         let nodes = 60;
@@ -503,7 +554,7 @@ mod tests {
         let linear: Vec<bool> = (0..nodes).map(|node| node % 4 == 0).collect();
         let blocks: Vec<Vec<usize>> = (0..nodes).step_by(4).map(|first| (first..(first + 5).min(nodes)).collect()).collect();
         let run = |matrix: &Blocked, load: &[f64], linear: &[bool], most: usize, cancelled: bool| {
-            solve(matrix, &[], load, size(load), linear, &blocks, &Extended::none(matrix.nodes()), &Limits::default(), SETTLED, most, &|| cancelled)
+            solve(matrix, &[], load, linear, &blocks, &Extended::none(matrix.nodes()), &Limits::default(), SETTLED, most, &|| cancelled)
         };
         let solved = run(&matrix, &load, &linear, MOST, false).unwrap().expect("settled");
         let mut direct = load.clone();
@@ -552,7 +603,7 @@ mod tests {
         let linear: Vec<bool> = (0..nodes).map(|node| node % 6 == 0).collect();
         let blocks: Vec<Vec<usize>> =
             (0..nodes).step_by(3).map(|first| (first..(first + 4).min(nodes)).filter(|node| !own[*node]).collect()).collect();
-        let solved = solve(&matrix, &own, &load, size(&load), &linear, &blocks, &Extended::none(nodes), &Limits::default(), SETTLED, MOST, &|| false)
+        let solved = solve(&matrix, &own, &load, &linear, &blocks, &Extended::none(nodes), &Limits::default(), SETTLED, MOST, &|| false)
             .unwrap()
             .expect("settled");
         let kept = matrix.rows_kept(&own);

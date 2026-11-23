@@ -457,7 +457,8 @@ pub struct Stats {
     /// The rounds of the iteration that solved the system ([`Options::solver`]); 0 when the
     /// factorization did. [`Stats::factor_entries`] is then the factor of the coarse level.
     pub iterations: usize,
-    /// The residual the iteration ended at, relative to the load; 0 for the factorization.
+    /// What the iteration left when it ended, measured in energy against the whole
+    /// (`crate::iterative`); 0 for the factorization.
     pub residual: f64,
 }
 
@@ -595,6 +596,12 @@ impl Place<'_> {
     }
 }
 
+/// The share of the cells that hold material that the material fills, below which a body is
+/// taken to be one of walls much thinner than its cells: where the rounds of an iteration grow
+/// without the larger coarse level ([`crate::iterative`]: 41 rounds at 0.36, 52 at 0.27, 74 at
+/// 0.18, for 31 or 32 with it).
+pub(crate) const THIN: f64 = 0.3;
+
 /// How a body is tied to others ([`crate::assembly`]).
 pub(crate) struct Ties<'a> {
     /// The faces that are held to another body where they touch it.
@@ -608,12 +615,11 @@ pub(crate) struct Ties<'a> {
     pub held: bool,
 }
 
-/// A point where a tied face touches the other body: the element it is in, the face, the point,
+/// A point where a tied face touches the other body, in an element's cell: the face, the point,
 /// its weight (an area), the values of the element's functions there and the held traction of
 /// each of their unknowns on the face, `tractions[3 n i + 3 f + k]` component i of function f's
 /// component k, of n functions.
 pub(crate) struct Tied<'a> {
-    pub element: usize,
     pub tag: u32,
     pub x: [f64; 3],
     pub weight: f64,
@@ -639,14 +645,15 @@ pub(crate) struct View<'a> {
     /// Hand every element's stiffness and load, on its functions, to the caller, in order.
     #[allow(clippy::type_complexity)]
     pub assemble: &'a dyn Fn(&mut dyn FnMut(usize, &[f64], &[f64]) -> Result<()>) -> Result<()>,
-    /// Hand every point where a tied face of the body touches another to the caller.
+    /// Hand every point where a tied face touches another body in an element's cell to the
+    /// caller. Elements are asked on several threads at once.
     #[allow(clippy::type_complexity)]
-    pub tied: &'a dyn Fn(&mut dyn FnMut(&Tied) -> Result<()>) -> Result<()>,
+    pub tied: &'a (dyn Fn(usize, &mut dyn FnMut(&Tied) -> Result<()>) -> Result<()> + Sync),
     /// The element whose cell holds the point, and the values of its functions there; a point
     /// no cell holds is read in the cell of the second point, one of the body's surface next
     /// to it.
     #[allow(clippy::type_complexity)]
-    pub at: &'a dyn Fn([f64; 3], [f64; 3]) -> Option<(usize, Vec<f64>)>,
+    pub at: &'a (dyn Fn([f64; 3], [f64; 3]) -> Option<(usize, Vec<f64>)> + Sync),
     /// The Nitsche parameter of an element's cell, once its matrices were handed over.
     pub nitsche: &'a dyn Fn(usize) -> f64,
     /// Which functions are linear shape functions ([`crate::space::Space::linear`]).
@@ -655,9 +662,11 @@ pub(crate) struct View<'a> {
     /// whether an iteration suits it.
     pub solver: Solver,
     pub poisson: f64,
-    /// Whether the body has the trunk basis: what a caller gives one that is thin on its cells,
-    /// which the iteration takes more rounds for.
-    pub trunk: bool,
+    /// Which functions are the quadratic ones of an edge ([`crate::space::Space::quadratic`]).
+    pub quadratic: &'a [bool],
+    /// Whether the body is one of walls much thinner than its cells ([`THIN`]): its coarse
+    /// level in an iteration has the quadratic functions of the edges too.
+    pub thin: bool,
     /// The levels of refinement asked for, and the stiffness and factor entries of the solve
     /// before this one, for what a refusal says and when.
     pub refine: usize,
@@ -670,7 +679,7 @@ pub(crate) struct Solved {
     pub u: Vec<f64>,
     pub stiffness_entries: usize,
     pub factor_entries: usize,
-    /// The rounds and the residual of the iteration; zero when the system was factored.
+    /// The rounds of the iteration and what it left; zero when the system was factored.
     pub iterations: usize,
     pub residual: f64,
 }
@@ -1922,49 +1931,59 @@ fn solve_at(
         Some((element, on_functions(element, &values)))
     };
     let pieces_of_element = |element: usize| pieces_of(space.elements.get(element).map_or(usize::MAX, |node| *node as usize), space.island(element));
-    let tied = |visit: &mut dyn FnMut(&Tied) -> Result<()>| -> Result<()> {
+    let tied = |element: usize, visit: &mut dyn FnMut(&Tied) -> Result<()>| -> Result<()> {
         if ties.is_none() {
             return Ok(());
         }
-        for element in 0..elements {
-            let owned = pieces_of_element(element);
-            if !on_surface.ties(&owned) {
-                continue;
-            }
-            let (_, cell, _) = cell_of(element)?;
-            let level = usize::from(cell.level);
-            let (corner, size) = (grid.fine_lo(level, cell.position()), grid.step(level));
-            let functions = space.functions(element).len();
-            let mut failed = None;
-            cell::tied_points(&shapes, corner, size, &owned, &on_surface, &lame, &surface_rule, |tag, x, weight, values, tractions, along| {
-                if failed.is_some() {
-                    return;
-                }
-                // On the element's functions: Bᵀ of the cell's modes' values and tractions.
-                let values = on_functions(element, values);
-                let mut all = Vec::with_capacity(9 * functions);
-                for i in 0..3 {
-                    let of_modes: Vec<f64> = tractions.iter().flat_map(|mode| mode[i]).collect();
-                    match space.map(element) {
-                        Some(map) => all.extend(map.vector(m, &of_modes)),
-                        None => all.extend(of_modes),
-                    }
-                }
-                if let Err(e) = visit(&Tied { element, tag, x, weight, values: &values, tractions: &all, along }) {
-                    failed = Some(e);
-                }
-            });
-            if let Some(e) = failed {
-                return Err(e);
-            }
+        let owned = pieces_of_element(element);
+        if !on_surface.ties(&owned) {
+            return Ok(());
         }
-        Ok(())
+        let (_, cell, _) = cell_of(element)?;
+        let level = usize::from(cell.level);
+        let (corner, size) = (grid.fine_lo(level, cell.position()), grid.step(level));
+        let functions = space.functions(element).len();
+        let mut failed = None;
+        cell::tied_points(&shapes, corner, size, &owned, &on_surface, &lame, &surface_rule, |tag, x, weight, values, tractions, along| {
+            if failed.is_some() {
+                return;
+            }
+            // On the element's functions: Bᵀ of the cell's modes' values and tractions.
+            let values = on_functions(element, values);
+            let mut all = Vec::with_capacity(9 * functions);
+            for i in 0..3 {
+                let of_modes: Vec<f64> = tractions.iter().flat_map(|mode| mode[i]).collect();
+                match space.map(element) {
+                    Some(map) => all.extend(map.vector(m, &of_modes)),
+                    None => all.extend(of_modes),
+                }
+            }
+            if let Err(e) = visit(&Tied { tag, x, weight, values: &values, tractions: &all, along }) {
+                failed = Some(e);
+            }
+        });
+        failed.map_or(Ok(()), Err)
     };
     let position = |function: usize| {
         let at = space.xyz.get(function).copied().unwrap_or_default();
         [0, 1, 2].map(|a| grid.origin[a] + 0.5 * grid.spacing * at[a])
     };
     let nitsche_of = |element: usize| tally.try_borrow().ok().and_then(|tally| tally.nitsche.get(element).copied()).unwrap_or(0.0);
+    // How full of material the cells that hold any are, taken together.
+    let thin = {
+        let (mut material, mut cells) = (0.0, 0.0);
+        for element in 0..elements {
+            let Ok((node, cell, _)) = cell_of(element) else { continue };
+            let size = grid.step(usize::from(cell.level));
+            let whole = size * size * size;
+            let island = space.island(element);
+            if island == 0 {
+                cells += whole;
+            }
+            material += cut_of(node).and_then(|leaf| leaf.inside.get(island)).map_or(whole, |inside| 0.125 * whole * inside.total());
+        }
+        material < THIN * cells
+    };
     let view = View {
         grid,
         tree: &tree,
@@ -1978,7 +1997,8 @@ fn solve_at(
         linear: &space.linear,
         solver: options.solver,
         poisson: material.poisson,
-        trunk: options.basis == Basis::Trunk,
+        quadratic: &space.quadratic,
+        thin,
         refine: options.refine,
         before: round.before,
     };
