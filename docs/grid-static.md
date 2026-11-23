@@ -537,11 +537,12 @@ share no unknown, however close they are: what joins them is a *connection*.
 so a small part gets small cells: a twentieth, as for one body, or more when the bodies are
 many. The bodies together are given the unknowns one compact body has at a twentieth (a cube:
 125,000 at degree 3), and their cells are all made larger by one factor until they fit. The
-unknowns are counted on the grids before anything is integrated, so this costs a fraction of a
-second, and an assembly takes the time of one part however many bodies it has. The reply gives
-each body's `cell_size`. A `cell_size` that is given is the cell of every body, and is not
-changed: a solve too large for a limit is then refused, where one on cells of the command's
-choosing is run again on larger cells and says so in a warning.
+unknowns are counted on the grids before anything is added up or solved, and what a count worked
+out of the surfaces is the next one's and the solve's to use. An assembly then takes the time of
+one part however many bodies it has. The reply gives each body's `cell_size`. A `cell_size` that
+is given is the cell of every body, and is not changed: a solve too large for a limit is then
+refused, where one on cells of the command's choosing is run again on larger cells and says so
+in a warning.
 
 A base plate of 100 × 60 × 5 mm with two clamp blocks of 20 × 10 × 8 mm standing on it, each
 with a bore and a load on its top: cells of 11.4 mm in the plate and 2.3 mm in the blocks

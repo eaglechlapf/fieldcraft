@@ -80,7 +80,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use fieldcraft_fem::{DofLayout, DofSet};
 use fieldcraft_mesh::surface::BoundarySurface;
@@ -96,7 +96,7 @@ use crate::grid::{self, Grid, cross, dot, sub};
 use crate::islands::closest_point;
 use crate::iterative;
 use crate::refine::Tree;
-use crate::solve::{self, Load, MAX_MATRIX_ENTRIES, Material, Options, Round, Solution, Solved, Solver, Support, Tied, Ties, View};
+use crate::solve::{self, Load, MAX_MATRIX_ENTRIES, Material, Memory, Options, Round, Solution, Solved, Solver, Support, Tied, Ties, View};
 use crate::space::NONE;
 use crate::{Error, Result};
 
@@ -744,14 +744,39 @@ fn refuse_free(motions: &[Motion]) -> Result<()> {
     )))
 }
 
-/// The unknowns [`solve_assembly`] would solve for: the bodies' grids are built and their cells
-/// sorted, and nothing is integrated or solved. For choosing cell sizes that fit a budget
-/// before the work is done.
+/// The unknowns [`solve_assembly`] would solve for: the bodies' grids are built, their cells
+/// sorted and the cut ones integrated, which tells the pieces of material in a cell apart;
+/// nothing is added up or solved. For choosing cell sizes that fit a budget before the work
+/// is done; a solve on the same cells takes what was worked out from [`Kept`].
 pub fn assembly_unknowns(parts: &[Part], bonds: &[Bond], limits: &Limits) -> Result<usize> {
+    assembly_unknowns_keeping(parts, bonds, limits, &mut Kept::default())
+}
+
+/// What solves of the same bodies keep for each other ([`assembly_unknowns_keeping`],
+/// [`solve_assembly_keeping`]): of each body what its surface gives alone and on its grid, and
+/// the integrals of its cut cells. A count of the unknowns and the solve on the same cells
+/// share all of it; on other cells, what the surfaces give alone. Nothing in it changes a
+/// result: a solve takes from it what it would work out again, the same, and what was kept of
+/// another surface, grid or degree is worked out anew.
+#[derive(Default)]
+pub struct Kept {
+    bodies: Vec<Arc<Memory>>,
+}
+
+impl Kept {
+    /// The first rounds of the bodies' solves, each with what is kept of its body.
+    fn rounds(&mut self, bodies: usize, counting: bool) -> Vec<Round> {
+        self.bodies.resize_with(bodies, Arc::default);
+        self.bodies.iter().map(|memory| Round::first(Arc::clone(memory), counting)).collect()
+    }
+}
+
+/// [`assembly_unknowns`], with what the solves of these bodies keep for each other.
+pub fn assembly_unknowns_keeping(parts: &[Part], bonds: &[Bond], limits: &Limits, kept: &mut Kept) -> Result<usize> {
     let Bonded { couplings, tied, held, curved } = couplings(parts, bonds)?;
     let fictitious: Vec<f64> = parts.iter().map(|part| part.options.fictitious).collect();
     let frames: Vec<OnceLock<(Grid, Tree)>> = (0..parts.len()).map(|_| OnceLock::new()).collect();
-    let rounds: Vec<Round> = parts.iter().map(|_| Round::default()).collect();
+    let rounds = kept.rounds(parts.len(), true);
     let count = Cell::new(None);
     let shared = Shared {
         parts,
@@ -787,6 +812,11 @@ pub fn assembly_unknowns(parts: &[Part], bonds: &[Bond], limits: &Limits) -> Res
 /// smallest [`Options::settle`] among them; each solution's [`crate::Stats::rounds`],
 /// [`crate::Stats::settled`] and [`crate::Stats::left_out`] are the assembly's.
 pub fn solve_assembly(parts: &[Part], bonds: &[Bond], limits: &Limits) -> Result<Vec<Solution>> {
+    solve_assembly_keeping(parts, bonds, limits, &mut Kept::default())
+}
+
+/// [`solve_assembly`], with what the solves of these bodies keep for each other.
+pub fn solve_assembly_keeping(parts: &[Part], bonds: &[Bond], limits: &Limits, kept: &mut Kept) -> Result<Vec<Solution>> {
     let Bonded { couplings, tied, held, curved } = couplings(parts, bonds)?;
     refuse_free(&motions(parts, &couplings, &curved)?)?;
     let most: Vec<f64> = parts.iter().map(|part| solve::most_fictitious(&part.material)).collect::<Result<_>>()?;
@@ -830,7 +860,7 @@ pub fn solve_assembly(parts: &[Part], bonds: &[Bond], limits: &Limits) -> Result
             }
         }
     };
-    let mut rounds: Vec<Round> = parts.iter().map(|_| Round::default()).collect();
+    let mut rounds = kept.rounds(parts.len(), false);
     let mut solutions = attempt(&rounds)?;
     let asked = parts.iter().map(|part| part.options.adapt).max().unwrap_or(0).min(grid::MAX_REFINE);
     let settle = parts.iter().map(|part| part.options.settle).fold(f64::INFINITY, f64::min);

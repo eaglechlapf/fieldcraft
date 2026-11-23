@@ -585,9 +585,9 @@ pub(crate) fn links<'a>(tree: &Tree, solid: &Solid, held: &(dyn Fn(usize) -> Opt
 }
 
 /// The least distance between the pieces of surface of two islands, from the corners and the
-/// middle of each piece of the one to the pieces of the other and back; infinite when one has
-/// none.
-fn width(first: &Held, first_island: u16, second: &Held, second_island: u16) -> f64 {
+/// middle of each piece of the one to the pieces of the other and back, or `most` when they are
+/// farther apart than that; infinite when one has none.
+fn width(first: &Held, first_island: u16, second: &Held, second_island: u16, most: f64) -> f64 {
     let of = |held: &Held, island: u16| -> Vec<Piece> {
         held.pieces
             .iter()
@@ -597,11 +597,14 @@ fn width(first: &Held, first_island: u16, second: &Held, second_island: u16) -> 
             .collect()
     };
     let (a, b) = (of(first, first_island), of(second, second_island));
+    if a.is_empty() || b.is_empty() {
+        return f64::INFINITY;
+    }
     // What the distances may round by: far below any gap, far above the last digits of the
     // coordinates.
     let size = a.iter().chain(&b).flat_map(|piece| piece.corners).flatten().fold(0.0f64, |most, x| most.max(x.abs()));
     let slack = (ROUNDING * size) * (ROUNDING * size);
-    let least = nearer(&b, &a, nearer(&a, &b, f64::INFINITY, slack), slack);
+    let least = nearer(&b, &a, nearer(&a, &b, most * most, slack), slack);
     least.sqrt()
 }
 
@@ -650,6 +653,15 @@ fn nearer(from: &[Piece], to: &[Piece], mut least: f64, slack: f64) -> f64 {
         let [p, q, r] = piece.corners;
         let centre = [0, 1, 2].map(|i| (p[i] + q[i] + r[i]) / 3.0);
         for x in [p, q, r, centre] {
+            // Not a point farther from all of them than the least found.
+            let mut from_all = 0.0;
+            for i in 0..3 {
+                let apart = (lo[i] - x[i]).max(x[i] - hi[i]).max(0.0);
+                from_all += apart * apart;
+            }
+            if beyond(from_all, least) {
+                continue;
+            }
             let measure = |at: usize, least: &mut f64| {
                 let Some((other, (low, high))) = order.get(at).and_then(|piece| Some((to.get(*piece)?, boxes.get(*piece)?))) else { return };
                 let mut bound = 0.0;
@@ -692,8 +704,9 @@ pub(crate) struct Sides {
 }
 
 /// Every two sides of a gap ([`Sides`]) among the leaves of `tree`, given the `links` between
-/// their islands ([`links`]).
-pub(crate) fn sides<'a>(tree: &Tree, links: &[[u32; 4]], held: &(dyn Fn(usize) -> Option<Held<'a>> + Sync)) -> Vec<Sides> {
+/// their islands ([`links`]). A width above `most` is given as `most`: what the caller takes
+/// for no gap to speak of, and need not be found.
+pub(crate) fn sides<'a>(tree: &Tree, links: &[[u32; 4]], held: &(dyn Fn(usize) -> Option<Held<'a>> + Sync), most: f64) -> Vec<Sides> {
     let mut joined: BTreeSet<[u32; 4]> = BTreeSet::new();
     for link in links {
         joined.insert(*link);
@@ -717,7 +730,7 @@ pub(crate) fn sides<'a>(tree: &Tree, links: &[[u32; 4]], held: &(dyn Fn(usize) -
         let islands = islands_of(&own);
         for first in 0..islands {
             for second in first + 1..islands {
-                between([node, u32::from(first), node, u32::from(second)], width(&own, first, &own, second));
+                between([node, u32::from(first), node, u32::from(second)], width(&own, first, &own, second, most));
             }
         }
         // Two islands of two cells that share a face, with no link between them.
@@ -740,7 +753,7 @@ pub(crate) fn sides<'a>(tree: &Tree, links: &[[u32; 4]], held: &(dyn Fn(usize) -
                     for second in 0..islands_of(&other) {
                         let pair = [node, u32::from(first), other_node as u32, u32::from(second)];
                         if !joined.contains(&pair) {
-                            between(pair, width(&own, first, &other, second));
+                            between(pair, width(&own, first, &other, second, most));
                         }
                     }
                 }
@@ -803,13 +816,17 @@ mod tests {
             let held = |pieces, of_piece| Held { lo: [0.0; 3], hi: [1.0; 3], pieces, of_piece };
             let expected = every(&a, &b);
             let one = held(&both[..], &of_piece[..]);
-            assert_eq!(width(&one, 0, &one, 1).to_bits(), expected.to_bits(), "{n} by {m}, {apart} apart");
-            assert_eq!(width(&held(&b[..], &[]), 0, &held(&a[..], &[]), 0).to_bits(), expected.to_bits(), "{n} by {m}, two cells");
+            assert_eq!(width(&one, 0, &one, 1, f64::INFINITY).to_bits(), expected.to_bits(), "{n} by {m}, {apart} apart");
+            assert_eq!(width(&held(&b[..], &[]), 0, &held(&a[..], &[]), 0, f64::INFINITY).to_bits(), expected.to_bits(), "{n} by {m}, two cells");
+            // Up to a distance: the least where it is below, else that distance.
+            for most in [0.5 * expected, expected, 2.0 * expected + 1e-3] {
+                assert_eq!(width(&one, 0, &one, 1, most).to_bits(), expected.min(most).to_bits(), "{n} by {m}, up to {most}");
+            }
         }
         // An island with no pieces is infinitely far.
         let a = sheet(2, 0.0, 0.0, 0.0, 1);
         let held = Held { lo: [0.0; 3], hi: [1.0; 3], pieces: &a, of_piece: &[] };
-        assert_eq!(width(&held, 0, &held, 1), f64::INFINITY);
+        assert_eq!(width(&held, 0, &held, 1, 1.0), f64::INFINITY);
     }
 
     #[test]

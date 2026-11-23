@@ -15,8 +15,8 @@
 use std::collections::BTreeMap;
 
 use fieldcraft_fcm::{
-    Basis, Bond, Curved, Grip, Load as GridLoad, Material as GridMaterial, Motion, Options, Part, Solution, Solver, Support, assembly_unknowns,
-    bond_areas, find_bonds, free_motions, solve_assembly,
+    Basis, Bond, Curved, Grip, Load as GridLoad, Material as GridMaterial, Motion, Options, Part, Solution, Solver, Support,
+    assembly_unknowns_keeping, bond_areas, find_bonds, free_motions, solve_assembly, solve_assembly_keeping,
 };
 use fieldcraft_geometry::FaceSurface;
 use fieldcraft_mesh::surface::{BoundarySurface, SurfaceOptions};
@@ -166,6 +166,11 @@ pub(super) fn default_tolerance(diagonal: f64) -> f64 {
 /// takes it.
 pub(super) fn surface(shape: Solid, tolerance: f64) -> Result<BoundarySurface> {
     let mesh = shape.tessellate(crate::units::to_geometry_length(tolerance))?;
+    surface_of(shape, &mesh)
+}
+
+/// The surface of a body from its triangles ([`Solid::tessellate`]).
+pub(super) fn surface_of(shape: Solid, mesh: &fieldcraft_geometry::SurfaceMesh) -> Result<BoundarySurface> {
     let positions: Vec<[f64; 3]> = mesh.positions.iter().map(|p| crate::units::geometry_point(*p)).collect();
     let options = SurfaceOptions { weld_distance: crate::units::geometry_length(mesh.weld_distance), ..SurfaceOptions::default() };
     BoundarySurface::new(&positions, &mesh.triangles, &mesh.tri_face, &options)
@@ -613,18 +618,20 @@ fn refine(surface: &BoundarySurface, size: f64, scale: impl Fn([f64; 3]) -> f64 
         let mut next_face = Vec::with_capacity(triangles.len() * 2);
         for (t, face) in triangles.iter().zip(&tri_face) {
             let [a, b, c] = *t;
-            let pieces: Vec<[u32; 3]> = match (middle(a, b), middle(b, c), middle(c, a)) {
-                (None, None, None) => vec![[a, b, c]],
-                (Some(ab), Some(bc), Some(ca)) => vec![[a, ab, ca], [ab, b, bc], [ca, bc, c], [ab, bc, ca]],
-                (Some(ab), None, None) => vec![[a, ab, c], [ab, b, c]],
-                (None, Some(bc), None) => vec![[b, bc, a], [bc, c, a]],
-                (None, None, Some(ca)) => vec![[c, ca, b], [ca, a, b]],
+            // Up to four pieces, the first `count` of the list.
+            const NONE: [u32; 3] = [0; 3];
+            let (pieces, count): ([[u32; 3]; 4], usize) = match (middle(a, b), middle(b, c), middle(c, a)) {
+                (None, None, None) => ([[a, b, c], NONE, NONE, NONE], 1),
+                (Some(ab), Some(bc), Some(ca)) => ([[a, ab, ca], [ab, b, bc], [ca, bc, c], [ab, bc, ca]], 4),
+                (Some(ab), None, None) => ([[a, ab, c], [ab, b, c], NONE, NONE], 2),
+                (None, Some(bc), None) => ([[b, bc, a], [bc, c, a], NONE, NONE], 2),
+                (None, None, Some(ca)) => ([[c, ca, b], [ca, a, b], NONE, NONE], 2),
                 // Two halved edges: the corner between them, and the rest cut by its shorter diagonal.
-                (Some(ab), Some(bc), None) => corner_and_quad(&points, [b, bc, ab], [ab, bc, c, a]),
-                (None, Some(bc), Some(ca)) => corner_and_quad(&points, [c, ca, bc], [bc, ca, a, b]),
-                (Some(ab), None, Some(ca)) => corner_and_quad(&points, [a, ab, ca], [ca, ab, b, c]),
+                (Some(ab), Some(bc), None) => (corner_and_quad(&points, [b, bc, ab], [ab, bc, c, a]), 3),
+                (None, Some(bc), Some(ca)) => (corner_and_quad(&points, [c, ca, bc], [bc, ca, a, b]), 3),
+                (Some(ab), None, Some(ca)) => (corner_and_quad(&points, [a, ab, ca], [ca, ab, b, c]), 3),
             };
-            for piece in pieces {
+            for piece in pieces.into_iter().take(count) {
                 next.push(piece);
                 next_face.push(*face);
             }
@@ -635,12 +642,12 @@ fn refine(surface: &BoundarySurface, size: f64, scale: impl Fn([f64; 3]) -> f64 
 }
 
 /// A corner triangle and the quad `q` (in order around it) beside it as two triangles, cut by the
-/// quad's shorter diagonal (the first on a tie).
-fn corner_and_quad(points: &[[f64; 3]], corner: [u32; 3], q: [u32; 4]) -> Vec<[u32; 3]> {
+/// quad's shorter diagonal (the first on a tie): three triangles, the first three of the list.
+fn corner_and_quad(points: &[[f64; 3]], corner: [u32; 3], q: [u32; 4]) -> [[u32; 3]; 4] {
     if edge_length(points, q[0], q[2]) <= edge_length(points, q[1], q[3]) {
-        vec![corner, [q[0], q[1], q[2]], [q[0], q[2], q[3]]]
+        [corner, [q[0], q[1], q[2]], [q[0], q[2], q[3]], [0; 3]]
     } else {
-        vec![corner, [q[0], q[1], q[3]], [q[1], q[2], q[3]]]
+        [corner, [q[0], q[1], q[3]], [q[1], q[2], q[3]], [0; 3]]
     }
 }
 

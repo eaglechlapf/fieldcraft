@@ -219,6 +219,27 @@ fn a_block_on_a_plate_is_held_through_its_foot() {
     assert_eq!(assembly_unknowns(&parts, std::slice::from_ref(&bond), &Limits::default()).unwrap(), unknowns);
     let few = Limits { max_dofs: unknowns - 1, ..Limits::default() };
     assert!(matches!(solve_assembly(&parts, std::slice::from_ref(&bond), &few), Err(Error::Limit(_))));
+    // What a count keeps, the solve after it takes, and what solves on other cells and of
+    // another degree kept is not theirs: the same solutions to the bit either way.
+    let mut kept = fieldcraft_fcm::Kept::default();
+    let same = |a: &[Solution], b: &[Solution]| {
+        a.iter().zip(b).all(|(a, b)| a.strain_energy.to_bits() == b.strain_energy.to_bits() && a.stats.unknowns == b.stats.unknowns)
+    };
+    let bonds = std::slice::from_ref(&bond);
+    assert_eq!(fieldcraft_fcm::assembly_unknowns_keeping(&parts, bonds, &Limits::default(), &mut kept).unwrap(), unknowns);
+    assert!(same(&fieldcraft_fcm::solve_assembly_keeping(&parts, bonds, &Limits::default(), &mut kept).unwrap(), &solutions));
+    let other = |change: &dyn Fn(Options) -> Options| {
+        [Part { options: change(parts[0].options), ..parts[0] }, Part { options: change(parts[1].options), ..parts[1] }]
+    };
+    for changed in [other(&|options| Options { cell_size: 1.1 * options.cell_size, ..options }), other(&|options| Options { degree: 3, ..options })] {
+        let fresh = solve_assembly(&changed, bonds, &Limits::default()).unwrap();
+        assert_eq!(
+            fieldcraft_fcm::assembly_unknowns_keeping(&changed, bonds, &Limits::default(), &mut kept).unwrap(),
+            fresh.iter().map(|s| s.stats.unknowns).sum::<usize>()
+        );
+        assert!(same(&fieldcraft_fcm::solve_assembly_keeping(&changed, bonds, &Limits::default(), &mut kept).unwrap(), &fresh));
+    }
+    assert!(same(&fieldcraft_fcm::solve_assembly_keeping(&parts, bonds, &Limits::default(), &mut kept).unwrap(), &solutions));
     // The post bends over: its top moves more than its foot.
     assert!(largest > 2.0 * solutions[1].displacement([0.85, 0.7, 0.3]).unwrap()[0].abs());
     // Without the bond nothing holds the post.

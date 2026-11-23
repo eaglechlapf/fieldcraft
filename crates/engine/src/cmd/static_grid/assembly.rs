@@ -277,6 +277,7 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let default_cells = p.get("cell_size").is_none();
 
     let mut prepared: Vec<Prepared> = Vec::with_capacity(shapes.len());
+    let mut sized = Vec::with_capacity(shapes.len());
     let mut least = 0.0;
     for (shape, (diagonal, volume, skin)) in shapes.into_iter().zip(sizes) {
         let (material, material_name) = material(model, shape.name, &mut warnings)?;
@@ -315,7 +316,20 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
 
         fieldcraft_model::progress::stage(&format!("{}: surface", shape.name), None, "");
         fieldcraft_model::progress::check()?;
-        let surface = surface(shape, tolerance)?;
+        let mesh = shape.tessellate(crate::units::to_geometry_length(tolerance))?;
+        sized.push((shape, material, material_name, supports, cell_size, thin, basis, tolerance, sample_size, volume, skin, mesh));
+    }
+    // The bodies' surfaces, each on a thread of its own: of an imported mesh of many triangles
+    // that is most of the work before the solve.
+    let surfaces: Vec<Result<BoundarySurface>> = with_threads(threads, || {
+        parallel::map(sized.len(), |body| {
+            sized.get(body).map_or_else(|| Err(EngineError::Params("a body is missing".into())), |sized| surface_of(sized.0, &sized.11))
+        })
+    });
+    for ((shape, material, material_name, supports, cell_size, thin, basis, tolerance, sample_size, volume, skin, _), surface) in
+        sized.into_iter().zip(surfaces)
+    {
+        let surface = surface?;
         let areas = face_areas(&surface);
         let (loads, applied) = loads(model, shape, step, &areas, material.density, material_name, false)?;
         least += 3.0 * (degree as f64).powi(3) * volume / cell_size.powi(3);
@@ -476,9 +490,12 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
     };
     // The cells as they are: the rounds of the bodies as they come.
     grow(&mut prepared, 1.0);
+    // What the counts of the unknowns and the solve work out of the bodies' surfaces, kept from
+    // one to the next.
+    let mut kept = fieldcraft_fcm::Kept::default();
     // The default cells: a twentieth of each body's own diagonal, and all of them larger by one
     // factor when the bodies would have more unknowns between them than one compact body has.
-    // The unknowns are counted on the bodies' grids, with nothing integrated.
+    // The unknowns are counted on the bodies' grids, with nothing added up or solved.
     if default_cells {
         let budget = compact_unknowns(degree);
         // Counted against the solver's own limit: a lower one refuses the solve below, which
@@ -487,7 +504,7 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
         for _ in 0..FIT {
             fieldcraft_model::progress::check()?;
             let parts = parts_of(&prepared);
-            let by = match with_threads(threads, || assembly_unknowns(&parts, &bonds, &countable)) {
+            let by = match with_threads(threads, || assembly_unknowns_keeping(&parts, &bonds, &countable, &mut kept)) {
                 Ok(unknowns) if unknowns as f64 <= budget => break,
                 Ok(unknowns) => (unknowns as f64 / budget).cbrt().max(FIT_STEP),
                 Err(fieldcraft_fcm::Error::Limit(_)) => 2f64.cbrt(),
@@ -501,7 +518,7 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let (mut enlarged, mut refused_at) = (0, None);
     let solutions = loop {
         let parts = parts_of(&prepared);
-        match with_threads(threads, || solve_assembly(&parts, &bonds, &limits)) {
+        match with_threads(threads, || solve_assembly_keeping(&parts, &bonds, &limits, &mut kept)) {
             Err(fieldcraft_fcm::Error::Limit(limit)) if default_cells && enlarged < ENLARGE && fieldcraft_model::progress::check().is_ok() => {
                 enlarged += 1;
                 grow(&mut prepared, 2f64.cbrt());

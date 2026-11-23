@@ -4,7 +4,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use fieldcraft_mesh::surface::BoundarySurface;
 use fieldcraft_solver::Limits;
@@ -1187,6 +1187,123 @@ fn alone(limits: &Limits) -> impl Fn(&View) -> Result<Solved> + '_ {
     }
 }
 
+/// A surface as far as what is kept of it tells it from another: its points and triangles,
+/// counted, and its first and last point.
+type SurfaceKey = (usize, usize, [u64; 3], [u64; 3]);
+
+/// What a solve works out of a body's surface alone: the same on every grid.
+struct OfSurface {
+    of: SurfaceKey,
+    solid: Solid,
+    feature: Vec<[bool; 3]>,
+}
+
+/// What a solve works out of a body's surface on a grid: the same in every round on it.
+struct OnGrid {
+    of: SurfaceKey,
+    grid: Grid,
+    finest: usize,
+    /// The triangles' corners on the planes of the finest cells, their faces, their unit
+    /// normals and the area of each face.
+    triangles: Vec<[[f64; 3]; 3]>,
+    tags: Vec<u32>,
+    normals: Vec<[f64; 3]>,
+    areas: BTreeMap<u32, f64>,
+    /// The surface in the grid's cells, and what each cell is.
+    sorted: grid::Sorted,
+    kinds: Vec<Kind>,
+}
+
+/// The cut cells of a solve, by level and place, each with its integrals
+/// ([`Options::reuse`]), and what they were integrated of: the surface, the grid and its finest
+/// cells, the degree and the depth of the quadrature, and whether the pieces of material were
+/// told apart ([`Options::separate`]) and integrated exactly ([`Options::exact`]).
+#[derive(Default)]
+struct Cuts {
+    of: Option<CutsOf>,
+    cells: BTreeMap<(u8, [u32; 3]), Arc<CutLeaf>>,
+}
+
+type CutsOf = (SurfaceKey, Grid, [usize; 3], [bool; 2]);
+
+/// What the solves of one body keep for each other: the rounds of one solve
+/// ([`Options::adapt`]), and a count of the unknowns and the solve that follows it
+/// ([`crate::assembly::Kept`]). Nothing in it changes a result: a solve takes from it what it
+/// would work out again, the same.
+#[derive(Default)]
+pub(crate) struct Memory {
+    of_surface: Mutex<Option<Arc<OfSurface>>>,
+    on_grid: Mutex<Option<Arc<OnGrid>>>,
+    cuts: Mutex<Cuts>,
+}
+
+fn in_use<T>(_: T) -> Error {
+    Error::Internal("what a body's solves keep is in use".into())
+}
+
+impl Memory {
+    /// What the surface alone gives: kept, or worked out and kept.
+    fn of_surface(&self, surface: &BoundarySurface) -> Result<Arc<OfSurface>> {
+        let bits = |point: Option<&[f64; 3]>| point.map_or([0; 3], |point| point.map(f64::to_bits));
+        let of = (surface.points().len(), surface.triangles().len(), bits(surface.points().first()), bits(surface.points().last()));
+        let mut kept = self.of_surface.lock().map_err(in_use)?;
+        if let Some(found) = kept.as_ref().filter(|found| found.of == of) {
+            return Ok(Arc::clone(found));
+        }
+        let found = Arc::new(OfSurface { of, solid: Solid::new(surface)?, feature: grid::feature_flags(surface) });
+        *kept = Some(Arc::clone(&found));
+        Ok(found)
+    }
+
+    /// What the surface gives on `grid`, with the finest cells there may be `finest` levels
+    /// down: kept, or worked out and kept.
+    fn on_grid(&self, surface: &BoundarySurface, of_surface: &OfSurface, grid: &Grid, finest: usize) -> Result<Arc<OnGrid>> {
+        let mut kept = self.on_grid.lock().map_err(in_use)?;
+        if let Some(found) = kept.as_ref().filter(|found| found.of == of_surface.of && found.grid == *grid && found.finest == finest) {
+            return Ok(Arc::clone(found));
+        }
+        let vertices = surface.points();
+        // On the planes of the finest cells there may be: a face of the part that lies on one
+        // lies on it exactly.
+        let triangles = fieldcraft_parallel::map_grained(surface.triangles().len(), GRAIN, |t| -> Result<[[f64; 3]; 3]> {
+            let corner = |v: u32| {
+                vertices
+                    .get(v as usize)
+                    .map(|x| grid.snap_to(*x, finest))
+                    .ok_or_else(|| Error::Internal("a surface triangle names a missing vertex".into()))
+            };
+            let t = surface.triangles().get(t).ok_or_else(|| Error::Internal("a surface triangle is missing".into()))?;
+            Ok([corner(t[0])?, corner(t[1])?, corner(t[2])?])
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+        let tags: Vec<u32> = (0..triangles.len()).map(|t| surface.tri_face().get(t).copied().unwrap_or(0)).collect();
+        let mut normals = Vec::with_capacity(triangles.len());
+        let mut areas: BTreeMap<u32, f64> = BTreeMap::new();
+        for (t, tag) in triangles.iter().zip(&tags) {
+            let normal = cross(sub(t[1], t[0]), sub(t[2], t[0]));
+            let length = dot(normal, normal).sqrt();
+            normals.push(if length > 0.0 { [normal[0] / length, normal[1] / length, normal[2] / length] } else { [0.0; 3] });
+            *areas.entry(*tag).or_insert(0.0) += 0.5 * length;
+        }
+        // The cells: cut where they own a piece of the surface, else by their centre.
+        let sorted = grid::sort_surface(grid, &triangles);
+        let kinds = fieldcraft_parallel::map_grained(grid.len(), GRAIN, |c| -> Result<Kind> {
+            if sorted.pieces.get(c).is_some_and(|pieces| !pieces.is_empty()) {
+                return Ok(Kind::Cut);
+            }
+            let ijk = grid.coords(c);
+            let (a, b) = (grid.lo(ijk), grid.hi(ijk));
+            Ok(if of_surface.solid.contains([0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1]), 0.5 * (a[2] + b[2])])? { Kind::Inside } else { Kind::Outside })
+        })
+        .into_iter()
+        .collect::<Result<Vec<Kind>>>()?;
+        let found = Arc::new(OnGrid { of: of_surface.of, grid: *grid, finest, triangles, tags, normals, areas, sorted, kinds });
+        *kept = Some(Arc::clone(&found));
+        Ok(found)
+    }
+}
+
 /// What a solve of [`solve`] takes from the solves before it ([`Options::adapt`]).
 #[derive(Default)]
 pub(crate) struct Round {
@@ -1194,13 +1311,19 @@ pub(crate) struct Round {
     asked: BTreeSet<(u8, [u32; 3])>,
     /// The entries of the stiffness and of its factor in the solve before, when there was one.
     before: Option<(usize, usize)>,
-    /// The cut cells of the solve before that were not divided, by level and place, each with
-    /// its integrals ([`Options::reuse`]), and whether their pieces of material were told apart
-    /// ([`Options::separate`]).
-    cuts: RefCell<(bool, BTreeMap<(u8, [u32; 3]), Arc<CutLeaf>>)>,
+    /// What the body's solves keep for each other.
+    memory: Arc<Memory>,
+    /// Whether the unknowns are only counted: they are not put in an order then.
+    counting: bool,
 }
 
 impl Round {
+    /// The first solve of a body whose solves keep `memory`; to count its unknowns only, or
+    /// to solve for them.
+    pub(crate) fn first(memory: Arc<Memory>, counting: bool) -> Round {
+        Round { memory, counting, ..Round::default() }
+    }
+
     /// Ask the next solve to divide `cells` as well, after `solution`, the solve before it;
     /// whether any of them was not asked for already.
     pub(crate) fn ask(&mut self, cells: BTreeSet<(u8, [u32; 3])>, solution: &Solution) -> bool {
@@ -1488,70 +1611,31 @@ fn solve_at(
         }
     }
     let grid = Grid::over(lo, hi, options.cell_size, options.offset, MAX_CELLS)?;
-    let mut triangles = Vec::with_capacity(surface.triangles().len());
     // The finest cells there can be: divided for the surface's curvature, then by the rounds
     // that follow the solution (each a level at most), then where gaps end. The same in every
     // round, so a cell is the same cell in each.
     let finest = (options.refine + options.adapt + if options.separate { options.gaps } else { 0 }).min(MAX_REFINE);
-    for t in surface.triangles() {
-        // On the planes of the finest cells there may be: a face of the part that lies on one
-        // lies on it exactly.
-        let corner = |v: u32| {
-            vertices
-                .get(v as usize)
-                .map(|x| grid.snap_to(*x, finest))
-                .ok_or_else(|| Error::Internal("a surface triangle names a missing vertex".into()))
-        };
-        triangles.push([corner(t[0])?, corner(t[1])?, corner(t[2])?]);
-    }
-    let tags: Vec<u32> = (0..triangles.len()).map(|t| surface.tri_face().get(t).copied().unwrap_or(0)).collect();
-    let mut normals = Vec::with_capacity(triangles.len());
-    let mut areas: BTreeMap<u32, f64> = BTreeMap::new();
-    for (t, tag) in triangles.iter().zip(&tags) {
-        let normal = cross(sub(t[1], t[0]), sub(t[2], t[0]));
-        let length = dot(normal, normal).sqrt();
-        normals.push(if length > 0.0 { [normal[0] / length, normal[1] / length, normal[2] / length] } else { [0.0; 3] });
-        *areas.entry(*tag).or_insert(0.0) += 0.5 * length;
-    }
-    let (faces, body) = conditions(supports, loads, &areas, material.density, ties)?;
-    let on_surface = Surface {
-        normals: &normals,
-        tags: &tags,
-        faces: &faces,
-        touching: ties.map(|ties| ties.touching),
-        curved: ties.map_or(&cell::NO_CURVES, |ties| ties.curved),
-    };
-    let feature = grid::feature_flags(surface);
-    let on_grid = Triangles { corners: &triangles, normals: &normals, across: surface.neighbors(), feature: &feature };
-
-    // The cells: cut where they own a piece of the surface, else by their centre.
-    let solid = Solid::new(surface)?;
-    let mut sorted = grid::sort_surface(&grid, &triangles);
-    let kinds = fieldcraft_parallel::map_grained(grid.len(), GRAIN, |c| -> Result<Kind> {
-        if sorted.pieces.get(c).is_some_and(|pieces| !pieces.is_empty()) {
-            return Ok(Kind::Cut);
-        }
-        let ijk = grid.coords(c);
-        let (a, b) = (grid.lo(ijk), grid.hi(ijk));
-        Ok(if solid.contains([0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1]), 0.5 * (a[2] + b[2])])? { Kind::Inside } else { Kind::Outside })
-    })
-    .into_iter()
-    .collect::<Result<Vec<Kind>>>()?;
+    // What the surface gives alone, and on this grid: the same in every round, and kept.
+    let of_surface = round.memory.of_surface(surface)?;
+    let placed = round.memory.on_grid(surface, &of_surface, &grid, finest)?;
+    let (triangles, tags, normals, solid) = (&placed.triangles[..], &placed.tags[..], &placed.normals[..], &of_surface.solid);
+    let (faces, body) = conditions(supports, loads, &placed.areas, material.density, ties)?;
+    let on_surface =
+        Surface { normals, tags, faces: &faces, touching: ties.map(|ties| ties.touching), curved: ties.map_or(&cell::NO_CURVES, |ties| ties.curved) };
+    let on_grid = Triangles { corners: triangles, normals, across: surface.neighbors(), feature: &of_surface.feature };
 
     // The cells that hold material, divided where they are too coarse, each with the surface
     // in it.
-    let mut tree = Tree::new(&grid, &kinds);
+    let mut tree = Tree::new(&grid, &placed.kinds);
     let (mut touching, mut pieces): (Vec<Vec<u32>>, Vec<Vec<Piece>>) = (Vec::with_capacity(tree.nodes.len()), Vec::with_capacity(tree.nodes.len()));
     for (cell, root) in tree.root.iter().enumerate() {
         if *root != NONE {
-            touching.push(sorted.touching.get_mut(cell).map(std::mem::take).unwrap_or_default());
-            pieces.push(sorted.pieces.get_mut(cell).map(std::mem::take).unwrap_or_default());
+            touching.push(placed.sorted.touching.get(cell).cloned().unwrap_or_default());
+            pieces.push(placed.sorted.pieces.get(cell).cloned().unwrap_or_default());
         }
     }
-    drop(sorted);
-    drop(kinds);
     if options.refine > 0 || !asked.is_empty() {
-        divide_cells(&grid, &mut tree, &on_grid, &solid, &mut touching, &mut pieces, options.refine, options.turn(), marker, asked)?;
+        divide_cells(&grid, &mut tree, &on_grid, solid, &mut touching, &mut pieces, options.refine, options.turn(), marker, asked)?;
     }
 
     // The cut cells: their quadrature, and the separate pieces of material each holds. Where
@@ -1561,10 +1645,11 @@ fn solve_at(
     let surface_rule = gauss_legendre(2 * p + 1);
     let (second_rule, third_rule) = (gauss_legendre(2 * p + 1), gauss_legendre(3 * p + 2));
     let mut cuts: Vec<Option<Arc<CutLeaf>>> = Vec::new();
-    // The cut cells of the round before ([`Options::reuse`]), when they were integrated as
-    // this round's are.
-    let before = round.cuts.take();
-    let reused = (options.reuse && before.0 == options.separate).then_some(&before.1);
+    // The cut cells of the solve before ([`Options::reuse`]), when they were integrated as
+    // this one's are, on this grid.
+    let cuts_of: CutsOf = (of_surface.of, grid, [finest, p, options.depth], [options.separate, options.exact]);
+    let before = std::mem::take(&mut *round.memory.cuts.lock().map_err(in_use)?);
+    let reused = (options.reuse && before.of == Some(cuts_of)).then_some(&before.cells);
     let mut links: Vec<[u32; 4]> = Vec::new();
     // What the ends of gaps may cost: as many cells again as hold material, or [`GAP_CELLS`]
     // where that is more.
@@ -1598,7 +1683,7 @@ fn solve_at(
                 touching.get(node).map(Vec::as_slice).unwrap_or_default(),
                 pieces.get(node).map(Vec::as_slice).unwrap_or_default(),
                 &on_grid,
-                &solid,
+                solid,
                 rules,
                 // The octree is as much shallower as the cell is smaller.
                 options.depth.saturating_sub(level),
@@ -1625,8 +1710,11 @@ fn solve_at(
                 of_piece: cuts.get(node).and_then(|slot| slot.as_deref()).map(|leaf| leaf.of_piece.as_slice()).unwrap_or_default(),
             })
         };
-        links = islands::links(&tree, &solid, &held)?;
-        let sides = islands::sides(&tree, &links, &held);
+        links = islands::links(&tree, solid, &held)?;
+        // A gap wider than half a cell of the grid is none that a cell is divided for: the
+        // largest cell is more than [`Options::GAP`] widths across only of a narrower one.
+        const _: () = assert!(Options::GAP >= 2.0);
+        let sides = islands::sides(&tree, &links, &held, 0.5 * grid.spacing);
         let islands_of = |node: u32| cuts.get(node as usize).and_then(|slot| slot.as_deref()).map_or(1, CutLeaf::islands);
         let divided = crate::space::holding(&tree, &islands_of, &links, &sides, Options::GAP, &|level| grid.step(level));
         if divided.is_empty() {
@@ -1641,7 +1729,7 @@ fn solve_at(
             break;
         }
         added += more;
-        divide_nodes(&grid, &mut tree, &on_grid, &solid, &mut touching, &mut pieces, &divided)?;
+        divide_nodes(&grid, &mut tree, &on_grid, solid, &mut touching, &mut pieces, &divided)?;
         for node in divided {
             if let Some(slot) = cuts.get_mut(node) {
                 *slot = None;
@@ -1650,10 +1738,10 @@ fn solve_at(
     }
     cuts.resize(tree.nodes.len(), None);
     drop(before);
-    // For the round after this one.
-    if options.reuse && options.adapt > 0 {
-        let kept = (tree.nodes.iter().zip(&cuts)).filter_map(|(cell, leaf)| Some(((cell.level, cell.ijk), Arc::clone(leaf.as_ref()?)))).collect();
-        round.cuts.replace((options.separate, kept));
+    // For the solve after this one.
+    if options.reuse {
+        let cells = (tree.nodes.iter().zip(&cuts)).filter_map(|(cell, leaf)| Some(((cell.level, cell.ijk), Arc::clone(leaf.as_ref()?)))).collect();
+        *round.memory.cuts.lock().map_err(in_use)? = Cuts { of: Some(cuts_of), cells };
     }
     let cut_of = |node: usize| cuts.get(node).and_then(|slot| slot.as_deref());
     // The pieces of surface an island of a cell owns: all of the cell's where it has one island.
@@ -1699,23 +1787,26 @@ fn solve_at(
     }
     // Nested dissection by elements: the functions of a cell all couple, so a separator is
     // the functions two groups of cells share, not a layer of functions through the cells.
-    let order = {
-        let lists: Vec<&[usize]> = (0..elements).map(|element| space.functions(element)).collect();
-        let centres: Vec<[f64; 3]> = lists
-            .iter()
-            .map(|list| {
-                let mut centre = [0.0; 3];
-                for at in list.iter().filter_map(|mode| space.xyz.get(*mode)) {
-                    for a in 0..3 {
-                        centre[a] += at[a] / list.len() as f64;
+    // Not for a count of the unknowns, which is what it is in any order.
+    if !round.counting {
+        let order = {
+            let lists: Vec<&[usize]> = (0..elements).map(|element| space.functions(element)).collect();
+            let centres: Vec<[f64; 3]> = lists
+                .iter()
+                .map(|list| {
+                    let mut centre = [0.0; 3];
+                    for at in list.iter().filter_map(|mode| space.xyz.get(*mode)) {
+                        for a in 0..3 {
+                            centre[a] += at[a] / list.len() as f64;
+                        }
                     }
-                }
-                centre
-            })
-            .collect();
-        element_dissection(space.count, &lists, &centres)
-    };
-    space.renumber(&order)?;
+                    centre
+                })
+                .collect();
+            element_dissection(space.count, &lists, &centres)
+        };
+        space.renumber(&order)?;
+    }
     // A cell the surface does not cut: every one of a level has the same matrices.
     let mut whole = Vec::with_capacity(m);
     for (z, wz) in &rule {
