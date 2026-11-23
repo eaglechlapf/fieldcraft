@@ -537,15 +537,19 @@ Leave **Body** empty in a design of several bodies and all of them are solved in
 body has its own grid, with its own cell size and the material of its own section. Two bodies
 share no unknown, however close they are: what joins them is a *connection*.
 
-**Cell sizes.** With `cell_size` left out each body's cells are a fraction of its own diagonal,
-so a small part gets small cells: a twentieth, as for one body, or more when the bodies are
-many. The bodies together are given the unknowns one compact body has at a twentieth (a cube:
-125,000 at degree 3), and their cells are all made larger by one factor until they fit. The
-unknowns are those of the bodies' cells, counted on the grids before anything is integrated,
+**Cell sizes.** With `cell_size` left out each body's cells are a twentieth of its own diagonal,
+as for one body, and no smaller than a floor that is raised until the bodies have no more
+unknowns between them than one compact body has at a twentieth (a cube: 125,000 at degree 3).
+The small bodies' cells grow first, up to the size of the larger bodies' cells, and beyond that
+every body has cells of one size. What an assembly costs is in its smallest cells and what it
+gets wrong in its largest, and a small body that holds little of the strain energy is worth
+fewer unknowns than the long members that carry the load.
+
+The unknowns are those of the bodies' cells, counted on the grids before anything is integrated,
 added up or solved, and what a count worked out of the surfaces is the next one's and the
-solve's to use. Two counts show how fast the unknowns fall as the cells grow (as the cube of
-their size in a compact body, as its square in sheet metal), which is how much larger the next
-cells are made. Cells divided where a gap ends are not in the count: whether a gap's end needs
+solve's to use. Two counts show how fast each body's unknowns fall as its cells grow (as the
+cube of their size in a compact body, as its square in sheet metal), which is how high the next
+floor is put. Cells divided where a gap ends are not in the count: whether a gap's end needs
 them depends on where the grid lies on the part, so their number jumps from one cell size to the
 next, and cells fitted to it would jump with it. An assembly then takes about the time of one
 part however many bodies it has. The reply gives each body's `cell_size`. A `cell_size` that is

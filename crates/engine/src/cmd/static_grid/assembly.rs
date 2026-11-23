@@ -13,23 +13,64 @@ use super::*;
 const ENLARGE: usize = 3;
 
 /// How often the unknowns are counted to fit the default cells to their budget: a count shows
-/// how far the cells are from it, two of them how fast the unknowns fall as the cells grow, and
-/// the next cells are as much larger as that takes: the third count is at the budget where the
-/// unknowns fall evenly, and the others are for where they do not.
+/// how far the cells are from it, two of them how fast a body's unknowns fall as its cells
+/// grow, and the next cells are as much larger as that takes: the third count is at the budget
+/// where the unknowns fall evenly, and the others are for where they do not.
 const FIT: usize = 6;
 
-/// The least a round of fitting enlarges the cells by: a count moves by about as much from one
-/// cell size to the next, as whole cells leave the grids, and a smaller step may leave it
-/// where it is.
+/// The least a round of fitting enlarges the smallest cells by: a count moves by about as much
+/// from one cell size to the next, as whole cells leave the grids, and a smaller step may
+/// leave it where it is.
 const FIT_STEP: f64 = 1.03;
 
 /// The unknowns a compact body has at the default cell size: a cube's, with cells
 /// [`DEFAULT_RELATIVE_CELL`] of its diagonal across, (1/(√3 · that))³ of them, each with
-/// 3 · degree³. The default cells of several bodies are made larger together until the bodies
-/// have no more than these between them, so that an assembly costs what one part does however
-/// many bodies it has.
+/// 3 · degree³. The default cells of several bodies are made larger until the bodies have no
+/// more than these between them, so that an assembly costs what one part does however many
+/// bodies it has.
+///
+/// **The smallest cells first.** Each body's cells are a twentieth of its own diagonal, and a
+/// floor is put under them all and raised until the bodies fit: the small bodies' cells grow up
+/// to the size of the large bodies' before any of those do, and beyond that all the cells are
+/// of one size. What an assembly costs is in its smallest cells and what it gets wrong in its
+/// largest, and a small body that holds little of the strain energy is not worth more unknowns
+/// than the long members that hold most of it.
 fn compact_unknowns(degree: usize) -> f64 {
     3.0 * (degree as f64).powi(3) * (1.0 / (3f64.sqrt() * DEFAULT_RELATIVE_CELL)).powi(3)
+}
+
+/// The floor under the bodies' cells at which they are predicted to have `budget` unknowns
+/// between them: each body with `counts` unknowns on its `cells` now, falling as its `powers`
+/// power of its cells' size, and with cells of its own size or the floor's, whichever is
+/// larger. Not below `least`.
+fn fitting_floor(budget: f64, cells: &[f64], counts: &[f64], powers: &[f64], least: f64) -> f64 {
+    let predicted = |floor: f64| -> f64 {
+        (cells.iter().zip(counts).zip(powers))
+            .map(|((cell, count), power)| if floor > *cell { count * (cell / floor).powf(*power) } else { *count })
+            .sum()
+    };
+    if !(least > 0.0 && least.is_finite()) || !(predicted(least) > budget) {
+        return least;
+    }
+    // A floor that fits, by doubling, and the least one between the two by halving the
+    // interval: both bounded.
+    let (mut below, mut above) = (least, least);
+    for _ in 0..64 {
+        above *= 2.0;
+        if !(predicted(above) > budget) {
+            break;
+        }
+        below = above;
+    }
+    for _ in 0..48 {
+        let middle = (below * above).sqrt();
+        if predicted(middle) > budget {
+            below = middle;
+        } else {
+            above = middle;
+        }
+    }
+    above
 }
 
 /// One body, ready for the solver.
@@ -475,13 +516,14 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
     // rounds that follow the solution are the assembly's: as many as were asked for, or those of
     // a thin body when any of the bodies is thin for its grid.
     let own_samples = p.get("sample_size").is_none();
-    let grow = |prepared: &mut [Prepared], by: f64| {
+    let resize = |prepared: &mut [Prepared], size: &dyn Fn(f64) -> f64| {
         for body in prepared.iter_mut() {
-            body.options.cell_size *= by;
+            let cell = size(body.options.cell_size);
             if own_samples {
-                body.sample_size *= by;
+                body.sample_size *= cell / body.options.cell_size;
             }
-            body.thin = body.skin > 0.0 && body.options.cell_size * body.skin > THIN * 2.0 * body.volume;
+            body.options.cell_size = cell;
+            body.thin = body.skin > 0.0 && cell * body.skin > THIN * 2.0 * body.volume;
             if asked_basis.is_none() && body.thin {
                 body.options.basis = Basis::Trunk;
             }
@@ -492,45 +534,54 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
         }
     };
     // The cells as they are: the rounds of the bodies as they come.
-    grow(&mut prepared, 1.0);
+    resize(&mut prepared, &|cell| cell);
     // What the counts of the unknowns and the solve work out of the bodies' surfaces, kept from
     // one to the next.
     let mut kept = fieldcraft_fcm::Kept::default();
-    // The default cells: a twentieth of each body's own diagonal, and all of them larger by one
-    // factor when the bodies would have more unknowns between them than one compact body has.
-    // The unknowns are those of the bodies' cells, counted on their grids with nothing
-    // integrated, added up or solved (`fieldcraft_fcm::assembly_unknowns`).
+    // The default cells: a twentieth of each body's own diagonal, and none smaller than a floor
+    // that is raised until the bodies have no more unknowns between them than one compact body
+    // has ([`compact_unknowns`]). The unknowns are those of the bodies' cells, counted on their
+    // grids with nothing integrated, added up or solved (`fieldcraft_fcm::assembly_unknowns`).
     if default_cells {
         let budget = compact_unknowns(degree);
         // Counted against the solver's own limit: a lower one refuses the solve below, which
         // then says that it made the cells larger.
         let countable = Limits { max_dofs: Limits::MAX_DOFS, ..limits };
-        // The count before this one, and the factor between its cells and these.
-        let mut before: Option<(f64, f64)> = None;
+        // A body's unknowns fall as a power of its cells' size: its cube in a compact body, its
+        // square in a sheet thinner than its cells. Two counts on cells of two sizes give it;
+        // until then it is taken for a compact body's, which makes a step too short and never
+        // too long.
+        let mut powers = vec![3.0; prepared.len()];
+        let mut before: Option<(Vec<f64>, Vec<f64>)> = None;
         for _ in 0..FIT {
             fieldcraft_model::progress::check()?;
+            let cells: Vec<f64> = prepared.iter().map(|body| body.options.cell_size).collect();
+            let smallest = cells.iter().copied().fold(f64::INFINITY, f64::min);
             let parts = parts_of(&prepared);
-            let unknowns = match with_threads(threads, || assembly_unknowns_keeping(&parts, &bonds, &countable, &mut kept)) {
-                Ok(unknowns) if unknowns as f64 <= budget => break,
-                Ok(unknowns) => unknowns as f64,
+            let counts: Vec<f64> = match with_threads(threads, || assembly_unknowns_keeping(&parts, &bonds, &countable, &mut kept)) {
+                Ok(counts) => counts.into_iter().map(|count| count as f64).collect(),
                 Err(fieldcraft_fcm::Error::Limit(_)) => {
                     before = None;
-                    grow(&mut prepared, 2f64.cbrt());
+                    resize(&mut prepared, &|cell| cell.max(2f64.cbrt() * smallest));
                     continue;
                 }
                 Err(e) => return Err(grid_error(e)),
             };
-            // The unknowns fall as a power of the cells' size: its cube in a compact body, its
-            // square in a sheet thinner than its cells, and something between in an assembly of
-            // both. The two counts there are give it; one alone is taken for a compact body's,
-            // which makes the step too short and never too long.
-            let power = match before {
-                Some((more, by)) if more > unknowns && by > 1.0 => ((more / unknowns).ln() / by.ln()).clamp(1.0, 3.0),
-                _ => 3.0,
-            };
-            let by = (unknowns / budget).powf(1.0 / power).max(FIT_STEP);
-            before = Some((unknowns, by));
-            grow(&mut prepared, by);
+            if !(counts.iter().sum::<f64>() > budget) {
+                break;
+            }
+            if let Some((cells_before, counts_before)) = &before {
+                for (power, ((cell, count), (cell_before, count_before))) in
+                    powers.iter_mut().zip(cells.iter().zip(&counts).zip(cells_before.iter().zip(counts_before)))
+                {
+                    if cell > cell_before && count_before > count && *count > 0.0 {
+                        *power = ((count_before / count).ln() / (cell / cell_before).ln()).clamp(1.0, 3.0);
+                    }
+                }
+            }
+            let floor = fitting_floor(budget, &cells, &counts, &powers, FIT_STEP * smallest);
+            before = Some((cells, counts));
+            resize(&mut prepared, &|cell| cell.max(floor));
         }
     }
     // A solve still too large for a limit is run again with half the cells, when the sizes are
@@ -541,7 +592,7 @@ pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
         match with_threads(threads, || solve_assembly_keeping(&parts, &bonds, &limits, &mut kept)) {
             Err(fieldcraft_fcm::Error::Limit(limit)) if default_cells && enlarged < ENLARGE && fieldcraft_model::progress::check().is_ok() => {
                 enlarged += 1;
-                grow(&mut prepared, 2f64.cbrt());
+                resize(&mut prepared, &|cell| 2f64.cbrt() * cell);
                 refused_at = Some(limit);
             }
             other => break other.map_err(grid_error)?,

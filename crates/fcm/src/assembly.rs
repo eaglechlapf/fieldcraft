@@ -301,7 +301,7 @@ struct Shared<'a> {
     frames: &'a [OnceLock<(Grid, Tree)>],
     /// Set when the unknowns are only counted: the system is not solved, and the count is left
     /// here.
-    count: Option<&'a Cell<Option<usize>>>,
+    count: Option<&'a Cell<Option<Vec<usize>>>>,
     solved: RefCell<Vec<Option<Solved>>>,
     solutions: RefCell<Vec<Option<Solution>>>,
 }
@@ -379,7 +379,7 @@ fn nest(shared: &Shared, index: usize, up: Option<&Chain>) -> Result<()> {
             if let Some(count) = shared.count {
                 // Counting: nothing is integrated or solved, and this error ends the bodies'
                 // solves; the caller reads the count.
-                count.set(Some(views.iter().fold(0usize, |sum, view| sum.saturating_add(3 * view.count))));
+                count.set(Some(views.iter().map(|view| view.count.saturating_mul(3)).collect()));
                 return Err(broken("counted"));
             }
             let touched = |body: usize, tag: u32, x: [f64; 3]| {
@@ -759,7 +759,8 @@ fn refuse_free(motions: &[Motion]) -> Result<()> {
 /// 19.8 mm and 54 219 on cells of 20.2 mm; without the gap's end 3 234 on both, and the count
 /// falls evenly as the cells grow, which is what a cell size can be fitted to.
 pub fn assembly_unknowns(parts: &[Part], bonds: &[Bond], limits: &Limits) -> Result<usize> {
-    assembly_unknowns_keeping(parts, bonds, limits, &mut Kept::default())
+    let bodies = assembly_unknowns_keeping(parts, bonds, limits, &mut Kept::default())?;
+    Ok(bodies.into_iter().fold(0usize, usize::saturating_add))
 }
 
 /// What solves of the same bodies keep for each other ([`assembly_unknowns_keeping`],
@@ -781,8 +782,9 @@ impl Kept {
     }
 }
 
-/// [`assembly_unknowns`], with what the solves of these bodies keep for each other.
-pub fn assembly_unknowns_keeping(parts: &[Part], bonds: &[Bond], limits: &Limits, kept: &mut Kept) -> Result<usize> {
+/// [`assembly_unknowns`] body by body, in the bodies' order, with what the solves of these
+/// bodies keep for each other.
+pub fn assembly_unknowns_keeping(parts: &[Part], bonds: &[Bond], limits: &Limits, kept: &mut Kept) -> Result<Vec<usize>> {
     let Bonded { couplings, tied, held, curved } = couplings(parts, bonds)?;
     let fictitious: Vec<f64> = parts.iter().map(|part| part.options.fictitious).collect();
     let frames: Vec<OnceLock<(Grid, Tree)>> = (0..parts.len()).map(|_| OnceLock::new()).collect();
@@ -802,7 +804,7 @@ pub fn assembly_unknowns_keeping(parts: &[Part], bonds: &[Bond], limits: &Limits
         solved: RefCell::new(Vec::new()),
         solutions: RefCell::new(Vec::new()),
     };
-    match (nest(&shared, 0, None), count.get()) {
+    match (nest(&shared, 0, None), count.take()) {
         (_, Some(unknowns)) => Ok(unknowns),
         (Err(e), None) => Err(e),
         (Ok(()), None) => Err(broken("the unknowns were not counted")),

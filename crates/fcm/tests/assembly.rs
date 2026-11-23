@@ -226,7 +226,8 @@ fn a_block_on_a_plate_is_held_through_its_foot() {
         a.iter().zip(b).all(|(a, b)| a.strain_energy.to_bits() == b.strain_energy.to_bits() && a.stats.unknowns == b.stats.unknowns)
     };
     let bonds = std::slice::from_ref(&bond);
-    assert_eq!(fieldcraft_fcm::assembly_unknowns_keeping(&parts, bonds, &Limits::default(), &mut kept).unwrap(), unknowns);
+    let of_each: Vec<usize> = solutions.iter().map(|solution| solution.stats.unknowns).collect();
+    assert_eq!(fieldcraft_fcm::assembly_unknowns_keeping(&parts, bonds, &Limits::default(), &mut kept).unwrap(), of_each);
     assert!(same(&fieldcraft_fcm::solve_assembly_keeping(&parts, bonds, &Limits::default(), &mut kept).unwrap(), &solutions));
     let other = |change: &dyn Fn(Options) -> Options| {
         [Part { options: change(parts[0].options), ..parts[0] }, Part { options: change(parts[1].options), ..parts[1] }]
@@ -235,7 +236,7 @@ fn a_block_on_a_plate_is_held_through_its_foot() {
         let fresh = solve_assembly(&changed, bonds, &Limits::default()).unwrap();
         assert_eq!(
             fieldcraft_fcm::assembly_unknowns_keeping(&changed, bonds, &Limits::default(), &mut kept).unwrap(),
-            fresh.iter().map(|s| s.stats.unknowns).sum::<usize>()
+            fresh.iter().map(|s| s.stats.unknowns).collect::<Vec<_>>()
         );
         assert!(same(&fieldcraft_fcm::solve_assembly_keeping(&changed, bonds, &Limits::default(), &mut kept).unwrap(), &fresh));
     }

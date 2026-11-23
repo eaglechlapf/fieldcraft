@@ -624,8 +624,9 @@ fn bodies_that_touch_are_solved_together() {
     let reactions = s.execute("results.reactions", &json!({"step": "Pull", "sets": ["x0"]})).unwrap();
     assert!(close(-reactions["sets"][0]["force"][0].as_f64().unwrap(), PULL * 100.0, 1e-6), "{reactions}");
 
-    // Cells left to the command: a twentieth of each body's diagonal, all larger by the one
-    // factor that leaves the two bodies the unknowns of one compact body between them.
+    // Cells left to the command: a twentieth of each body's diagonal, and none smaller than
+    // the floor that leaves the two bodies the unknowns of one compact body between them:
+    // here above both, so the two have cells of one size.
     let diagonals = [(20.0f64 * 20.0 + 200.0).sqrt(), (15.0f64 * 15.0 + 200.0).sqrt()];
     let cells = |r: &Value| -> Vec<f64> { r["bodies"].as_array().unwrap().iter().map(|b| b["cell_size"].as_f64().unwrap()).collect() };
     let coarse = json!({"degree": 1, "refine": 0});
@@ -633,7 +634,7 @@ fn bodies_that_touch_are_solved_together() {
     let sizes = cells(&ours);
     let (unknowns, budget) = (ours["unknowns"].as_f64().unwrap(), 3.0 * (20.0f64 / 3f64.sqrt()).powi(3));
     assert!(unknowns <= budget && unknowns > 0.8 * budget, "{unknowns} of {budget}");
-    assert!(sizes[0] > diagonals[0] / 20.0 && close(sizes[0] / diagonals[0], sizes[1] / diagonals[1], 1e-12), "{sizes:?}");
+    assert!(sizes[0] > diagonals[0] / 20.0 && close(sizes[0], sizes[1], 1e-12), "{sizes:?}");
     assert!(ours["warnings"].as_array().unwrap().is_empty(), "{ours}");
     assert!(close(ours["max_displacement"]["value"].as_f64().unwrap(), PULL * 35.0 / YOUNG, 2e-2), "{}", ours["max_displacement"]);
     // Too large for a limit, they are made larger until the solve fits, and the reply says so;
